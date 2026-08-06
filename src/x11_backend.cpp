@@ -894,9 +894,9 @@ class X11Backend final : public Backend {
 
   void grab_keys() {
     const unsigned int ignored_modifiers[] = {0, LockMask, Mod2Mask, LockMask | Mod2Mask};
-    const KeySym plain_keys[] = {XK_Return, XK_q, XK_j, XK_k, XK_v, XK_s, XK_Tab, XK_space, XK_a,
-                                 XK_z, XK_m, XK_r, XK_minus, XK_comma, XK_period, XK_1, XK_2, XK_3, XK_4, XK_5,
-                                 XK_6, XK_7, XK_8, XK_9};
+    const KeySym plain_keys[] = {XK_Return, XK_q, XK_h, XK_j, XK_k, XK_l, XK_v, XK_s, XK_Tab, XK_space,
+                                 XK_a, XK_z, XK_m, XK_r, XK_minus, XK_comma, XK_period, XK_1, XK_2, XK_3,
+                                 XK_4, XK_5, XK_6, XK_7, XK_8, XK_9};
     const KeySym shift_keys[] = {XK_q, XK_space, XK_c, XK_minus, XK_comma, XK_period, XK_h, XK_j, XK_k, XK_l};
     for (const unsigned int ignored : ignored_modifiers) {
       for (const KeySym key : plain_keys) {
@@ -1175,16 +1175,58 @@ class X11Backend final : public Backend {
     set_active_window(window);
   }
 
-  void focus_relative(int offset) {
+  // In manual layout the visible clients are the active tabs, so this selects
+  // panes there and clients in automatic layouts.
+  void focus_direction(KeySym key) {
+    const Window selected = workspace().focused;
+    if (selected == None) return;
+
+    XWindowAttributes selected_attributes;
+    if (!XGetWindowAttributes(display_, selected, &selected_attributes) ||
+        selected_attributes.map_state != IsViewable) return;
+    const int selected_x = selected_attributes.x + selected_attributes.width / 2;
+    const int selected_y = selected_attributes.y + selected_attributes.height / 2;
+
     std::vector<Window> windows;
     collect_windows(workspace().root.get(), windows);
     windows.insert(windows.end(), workspace().floating.begin(), workspace().floating.end());
-    if (windows.empty()) return;
-    const auto found = std::find(windows.begin(), windows.end(), workspace().focused);
-    const int current = found == windows.end() ? 0 : static_cast<int>(found - windows.begin());
-    const int next = (current + offset + static_cast<int>(windows.size())) % static_cast<int>(windows.size());
-    focus(windows[next]);
-    arrange();
+
+    Window best = None;
+    long best_score = 0;
+    for (Window candidate : windows) {
+      if (candidate == selected || window_state_[candidate].monitor != current_monitor_) continue;
+      XWindowAttributes attributes;
+      if (!XGetWindowAttributes(display_, candidate, &attributes) || attributes.map_state != IsViewable) continue;
+
+      const int candidate_x = attributes.x + attributes.width / 2;
+      const int candidate_y = attributes.y + attributes.height / 2;
+      int primary = 0;
+      int secondary = 0;
+      if (key == XK_h) {
+        primary = selected_x - candidate_x;
+        secondary = std::abs(selected_y - candidate_y);
+      } else if (key == XK_j) {
+        primary = candidate_y - selected_y;
+        secondary = std::abs(selected_x - candidate_x);
+      } else if (key == XK_k) {
+        primary = selected_y - candidate_y;
+        secondary = std::abs(selected_x - candidate_x);
+      } else if (key == XK_l) {
+        primary = candidate_x - selected_x;
+        secondary = std::abs(selected_y - candidate_y);
+      } else {
+        return;
+      }
+      if (primary <= 0) continue;
+
+      // Prioritize distance along the requested axis, then alignment with it.
+      const long score = static_cast<long>(primary) * 10000L + secondary;
+      if (best == None || score < best_score) {
+        best = candidate;
+        best_score = score;
+      }
+    }
+    if (best != None) focus(best);
   }
 
   void next_tab() {
@@ -1861,8 +1903,7 @@ class X11Backend final : public Backend {
     }
     if (state != Mod4Mask) return;
     if (key == XK_Return) spawn_terminal();
-    if (key == XK_j) focus_relative(1);
-    if (key == XK_k) focus_relative(-1);
+    if (key == XK_h || key == XK_j || key == XK_k || key == XK_l) focus_direction(key);
     if (key == XK_v) split(Orientation::Vertical);
     if (key == XK_s) split(Orientation::Horizontal);
     if (key == XK_Tab) next_tab();

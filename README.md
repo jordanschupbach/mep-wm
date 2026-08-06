@@ -41,10 +41,11 @@ At an outer edge the matching key reverses direction, so the same bindings work
 for either side of a split.
 
 `Super+Space` (or `Super+a`) cycles the workspace between manual, master-stack,
-and monocle layouts. `Super+j` and `Super+k` change focus, `Super+1` through
-`Super+9` select a workspace, `Super+Enter` opens the configured terminal, and
-`Super+Shift+q` exits the manager. The top bar shows all nine workspaces, marks
-the current one, and displays its active layout.
+and monocle layouts. `Super+h`, `j`, `k`, and `l` focus the nearest visible pane
+or client to the left, down, up, or right. `Super+1` through `Super+9` select a
+workspace, `Super+Enter` opens the configured terminal, and `Super+Shift+q`
+exits the manager. The top bar shows all nine workspaces, marks the current one,
+and displays its active layout.
 
 When Xinerama reports more than one monitor, workspaces remain shared globally
 and each window belongs to one monitor. `Super+,` and `Super+.` focus the
