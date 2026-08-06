@@ -28,6 +28,9 @@
             pkgs.libxcb
             pkgs.libffi
             pkgs.libx11
+            pkgs.libXinerama
+            pkgs.libXft
+            pkgs.lua
             pkgs.libxkbcommon
             pkgs.libxdmcp
             pkgs.xorg-server

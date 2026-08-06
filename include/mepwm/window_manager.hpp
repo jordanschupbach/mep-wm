@@ -10,6 +10,12 @@ enum class BackendKind { X11, Wayland };
 struct Config {
   unsigned int gap = 8;
   std::string terminal = "xterm";
+  unsigned int border_width = 2;
+  std::string border_color_normal = "#444444";
+  std::string border_color_focused = "#5294e2";
+  unsigned int snap = 32;
+  float mfact = 0.55f;
+  unsigned int nmaster = 1;
 };
 
 class WindowManager {

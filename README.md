@@ -43,6 +43,11 @@ and monocle layouts. `Super+j` and `Super+k` change focus, `Super+1` through
 `Super+Shift+q` exits the manager. The top bar shows all nine workspaces, marks
 the current one, and displays its active layout.
 
+When Xinerama reports more than one monitor, workspaces remain shared globally
+and each window belongs to one monitor. `Super+,` and `Super+.` focus the
+previous or next monitor; add Shift to send the focused window there. Dropping
+a moved or resized floating window on another monitor also transfers it.
+
 ## Mouse controls
 
 The X11 backend provides an arrow cursor in the nested display. Click a client
