@@ -37,8 +37,8 @@ Use `Super+v` to split that pane vertically (side by side) and `Super+s` to spli
 it horizontally. A new empty pane is selected so the next window opens there.
 Every pane can hold tabs; switch its active tab with `Super+Tab`.
 Resize the selected manual-layout pane with `Super+Shift+h`, `j`, `k`, or `l`.
-At an outer edge the matching key reverses direction, so the same bindings work
-for either side of a split.
+`h` and `k` shrink the pane; `j` and `l` grow it. At an outer edge, the
+binding uses the only available split boundary.
 
 `Super+Space` (or `Super+a`) cycles the workspace between manual, master-stack,
 and monocle layouts. `Super+h`, `j`, `k`, and `l` focus the nearest visible pane
@@ -46,6 +46,37 @@ or client to the left, down, up, or right. `Super+1` through `Super+9` select a
 workspace, `Super+Enter` opens the configured terminal, and `Super+Shift+q`
 exits the manager. The top bar shows all nine workspaces, marks the current one,
 and displays its active layout.
+
+`Super+p` opens an application picker. It searches XDG `.desktop` entries by
+name; type to fuzzy-filter, use Up/Down (or Ctrl+p/Ctrl+n) to choose, Enter to
+launch, and Escape to dismiss.
+
+## Sidebars and widgets
+
+MEPWM provides a left application dock, a bottom system-widget dock, and a
+right dock for notifications, todos, agents, layouts, and keybinding help.
+The bottom dock reports battery, brightness, volume, microphone, media, theme,
+Git branch, load, CPU, memory, disk, Wi-Fi, Bluetooth, keyboard layout, and clock state. Set
+`MEPWM_PROJECT_DIR` to a repository path to enable the Git branch indicator. Scroll
+brightness, volume, or microphone to adjust it; left-click opens its slider.
+Middle-click volume/microphone toggles mute, and media controls use middle
+click for play/pause plus the scroll wheel for next/previous. The notification
+panel is an `org.freedesktop.Notifications` service when MEPWM owns that
+session-bus name. Todos persist in `~/.local/share/mepwm/todos`; Lua config may
+add entries with `mwm.todo("text")` (which returns its ID), manage them with
+`mwm.todo_toggle(id)`, `mwm.todo_remove(id)`, or `mwm.todo_clear_completed()`,
+and create panel notifications with `mwm.notify("summary", "body")`. The
+Agents panel detects running Claude and Codex processes; selecting a matching
+client focuses its window when its PID is available through EWMH.
+All panels scroll with the mouse wheel. Their header `clear` actions dismiss
+notifications, completed todos, or file-backed agent statuses; middle-click an
+individual notification or file-backed agent to dismiss it.
+Wi-Fi and Bluetooth open actionable device panels; their first row toggles the
+radio and device rows connect or disconnect. Media, Git, keyboard-layout, and
+theme panels likewise expose their original widget actions.
+
+Lua configuration can extend the bottom dock with
+`mwm.widget({ name = "…", update = function() return "…" end, click = function(button) end, highlight = true })`.
 
 When Xinerama reports more than one monitor, workspaces remain shared globally
 and each window belongs to one monitor. `Super+,` and `Super+.` focus the

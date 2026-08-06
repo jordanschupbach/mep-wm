@@ -31,6 +31,7 @@
             pkgs.libXinerama
             pkgs.libXft
             pkgs.lua
+            pkgs.dbus
             pkgs.libxkbcommon
             pkgs.libxdmcp
             pkgs.xorg-server

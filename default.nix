@@ -15,6 +15,7 @@ pkgs.stdenv.mkDerivation {
     pkgs.libXinerama
     pkgs.libXft
     pkgs.lua
+    pkgs.dbus
     pkgs.wlroots
     pkgs.wayland
     pkgs.wayland-protocols

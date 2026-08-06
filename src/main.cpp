@@ -10,7 +10,7 @@ namespace {
 void print_usage(const char* program) {
   std::cout << "Usage: " << program << " [--backend x11|wayland] [--terminal COMMAND]\n"
             << "\n"
-            << "X11 controls: Super+h/j/k/l focuses by direction; Super+Enter opens a terminal; "
+            << "X11 controls: Super+h/j/k/l focuses by direction; Super+p opens the application picker; Super+Enter opens a terminal; "
                "Super+Shift+q exits.\n";
 }
 
