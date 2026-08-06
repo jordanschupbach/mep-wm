@@ -61,7 +61,9 @@ enum class Orientation { Vertical, Horizontal };
 enum class LayoutMode { Manual, MasterStack, Monocle };
 enum class SliderKind { Backlight, Volume, Microphone };
 enum class SidePanel { Closed, Notifications, Todos, Agents, Help, Info };
-enum class InfoAction { None, Wifi, Bluetooth, Media, Git, Keyboard, Theme };
+// Note: cannot use "None" as a member name here — X11/X.h (pulled in via
+// Xlib.h) #defines None to 0L, which breaks enum class member declarations.
+enum class InfoAction { NoneAction, Wifi, Bluetooth, Media, Git, Keyboard, Theme };
 
 struct Node {
   Node* parent = nullptr;
@@ -1139,7 +1141,7 @@ class X11Backend final : public Backend {
     };
     const char* runtime = std::getenv("XDG_RUNTIME_DIR");
     const std::string status_dir = runtime && *runtime ? std::string(runtime) + "/mwm-agents" :
-        "/tmp/mwm-agents-" + (std::getenv("USER") ? std::getenv("USER") : "mwm");
+        std::string("/tmp/mwm-agents-") + (std::getenv("USER") ? std::getenv("USER") : "mwm");
     if (DIR* directory = opendir(status_dir.c_str())) {
       while (dirent* entry = readdir(directory)) {
         const std::string name(entry->d_name);
@@ -1611,7 +1613,7 @@ class X11Backend final : public Backend {
   void open_info_panel(const std::string& title, const std::string& body) {
     info_panel_title_ = title;
     info_panel_body_ = body;
-    info_action_ = InfoAction::None;
+    info_action_ = InfoAction::NoneAction;
     if (side_panel_ == SidePanel::Info) draw_side_panel();
     else toggle_side_panel(SidePanel::Info);
   }
@@ -3554,7 +3556,7 @@ class X11Backend final : public Backend {
   bool todos_loaded_ = false;
   std::string info_panel_title_;
   std::string info_panel_body_;
-  InfoAction info_action_ = InfoAction::None;
+  InfoAction info_action_ = InfoAction::NoneAction;
   std::vector<WifiNetwork> wifi_networks_;
   std::vector<BluetoothDevice> bluetooth_devices_;
   DBusConnection* notification_dbus_ = nullptr;
