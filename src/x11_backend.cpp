@@ -126,6 +126,7 @@ enum class Orientation { Vertical, Horizontal };
 enum class LayoutMode { Manual, MasterStack, Monocle };
 enum class SliderKind { Backlight, Volume, Microphone };
 enum class SidePanel { Closed, Notifications, Todos, Agents, Help, Info };
+enum class LauncherMode { Applications, Projects, ActiveProjects };
 // Note: cannot use "None" as a member name here — X11/X.h (pulled in via
 // Xlib.h) #defines None to 0L, which breaks enum class member declarations.
 enum class InfoAction { NoneAction, Wifi, Bluetooth, Media, Git, Keyboard, Theme };
@@ -151,6 +152,11 @@ struct Workspace {
   // this and arranges straight from the tree instead.
   std::vector<Window> stack_order;
   std::vector<Window> floating;
+};
+
+struct Project {
+  std::string path;
+  std::array<Workspace, kWorkspaceCount> workspaces;
 };
 
 // Per-window state that outlives which workspace/container currently holds
@@ -324,6 +330,7 @@ class X11Backend final : public Backend {
     startup.checkpoint("initialize notification D-Bus");
     initialize_lua();
     startup.checkpoint("initialize Lua");
+    initialize_projects();
     create_ipc();
     startup.checkpoint("create IPC socket");
     grab_keys();
@@ -359,6 +366,95 @@ class X11Backend final : public Backend {
 
  private:
   Workspace& workspace() { return workspaces_[current_workspace_]; }
+
+  static std::string project_state_path() {
+    if (const char* data_home = std::getenv("XDG_DATA_HOME"); data_home && *data_home)
+      return std::string(data_home) + "/mepwm/projects";
+    if (const char* home = std::getenv("HOME"); home && *home)
+      return std::string(home) + "/.local/share/mepwm/projects";
+    return {};
+  }
+
+  static std::string project_label(const std::string& path) {
+    const char* home = std::getenv("HOME");
+    if (home && path == home) return "default";
+    const std::filesystem::path value(path);
+    const std::string label = value.filename().string();
+    return label.empty() ? path : label;
+  }
+
+  void save_projects() const {
+    const std::string state_path = project_state_path();
+    if (state_path.empty()) return;
+    std::error_code error;
+    std::filesystem::create_directories(std::filesystem::path(state_path).parent_path(), error);
+    std::ofstream file(state_path);
+    if (!file) return;
+    for (const Project& project : projects_) file << project.path << '\n';
+  }
+
+  bool add_project(const std::string& raw_path, bool save = true) {
+    if (raw_path.empty()) return false;
+    std::filesystem::path path(raw_path);
+    if (raw_path == "~" || raw_path.rfind("~/", 0) == 0) {
+      const char* home = std::getenv("HOME");
+      if (!home || !*home) return false;
+      path = std::filesystem::path(home) / raw_path.substr(raw_path == "~" ? 1 : 2);
+    }
+    std::error_code error;
+    path = std::filesystem::weakly_canonical(path, error);
+    if (error || !std::filesystem::is_directory(path, error)) return false;
+    const std::string normalized = path.string();
+    if (std::any_of(projects_.begin(), projects_.end(), [&](const Project& project) { return project.path == normalized; }))
+      return true;
+    projects_.push_back({normalized, {}});
+    if (save) save_projects();
+    return true;
+  }
+
+  void initialize_projects() {
+    const std::string state_path = project_state_path();
+    std::ifstream file(state_path);
+    for (std::string path; std::getline(file, path);) add_project(path, false);
+    if (const char* home = std::getenv("HOME"); home && *home) add_project(home, false);
+    if (projects_.empty()) {
+      std::error_code error;
+      add_project(std::filesystem::current_path(error).string(), false);
+    }
+    if (!projects_.empty()) save_projects();
+  }
+
+  bool project_has_clients(std::size_t index) const {
+    if (index == active_project_index_) {
+      for (const Workspace& value : workspaces_)
+        if (value.root || !value.floating.empty()) return true;
+      return false;
+    }
+    if (index >= projects_.size()) return false;
+    for (const Workspace& value : projects_[index].workspaces)
+      if (value.root || !value.floating.empty()) return true;
+    return false;
+  }
+
+  void switch_project(std::size_t index) {
+    if (index >= projects_.size()) return;
+    if (index == active_project_index_) {
+      switch_workspace(0);
+      return;
+    }
+    hide_workspace(workspace());
+    projects_[active_project_index_].workspaces = std::move(workspaces_);
+    active_project_index_ = index;
+    workspaces_ = std::move(projects_[active_project_index_].workspaces);
+    current_workspace_ = 0;
+    arrange();
+    if (workspace().focused != None) focus(workspace().focused);
+    else {
+      XSetInputFocus(display_, root_, RevertToPointerRoot, CurrentTime);
+      set_active_window(None);
+    }
+    save_projects();
+  }
 
   const Monitor& monitor(std::size_t index) const { return monitors_[std::min(index, monitors_.size() - 1)]; }
 
@@ -949,6 +1045,13 @@ class X11Backend final : public Backend {
     for (Workspace& ws : workspaces_) {
       collect_windows(ws.root.get(), all);
       all.insert(all.end(), ws.floating.begin(), ws.floating.end());
+    }
+    for (Project& project : projects_) {
+      if (&project == &projects_[active_project_index_]) continue;
+      for (Workspace& ws : project.workspaces) {
+        collect_windows(ws.root.get(), all);
+        all.insert(all.end(), ws.floating.begin(), ws.floating.end());
+      }
     }
     XChangeProperty(display_, root_, net_client_list_atom_, XA_WINDOW, 32, PropModeReplace,
                      reinterpret_cast<unsigned char*>(all.data()), static_cast<int>(all.size()));
@@ -2221,7 +2324,8 @@ class X11Backend final : public Backend {
     const char* mode = workspace().mode == LayoutMode::Manual
                            ? "manual"
                            : workspace().mode == LayoutMode::MasterStack ? "master-stack" : "monocle";
-    text(390, mode, bar_foreground_);
+    const std::string project = projects_.empty() ? "default" : project_label(projects_[active_project_index_].path);
+    text(390, project + " · " + mode, bar_foreground_);
     const std::time_t now = std::time(nullptr);
     char clock[16];
     std::strftime(clock, sizeof(clock), "%H:%M", std::localtime(&now));
@@ -2387,6 +2491,25 @@ class X11Backend final : public Backend {
   }
 
   void filter_launcher_apps() {
+    if (launcher_mode_ != LauncherMode::Applications) {
+      std::vector<std::pair<int, std::size_t>> matches;
+      for (std::size_t index = 0; index < projects_.size(); ++index) {
+        if (launcher_mode_ == LauncherMode::ActiveProjects && !project_has_clients(index)) continue;
+        const int score = fuzzy_score(launcher_query_, projects_[index].path);
+        if (score >= 0) matches.push_back({score, index});
+      }
+      if (!launcher_query_.empty()) {
+        std::sort(matches.begin(), matches.end(), [&](const auto& left, const auto& right) {
+          return left.first != right.first ? left.first > right.first
+                                           : projects_[left.second].path < projects_[right.second].path;
+        });
+      }
+      project_matches_.clear();
+      for (const auto& match : matches) project_matches_.push_back(match.second);
+      launcher_selection_ = 0;
+      launcher_scroll_ = 0;
+      return;
+    }
     std::vector<std::pair<int, std::size_t>> matches;
     for (std::size_t index = 0; index < launcher_apps_.size(); ++index) {
       const int score = fuzzy_score(launcher_query_, launcher_apps_[index].name);
@@ -2422,7 +2545,9 @@ class X11Backend final : public Backend {
 
   void draw_launcher() {
     if (launcher_window_ == None) return;
-    const int shown = std::min<int>(kLauncherMaxRows, launcher_matches_.size() - launcher_scroll_);
+    const std::size_t match_count = launcher_mode_ == LauncherMode::Applications ? launcher_matches_.size()
+                                                                                   : project_matches_.size();
+    const int shown = std::min<int>(kLauncherMaxRows, match_count - launcher_scroll_);
     const int height = kBarHeight * (std::max(1, shown) + 1);
     const Monitor& target_monitor = monitor(current_monitor_);
     const int width = std::max(1, std::min(kLauncherWidth, target_monitor.width - 20));
@@ -2436,11 +2561,15 @@ class X11Backend final : public Backend {
                                         DefaultColormap(display_, screen_));
     XSetForeground(display_, bar_gc_, bar_background_.pixel);
     XFillRectangle(display_, launcher_pixmap_, bar_gc_, 0, 0, width, height);
+    const char* title = launcher_mode_ == LauncherMode::Applications ? "Run: "
+                      : launcher_mode_ == LauncherMode::Projects ? "Projects: " : "Active projects: ";
     draw_launcher_text(10, (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2,
-                       "Run: " + launcher_query_, bar_foreground_);
+                       std::string(title) + launcher_query_, bar_foreground_);
     if (shown == 0) {
       draw_launcher_text(10, kBarHeight + (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2,
-                         launcher_apps_.empty() ? "No applications found" : "No matching applications", bar_foreground_);
+                         launcher_mode_ == LauncherMode::Applications
+                             ? (launcher_apps_.empty() ? "No applications found" : "No matching applications")
+                             : "No matching projects", bar_foreground_);
     }
     for (int row = 0; row < shown; ++row) {
       const int y_offset = (row + 1) * kBarHeight;
@@ -2448,8 +2577,10 @@ class X11Backend final : public Backend {
         XSetForeground(display_, bar_gc_, bar_selected_.pixel);
         XFillRectangle(display_, launcher_pixmap_, bar_gc_, 0, y_offset, width, kBarHeight);
       }
-      draw_launcher_text(10, y_offset + (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2,
-                         launcher_apps_[launcher_matches_[launcher_scroll_ + row]].name,
+      const std::string label = launcher_mode_ == LauncherMode::Applications
+                                    ? launcher_apps_[launcher_matches_[launcher_scroll_ + row]].name
+                                    : project_label(projects_[project_matches_[launcher_scroll_ + row]].path);
+      draw_launcher_text(10, y_offset + (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2, label,
                          launcher_scroll_ + static_cast<std::size_t>(row) == launcher_selection_
                              ? bar_background_
                              : bar_foreground_);
@@ -2465,8 +2596,9 @@ class X11Backend final : public Backend {
     XUnmapWindow(display_, launcher_window_);
   }
 
-  void open_launcher() {
-    scan_launcher_apps();
+  void open_launcher(LauncherMode mode = LauncherMode::Applications) {
+    launcher_mode_ = mode;
+    if (mode == LauncherMode::Applications) scan_launcher_apps();
     launcher_query_.clear();
     filter_launcher_apps();
     if (launcher_window_ == None) {
@@ -2489,12 +2621,25 @@ class X11Backend final : public Backend {
 
   void toggle_launcher() {
     if (launcher_visible_) close_launcher();
-    else open_launcher();
+    else open_launcher(LauncherMode::Applications);
+  }
+
+  void toggle_project_picker(bool active_only) {
+    const LauncherMode mode = active_only ? LauncherMode::ActiveProjects : LauncherMode::Projects;
+    if (launcher_visible_ && launcher_mode_ == mode) close_launcher();
+    else {
+      if (launcher_visible_) close_launcher();
+      open_launcher(mode);
+    }
+  }
+
+  std::size_t launcher_match_count() const {
+    return launcher_mode_ == LauncherMode::Applications ? launcher_matches_.size() : project_matches_.size();
   }
 
   void move_launcher_selection(int delta) {
-    if (launcher_matches_.empty()) return;
-    const int count = static_cast<int>(launcher_matches_.size());
+    if (launcher_match_count() == 0) return;
+    const int count = static_cast<int>(launcher_match_count());
     launcher_selection_ = static_cast<std::size_t>((static_cast<int>(launcher_selection_) + delta + count) % count);
     if (launcher_selection_ < launcher_scroll_) launcher_scroll_ = launcher_selection_;
     if (launcher_selection_ >= launcher_scroll_ + kLauncherMaxRows)
@@ -2502,6 +2647,20 @@ class X11Backend final : public Backend {
   }
 
   void launch_selected_app() {
+    if (launcher_mode_ != LauncherMode::Applications) {
+      if (project_matches_.empty()) {
+        if (launcher_mode_ != LauncherMode::Projects || !add_project(launcher_query_)) return;
+        filter_launcher_apps();
+        if (project_matches_.empty()) return;
+      }
+      const std::size_t project = project_matches_[launcher_selection_];
+      const bool open_terminal = launcher_mode_ == LauncherMode::Projects;
+      const std::string path = projects_[project].path;
+      close_launcher();
+      switch_project(project);
+      if (open_terminal) spawn_terminal_in(path);
+      return;
+    }
     if (launcher_matches_.empty()) return;
     const std::string command = launcher_apps_[launcher_matches_[launcher_selection_]].exec;
     close_launcher();
@@ -2542,7 +2701,7 @@ class X11Backend final : public Backend {
 
   void grab_keys() {
     const unsigned int ignored_modifiers[] = {0, LockMask, Mod2Mask, LockMask | Mod2Mask};
-    const KeySym plain_keys[] = {XK_Return, XK_q, XK_h, XK_j, XK_k, XK_l, XK_p, XK_v, XK_s, XK_Tab, XK_space,
+    const KeySym plain_keys[] = {XK_Return, XK_q, XK_h, XK_i, XK_j, XK_k, XK_l, XK_o, XK_p, XK_v, XK_s, XK_Tab, XK_space,
                                  XK_a, XK_z, XK_m, XK_r, XK_minus, XK_comma, XK_period, XK_1, XK_2, XK_3,
                                  XK_4, XK_5, XK_6, XK_7, XK_8, XK_9};
     const KeySym shift_keys[] = {XK_q, XK_space, XK_c, XK_minus, XK_comma, XK_period, XK_h, XK_j, XK_k, XK_l};
@@ -2766,7 +2925,21 @@ class X11Backend final : public Backend {
 
   void unmanage(Window window) {
     const int index = find_workspace(window);
-    if (index < 0) return;
+    if (index < 0) {
+      for (Project& project : projects_) {
+        for (Workspace& candidate : project.workspaces) {
+          if (!find_leaf(candidate.root.get(), window) &&
+              std::find(candidate.floating.begin(), candidate.floating.end(), window) == candidate.floating.end())
+            continue;
+          XUngrabButton(display_, AnyButton, AnyModifier, window);
+          forget_window(candidate, window);
+          window_state_.erase(window);
+          rebuild_client_list();
+          return;
+        }
+      }
+      return;
+    }
     XUngrabButton(display_, AnyButton, AnyModifier, window);
     if (previously_focused_ == window) previously_focused_ = None;
     const bool visible = index == current_workspace_;
@@ -3297,6 +3470,21 @@ class X11Backend final : public Backend {
 
   void spawn_terminal() const { spawn_command(config_.terminal); }
 
+  void spawn_terminal_in(const std::string& directory) const {
+    const pid_t child = fork();
+    if (child < 0) {
+      std::cerr << "mepwm: could not start terminal: " << std::strerror(errno) << '\n';
+      return;
+    }
+    if (child == 0) {
+      setsid();
+      if (chdir(directory.c_str()) != 0) _exit(127);
+      execl("/bin/sh", "sh", "-c", config_.terminal.c_str(), static_cast<char*>(nullptr));
+      _exit(127);
+    }
+    signal(SIGCHLD, SIG_IGN);
+  }
+
   // Makes a tiled window floating mid-drag, at the given live geometry, and
   // re-tiles everything else immediately (mirrors dwm's drag-to-float).
   void make_floating_in_place(Window window, int x, int y, int width, int height) {
@@ -3500,7 +3688,7 @@ class X11Backend final : public Backend {
           else if (event.xbutton.button == Button5) move_launcher_selection(1);
           else if (event.xbutton.button == Button1 && event.xbutton.y >= kBarHeight) {
             const std::size_t row = static_cast<std::size_t>(event.xbutton.y / kBarHeight - 1);
-            if (row < launcher_matches_.size() - launcher_scroll_ && row < kLauncherMaxRows) {
+            if (row < launcher_match_count() - launcher_scroll_ && row < kLauncherMaxRows) {
               launcher_selection_ = launcher_scroll_ + row;
               launch_selected_app();
               break;
@@ -3593,6 +3781,8 @@ class X11Backend final : public Backend {
     }
     if (state != Mod4Mask) return;
     if (key == XK_Return) spawn_terminal();
+    if (key == XK_i) toggle_project_picker(false);
+    if (key == XK_o) toggle_project_picker(true);
     if (key == XK_p) toggle_launcher();
     if (key == XK_h || key == XK_j || key == XK_k || key == XK_l) focus_direction(key);
     if (key == XK_v) split(Orientation::Vertical);
@@ -3723,6 +3913,8 @@ class X11Backend final : public Backend {
   std::string launcher_query_;
   std::vector<LauncherApp> launcher_apps_;
   std::vector<std::size_t> launcher_matches_;
+  LauncherMode launcher_mode_ = LauncherMode::Applications;
+  std::vector<std::size_t> project_matches_;
   std::size_t launcher_selection_ = 0;
   std::size_t launcher_scroll_ = 0;
   XftFont* bar_font_ = nullptr;
@@ -3734,6 +3926,8 @@ class X11Backend final : public Backend {
   std::vector<BarHit> task_hits_;
   Cursor cursor_ = None;
   std::array<Workspace, kWorkspaceCount> workspaces_;
+  std::vector<Project> projects_;
+  std::size_t active_project_index_ = 0;
   int current_workspace_ = 0;
   std::vector<Monitor> monitors_;
   std::size_t current_monitor_ = 0;

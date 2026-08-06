@@ -56,13 +56,22 @@ binding uses the only available split boundary.
 `Super+Space` (or `Super+a`) cycles the workspace between manual, master-stack,
 and monocle layouts. `Super+h`, `j`, `k`, and `l` focus the nearest visible pane
 or client to the left, down, up, or right. `Super+1` through `Super+9` select a
-workspace, `Super+Enter` opens the configured terminal, and `Super+Shift+q`
-exits the manager. The top bar shows all nine workspaces, marks the current one,
-and displays its active layout.
+workspace within the active project, `Super+Enter` opens the configured terminal,
+and `Super+Shift+q` exits the manager. The top bar shows all nine workspaces,
+marks the current one, and displays its active project and layout.
 
 `Super+p` opens an application picker. It searches XDG `.desktop` entries by
 name; type to fuzzy-filter, use Up/Down (or Ctrl+p/Ctrl+n) to choose, Enter to
 launch, and Escape to dismiss.
+
+## Projects
+
+Each project owns an independent set of nine workspaces. `Super+i` opens the
+project picker; choose a saved project, or type an existing directory and press
+Enter to add, switch to it, and open a terminal there. `Super+o` opens the active-project picker, which
+lists only projects with open clients. Project paths persist in
+`$XDG_DATA_HOME/mepwm/projects` (or `~/.local/share/mepwm/projects`), and the
+home directory is available as the default project.
 
 ## Sidebars and widgets
 
