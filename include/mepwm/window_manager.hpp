@@ -9,7 +9,7 @@ enum class BackendKind { X11, Wayland };
 
 struct Config {
   unsigned int gap = 8;
-  std::string terminal = "xterm";
+  std::string terminal = "command -v kitty >/dev/null 2>&1 && exec kitty || exec xterm";
   unsigned int border_width = 2;
   std::string border_color_normal = "#444444";
   std::string border_color_focused = "#5294e2";
