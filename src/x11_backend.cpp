@@ -18,6 +18,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <numeric>
 #include <poll.h>
 #include <stdexcept>
 #include <string>
@@ -36,6 +37,8 @@ namespace {
 constexpr int kWorkspaceCount = 9;
 constexpr int kBarHeight = 24;
 constexpr int kMinWindowSize = 20;
+constexpr double kResizeStep = 0.05;
+constexpr double kMinSplitWeight = 0.05;
 constexpr int kTraySpacing = 4;
 constexpr long kSystemTrayRequestDock = 0;
 constexpr long kXEmbedEmbeddedNotify = 0;
@@ -49,6 +52,8 @@ struct Node {
   Node* parent = nullptr;
   Orientation orientation = Orientation::Vertical;
   std::vector<std::unique_ptr<Node>> children;
+  // Relative space assigned to each child.  This is empty for leaves.
+  std::vector<double> weights;
   std::vector<Window> tabs;
   std::size_t active_tab = 0;
 
@@ -892,7 +897,7 @@ class X11Backend final : public Backend {
     const KeySym plain_keys[] = {XK_Return, XK_q, XK_j, XK_k, XK_v, XK_s, XK_Tab, XK_space, XK_a,
                                  XK_z, XK_m, XK_r, XK_minus, XK_comma, XK_period, XK_1, XK_2, XK_3, XK_4, XK_5,
                                  XK_6, XK_7, XK_8, XK_9};
-    const KeySym shift_keys[] = {XK_q, XK_space, XK_c, XK_minus, XK_comma, XK_period};
+    const KeySym shift_keys[] = {XK_q, XK_space, XK_c, XK_minus, XK_comma, XK_period, XK_h, XK_j, XK_k, XK_l};
     for (const unsigned int ignored : ignored_modifiers) {
       for (const KeySym key : plain_keys) {
         XGrabKey(display_, XKeysymToKeycode(display_, key), Mod4Mask | ignored, root_, True,
@@ -1096,11 +1101,12 @@ class X11Backend final : public Backend {
     }
     Node* parent = leaf->parent;
     auto& children = parent->children;
-    children.erase(std::remove_if(children.begin(), children.end(),
-                                  [leaf](const std::unique_ptr<Node>& child) {
-                                    return child.get() == leaf;
-                                  }),
-                   children.end());
+    const auto position = std::find_if(children.begin(), children.end(),
+                                       [leaf](const std::unique_ptr<Node>& child) {
+                                         return child.get() == leaf;
+                                       });
+    parent->weights.erase(parent->weights.begin() + (position - children.begin()));
+    children.erase(position);
     if (children.size() == 1) {
       std::unique_ptr<Node>* parent_slot = slot_for(target.root, parent);
       std::unique_ptr<Node> survivor = std::move(children.front());
@@ -1208,7 +1214,60 @@ class X11Backend final : public Backend {
     target.selected_leaf = new_leaf.get();
     container->children.push_back(std::move(old_leaf));
     container->children.push_back(std::move(new_leaf));
+    container->weights = {1.0, 1.0};
     *slot = std::move(container);
+    arrange();
+  }
+
+  // Resize across the nearest split boundary that has the requested axis.
+  // A key uses the neighbour on its named side when available; otherwise it
+  // reverses at the only available boundary, matching the usual smart-resize
+  // behaviour at an edge of a layout.
+  void resize_pane(KeySym key) {
+    Workspace& target = workspace();
+    if (target.mode != LayoutMode::Manual || target.focused == None) return;
+    Node* child = find_leaf(target.root.get(), target.focused);
+    if (!child) return;
+
+    const Orientation axis = (key == XK_h || key == XK_l) ? Orientation::Vertical
+                                                           : Orientation::Horizontal;
+    Node* split = child->parent;
+    while (split && split->orientation != axis) {
+      child = split;
+      split = split->parent;
+    }
+    if (!split) return;
+    const auto found = std::find_if(split->children.begin(), split->children.end(),
+                                    [child](const std::unique_ptr<Node>& node) { return node.get() == child; });
+    if (found == split->children.end()) return;
+    const std::size_t index = static_cast<std::size_t>(found - split->children.begin());
+    const bool has_before = index > 0;
+    const bool has_after = index + 1 < split->children.size();
+    if (!has_before && !has_after) return;
+
+    bool grow = false;
+    std::size_t neighbour = 0;
+    if (key == XK_h) {
+      grow = !has_before;
+      neighbour = has_before ? index - 1 : index + 1;
+    } else if (key == XK_l) {
+      grow = has_after;
+      neighbour = has_after ? index + 1 : index - 1;
+    } else if (key == XK_j) {
+      grow = has_before;
+      neighbour = has_before ? index - 1 : index + 1;
+    } else if (key == XK_k) {
+      grow = !has_after;
+      neighbour = has_after ? index + 1 : index - 1;
+    } else {
+      return;
+    }
+
+    const std::size_t donor = grow ? neighbour : index;
+    if (split->weights[donor] <= kMinSplitWeight) return;
+    const double amount = std::min(kResizeStep, split->weights[donor] - kMinSplitWeight);
+    split->weights[index] += grow ? amount : -amount;
+    split->weights[neighbour] += grow ? -amount : amount;
     arrange();
   }
 
@@ -1432,19 +1491,22 @@ class X11Backend final : public Backend {
       return;
     }
     const int count = static_cast<int>(node->children.size());
+    if (count == 0) return;
     const int gap = static_cast<int>(config_.gap);
-    if (node->orientation == Orientation::Vertical) {
-      const int child_width = (width - gap * (count - 1)) / count;
-      for (int index = 0; index < count; ++index) {
-        arrange_manual(node->children[index].get(), x + index * (child_width + gap), y, child_width,
-                       height, monitor_index);
+    const int available = std::max(1, (node->orientation == Orientation::Vertical ? width : height) -
+                                      gap * (count - 1));
+    const double total = std::accumulate(node->weights.begin(), node->weights.end(), 0.0);
+    int offset = 0;
+    for (int index = 0; index < count; ++index) {
+      const int extent = index == count - 1
+                             ? available - offset
+                             : std::max(1, static_cast<int>(available * node->weights[index] / total));
+      if (node->orientation == Orientation::Vertical) {
+        arrange_manual(node->children[index].get(), x + offset, y, extent, height, monitor_index);
+      } else {
+        arrange_manual(node->children[index].get(), x, y + offset, width, extent, monitor_index);
       }
-    } else {
-      const int child_height = (height - gap * (count - 1)) / count;
-      for (int index = 0; index < count; ++index) {
-        arrange_manual(node->children[index].get(), x, y + index * (child_height + gap), width,
-                       child_height, monitor_index);
-      }
+      offset += extent + gap;
     }
   }
 
@@ -1794,6 +1856,7 @@ class X11Backend final : public Backend {
                                            (current_monitor_ + monitors_.size() - 1) % monitors_.size());
       if (key == XK_period) send_to_monitor(workspace().focused,
                                             (current_monitor_ + 1) % monitors_.size());
+      if (key == XK_h || key == XK_j || key == XK_k || key == XK_l) resize_pane(key);
       return;
     }
     if (state != Mod4Mask) return;

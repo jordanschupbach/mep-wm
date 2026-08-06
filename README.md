@@ -36,6 +36,9 @@ The default layout is **manual**: new windows open as tabs in the selected pane.
 Use `Super+v` to split that pane vertically (side by side) and `Super+s` to split
 it horizontally. A new empty pane is selected so the next window opens there.
 Every pane can hold tabs; switch its active tab with `Super+Tab`.
+Resize the selected manual-layout pane with `Super+Shift+h`, `j`, `k`, or `l`.
+At an outer edge the matching key reverses direction, so the same bindings work
+for either side of a split.
 
 `Super+Space` (or `Super+a`) cycles the workspace between manual, master-stack,
 and monocle layouts. `Super+j` and `Super+k` change focus, `Super+1` through
