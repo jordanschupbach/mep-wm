@@ -14,6 +14,7 @@
 #include <array>
 #include <cerrno>
 #include <cctype>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <ctime>
@@ -55,7 +56,71 @@ constexpr int kLauncherMaxRows = 8;
 constexpr long kSystemTrayRequestDock = 0;
 constexpr long kXEmbedEmbeddedNotify = 0;
 constexpr long kXEmbedMapped = 1 << 0;
+// These match MWM's built-in widget glyphs. They live in Nerd Font's
+// private-use ranges and are drawn with the dedicated fallback font below.
+constexpr const char kIconBatteryFull[] = "\uf240";
+constexpr const char kIconBattery75[] = "\uf241";
+constexpr const char kIconBattery50[] = "\uf242";
+constexpr const char kIconBattery25[] = "\uf243";
+constexpr const char kIconBatteryEmpty[] = "\uf244";
+constexpr const char kIconBatteryCharging[] = "\uf0e7";
+constexpr const char kIconBacklight[] = "\U000f0599";
+constexpr const char kIconVolumeMuted[] = "\uf026";
+constexpr const char kIconVolumeLow[] = "\uf027";
+constexpr const char kIconVolumeHigh[] = "\uf028";
+constexpr const char kIconThemeDark[] = "\uf186";
+constexpr const char kIconThemeLight[] = "\U000f0599";
+constexpr const char kIconCpu[] = "\U000f061a";
+constexpr const char kIconMemory[] = "\U000f035b";
+constexpr const char kIconDisk[] = "\uf0a0";
+constexpr const char kIconWifi[] = "\uf1eb";
+constexpr const char kIconBluetooth[] = "\uf293";
+constexpr const char kIconMicrophone[] = "\uf130";
+constexpr const char kIconMicrophoneMuted[] = "\uf131";
+constexpr const char kIconLoad[] = "\uf0e4";
+constexpr const char kIconGit[] = "\uf126";
+constexpr const char kIconMedia[] = "\uf001";
+constexpr const char kIconKeyboard[] = "\uf11c";
+constexpr const char kIconClock[] = "\uf017";
+constexpr const char kIconLauncher[] = "\uf135";
+constexpr const char kIconFirefox[] = "\uf269";
+constexpr const char kIconTerminal[] = "\uf120";
+constexpr const char kIconInkscape[] = "\U000e0801";
+constexpr const char kIconGimp[] = "\U000e07e7";
+constexpr const char kIconLibreOffice[] = "\uf376";
+constexpr const char kIconVsCode[] = "\U000e08da";
+constexpr const char kIconEmacs[] = "\U000e07cf";
+constexpr const char kIconNeovim[] = "\U000e06a9";
+constexpr const char kIconBell[] = "\uf0f3";
+constexpr const char kIconTodo[] = "\uf0ae";
+constexpr const char kIconAgents[] = "\uf120";
+constexpr const char kIconInfo[] = "\uf05a";
+constexpr const char kIconLayoutTile[] = "\uf00a";
+constexpr const char kIconLayoutMonocle[] = "\uf2d0";
+constexpr const char kIconLayoutOther[] = "\uf009";
+constexpr const char kIconNixOs[] = "\uf313";
 int another_window_manager = 0;
+
+class StartupTimer {
+ public:
+  StartupTimer() : enabled_(std::getenv("MEPWM_STARTUP_TIMING") != nullptr), started_(Clock::now()), previous_(started_) {}
+
+  void checkpoint(const char* phase) {
+    if (!enabled_) return;
+    const Clock::time_point now = Clock::now();
+    const auto elapsed = std::chrono::duration<double, std::milli>(now - previous_).count();
+    const auto total = std::chrono::duration<double, std::milli>(now - started_).count();
+    std::cerr << "mepwm: startup: " << phase << " +" << elapsed << "ms (total " << total << "ms)\n";
+    previous_ = now;
+  }
+
+ private:
+  using Clock = std::chrono::steady_clock;
+
+  bool enabled_;
+  Clock::time_point started_;
+  Clock::time_point previous_;
+};
 
 enum class Orientation { Vertical, Horizontal };
 enum class LayoutMode { Manual, MasterStack, Monocle };
@@ -206,10 +271,12 @@ class X11Backend final : public Backend {
       XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &bar_background_);
       XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &bar_selected_);
     }
-    for (auto& entry : fallback_fonts_) if (entry.second != bar_font_) XftFontClose(display_, entry.second);
+    for (auto& entry : fallback_fonts_)
+      if (entry.second != bar_font_ && entry.second != icon_font_) XftFontClose(display_, entry.second);
     if (bar_xft_draw_) XftDrawDestroy(bar_xft_draw_);
     if (launcher_xft_draw_) XftDrawDestroy(launcher_xft_draw_);
     if (bar_font_) XftFontClose(display_, bar_font_);
+    if (icon_font_) XftFontClose(display_, icon_font_);
     if (bar_pixmap_) XFreePixmap(display_, bar_pixmap_);
     if (launcher_pixmap_) XFreePixmap(display_, launcher_pixmap_);
     if (bar_gc_) XFreeGC(display_, bar_gc_);
@@ -218,9 +285,12 @@ class X11Backend final : public Backend {
   }
 
   int run(const Config& config) override {
+    StartupTimer startup;
+    startup_timer_ = &startup;
     config_ = config;
     display_ = XOpenDisplay(nullptr);
     if (!display_) throw std::runtime_error("could not open the X display");
+    startup.checkpoint("open display");
 
     screen_ = DefaultScreen(display_);
     root_ = RootWindow(display_, screen_);
@@ -235,22 +305,37 @@ class X11Backend final : public Backend {
     if (another_window_manager) {
       throw std::runtime_error("another window manager is already running on this display");
     }
+    startup.checkpoint("claim window-manager ownership");
 
     border_normal_pixel_ = alloc_color(config_.border_color_normal);
     border_focused_pixel_ = alloc_color(config_.border_color_focused);
     update_monitors();
+    startup.checkpoint("configure display and monitors");
 
     create_bar();
+    startup.checkpoint("create top bar");
     create_docks();
+    startup.checkpoint("create sidebars");
     setup_ewmh();
+    startup.checkpoint("set up EWMH");
     create_tray();
+    startup.checkpoint("create system tray");
     initialize_notification_dbus();
+    startup.checkpoint("initialize notification D-Bus");
     initialize_lua();
+    startup.checkpoint("initialize Lua");
     create_ipc();
+    startup.checkpoint("create IPC socket");
     grab_keys();
+    startup.checkpoint("grab keys");
     adopt_existing_windows();
+    startup.checkpoint("adopt existing windows");
     arrange();
+    startup.checkpoint("initial layout and render");
     std::cerr << "mepwm: managing X display " << DisplayString(display_) << '\n';
+    startup.checkpoint("ready");
+    startup_timer_ = nullptr;
+    defer_widget_refresh_ = false;
 
     while (running_) {
       pollfd fds[] = {{ConnectionNumber(display_), POLLIN, 0}, {ipc_fd_, POLLIN, 0}};
@@ -1127,6 +1212,14 @@ class X11Backend final : public Backend {
     return output;
   }
 
+  static int percent_from_command_output(const std::string& output) {
+    const std::size_t percent = output.find('%');
+    if (percent == std::string::npos) return -1;
+    std::size_t begin = percent;
+    while (begin > 0 && std::isdigit(static_cast<unsigned char>(output[begin - 1]))) --begin;
+    return begin == percent ? -1 : std::atoi(output.substr(begin, percent - begin).c_str());
+  }
+
   void refresh_agents() {
     agents_.clear();
     agent_needs_input_ = 0;
@@ -1214,10 +1307,17 @@ class X11Backend final : public Backend {
     std::getline(head, reference);
     constexpr const char* ref_prefix = "ref: refs/heads/";
     if (reference.rfind(ref_prefix, 0) == 0) reference = reference.substr(std::strlen(ref_prefix));
-    if (!reference.empty()) git_status_ = "Git " + reference;
+    if (!reference.empty()) git_status_ = reference;
   }
 
   void refresh_widgets() {
+    // The widget probe launches several external commands (audio, network,
+    // Bluetooth, media, and keyboard queries).  Do not make the first mapped
+    // frame wait for them; the regular event-loop refresh fills these values.
+    if (defer_widget_refresh_) {
+      if (startup_timer_) startup_timer_->checkpoint("defer dock widget refresh");
+      return;
+    }
     const std::time_t now = std::time(nullptr);
     if (widgets_refreshed_ != 0 && now - widgets_refreshed_ < 2) return;
     widgets_refreshed_ = now;
@@ -1329,11 +1429,12 @@ class X11Backend final : public Backend {
     if (XkbGetState(display_, XkbUseCoreKbd, &keyboard_state) == Success && keyboard_state.group >= 0 &&
         static_cast<std::size_t>(keyboard_state.group) < keyboard_layouts_.size())
       keyboard_layout_ = keyboard_layouts_[keyboard_state.group];
-    const std::string volume = capture_command("amixer get Master 2>/dev/null | grep -o '[0-9]*%' | head -1");
-    volume_percent_ = volume.empty() ? -1 : std::atoi(volume.c_str());
-    volume_muted_ = capture_command("amixer get Master 2>/dev/null | grep -q '\\[off\\]' && echo off").empty() == false;
-    const std::string microphone = capture_command("amixer get Capture 2>/dev/null | grep -o '[0-9]*%' | head -1");
-    mic_percent_ = microphone.empty() ? -1 : std::atoi(microphone.c_str());
+    const std::string volume = capture_command("amixer get Master 2>/dev/null");
+    volume_percent_ = percent_from_command_output(volume);
+    volume_muted_ = volume.find("[off]") != std::string::npos;
+    const std::string microphone = capture_command("amixer get Capture 2>/dev/null");
+    mic_percent_ = percent_from_command_output(microphone);
+    mic_muted_ = microphone.find("[off]") != std::string::npos;
     media_title_ = capture_command("playerctl metadata --format '{{ artist }} - {{ title }}' 2>/dev/null");
     std::time_t clock = std::time(nullptr);
     char clock_text[32];
@@ -1362,28 +1463,50 @@ class X11Backend final : public Backend {
         lua_pop(lua_, 1);
       }
     }
+    if (startup_timer_) startup_timer_->checkpoint("refresh dock widgets");
   }
 
   void draw_bottom_widgets(std::size_t monitor_index) {
     refresh_widgets();
     const DockWindows& dock = docks_[monitor_index];
+    const char* battery_icon = battery_charging_ ? kIconBatteryCharging
+                               : battery_percent_ >= 90 ? kIconBatteryFull
+                               : battery_percent_ >= 65 ? kIconBattery75
+                               : battery_percent_ >= 40 ? kIconBattery50
+                               : battery_percent_ >= 15 ? kIconBattery25
+                                                        : kIconBatteryEmpty;
+    const char* volume_icon = volume_percent_ < 0 ? kIconVolumeHigh
+                              : volume_muted_ || volume_percent_ == 0 ? kIconVolumeMuted
+                              : volume_percent_ < 50 ? kIconVolumeLow
+                                                     : kIconVolumeHigh;
     const std::array<std::pair<const char*, std::string>, 15> widgets = {{
-        {"battery", battery_percent_ < 0 ? "Bat n/a" : "Bat " + std::to_string(battery_percent_) + "%"},
-        {"backlight", backlight_percent_ < 0 ? "Light n/a" : "Light " + std::to_string(backlight_percent_) + "%"},
-        {"volume", volume_percent_ < 0 ? "Vol n/a" : std::string(volume_muted_ ? "Mute" : "Vol ") + std::to_string(volume_percent_) + "%"},
-        {"mic", mic_percent_ < 0 ? "" : "Mic " + std::to_string(mic_percent_) + "%"},
-        {"media", media_title_}, {"theme", "Theme"}, {"git", git_status_},
-        {"load", load_average_ < 0 ? "Load n/a" : "Load " + std::to_string(load_average_).substr(0, 4)},
-        {"cpu", cpu_percent_ < 0 ? "CPU …" : "CPU " + std::to_string(cpu_percent_) + "%"},
-        {"memory", mem_percent_ < 0 ? "Mem n/a" : "Mem " + std::to_string(mem_percent_) + "%"},
-        {"disk", disk_percent_ < 0 ? "Disk n/a" : "Disk " + std::to_string(disk_percent_) + "%"},
-        {"wifi", wifi_interface_.empty() ? "WiFi n/a" : "WiFi " + (wifi_ssid_.empty() ? wifi_interface_ : wifi_ssid_)},
-        {"bluetooth", bluetooth_status_.empty() ? "BT" : "BT " + bluetooth_status_},
-        {"keyboard", keyboard_layouts_.size() > 1 ? "Key " + keyboard_layout_ : ""}, {"clock", clock_text_},
+        {"battery", battery_percent_ < 0 ? std::string(kIconBatteryFull) + " n/a" : std::string(battery_icon) + " " + std::to_string(battery_percent_) + "%"},
+        {"backlight", kIconBacklight},
+        {"volume", volume_icon},
+        {"mic", mic_percent_ < 0 ? "" : (mic_muted_ ? kIconMicrophoneMuted : kIconMicrophone)},
+        {"media", media_title_.empty() ? "" : std::string(kIconMedia) + " " + media_title_},
+        {"theme", theme_index_ == 1 ? kIconThemeLight : kIconThemeDark},
+        {"git", git_status_.empty() ? "" : std::string(kIconGit) + " " + git_status_},
+        {"load", load_average_ < 0 ? std::string(kIconLoad) + " n/a" : std::string(kIconLoad) + " " + std::to_string(load_average_).substr(0, 4)},
+        {"cpu", cpu_percent_ < 0 ? std::string(kIconCpu) + " ..." : std::string(kIconCpu) + " " + std::to_string(cpu_percent_) + "%"},
+        {"memory", mem_percent_ < 0 ? std::string(kIconMemory) + " n/a" : std::string(kIconMemory) + " " + std::to_string(mem_percent_) + "%"},
+        {"disk", disk_percent_ < 0 ? std::string(kIconDisk) + " n/a" : std::string(kIconDisk) + " " + std::to_string(disk_percent_) + "%"},
+        {"wifi", wifi_interface_.empty() ? std::string(kIconWifi) + " n/a" : std::string(kIconWifi) + " " + (wifi_ssid_.empty() ? wifi_interface_ : wifi_ssid_)},
+        {"bluetooth", bluetooth_status_.empty() ? kIconBluetooth : std::string(kIconBluetooth) + " " + bluetooth_status_},
+        {"keyboard", keyboard_layouts_.size() > 1 ? std::string(kIconKeyboard) + " " + keyboard_layout_ : ""},
+        {"clock", std::string(kIconClock) + " " + clock_text_},
     }};
     bottom_widget_hits_.clear();
-    int x = 8;
     const int width = std::max(1, monitors_[monitor_index].width - 2 * kDockWidth);
+    int total_width = 0;
+    for (const auto& widget : widgets)
+      if (!widget.second.empty()) total_width += text_width(widget.second) + 14;
+    for (const LuaWidget& widget : lua_widgets_)
+      if (!widget.text.empty()) total_width += text_width(widget.text) + 14;
+    // The bottom dock is a system-status area, so anchor its complete widget
+    // group to the right edge. Keep the existing left margin as a safe
+    // fallback when a narrow monitor cannot fit every widget.
+    int x = std::max(8, width - total_width);
     for (const auto& widget : widgets) {
       if (widget.second.empty()) continue;
       const int widget_width = text_width(widget.second) + 14;
@@ -1798,8 +1921,11 @@ class X11Backend final : public Backend {
   }
 
   void draw_docks() {
-    static const std::array<const char*, 9> left_labels = {"⌕", "Web", "Term", "Ink", "Gimp", "Office", "Code", "Emacs", "Nvim"};
-    static const std::array<const char*, 3> right_labels = {"Bell", "Todo", "Agent"};
+    static const std::array<const char*, 9> left_labels = {
+        kIconLauncher, kIconFirefox, kIconTerminal, kIconInkscape, kIconGimp,
+        kIconLibreOffice, kIconVsCode, kIconEmacs, kIconNeovim,
+    };
+    static const std::array<const char*, 3> right_labels = {kIconBell, kIconTodo, kIconAgents};
     for (std::size_t index = 0; index < monitors_.size() && index < docks_.size(); ++index) {
       const Monitor& target = monitors_[index];
       const DockWindows& dock = docks_[index];
@@ -1809,9 +1935,9 @@ class X11Backend final : public Backend {
       XFillRectangle(display_, dock.bottom, bar_gc_, 0, 0, std::max(1, target.width - 2 * kDockWidth), kBarHeight);
       for (std::size_t row = 0; row < left_labels.size(); ++row)
         draw_dock_cell(dock.left, static_cast<int>(row) * kDockWidth, kDockWidth, kDockWidth, left_labels[row]);
-      draw_dock_cell(dock.left, target.height - kBarHeight, kDockWidth, kBarHeight, "OS");
-      const char* layout = workspace().mode == LayoutMode::Manual ? "Split" :
-                           workspace().mode == LayoutMode::MasterStack ? "Tile" : "Mono";
+      draw_dock_cell(dock.left, target.height - kBarHeight, kDockWidth, kBarHeight, kIconNixOs);
+      const char* layout = workspace().mode == LayoutMode::Manual ? kIconLayoutOther :
+                           workspace().mode == LayoutMode::MasterStack ? kIconLayoutTile : kIconLayoutMonocle;
       draw_dock_cell(dock.right, 0, kDockWidth, kBarHeight, layout);
       const int unread = static_cast<int>(std::count_if(notifications_.begin(), notifications_.end(), [](const Notification& item) {
         return item.unread;
@@ -1823,9 +1949,10 @@ class X11Backend final : public Backend {
       for (std::size_t row = 0; row < right_labels.size(); ++row)
         draw_dock_cell(dock.right, kBarHeight + static_cast<int>(row) * kDockWidth, kDockWidth, kDockWidth,
                        right_labels[row], highlighted[row]);
-      draw_dock_cell(dock.right, target.height - kBarHeight, kDockWidth, kBarHeight, "?");
+      draw_dock_cell(dock.right, target.height - kBarHeight, kDockWidth, kBarHeight, kIconInfo);
       draw_bottom_widgets(index);
     }
+    if (startup_timer_) startup_timer_->checkpoint("draw docks");
   }
 
   int dock_monitor(Window window) const {
@@ -1969,6 +2096,7 @@ class X11Backend final : public Backend {
     bar_gc_ = XCreateGC(display_, bar_, 0, nullptr);
     bar_font_ = XftFontOpenName(display_, screen_, "sans-10");
     if (!bar_font_) throw std::runtime_error("could not open an Xft bar font");
+    icon_font_ = XftFontOpenName(display_, screen_, "UbuntuMono Nerd Font Mono:size=14");
     XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_),
                       "#f8f8f2", &bar_foreground_);
     XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_),
@@ -1982,6 +2110,10 @@ class X11Backend final : public Backend {
   XftFont* fallback_font(FcChar32 codepoint) {
     const auto cached = fallback_fonts_.find(codepoint);
     if (cached != fallback_fonts_.end()) return cached->second;
+    if (icon_font_ && XftCharExists(display_, icon_font_, codepoint)) {
+      fallback_fonts_.emplace(codepoint, icon_font_);
+      return icon_font_;
+    }
     FcPattern* pattern = FcNameParse(reinterpret_cast<const FcChar8*>("sans-10"));
     FcCharSet* charset = FcCharSetCreate();
     FcCharSetAddChar(charset, codepoint);
@@ -3526,6 +3658,8 @@ class X11Backend final : public Backend {
   Window bar_ = None;
   Window tray_ = None;
   std::vector<DockWindows> docks_;
+  StartupTimer* startup_timer_ = nullptr;
+  bool defer_widget_refresh_ = true;
   std::vector<WidgetHit> bottom_widget_hits_;
   std::time_t widgets_refreshed_ = 0;
   std::string battery_capacity_path_, battery_status_path_, backlight_path_, backlight_max_path_;
@@ -3539,7 +3673,7 @@ class X11Backend final : public Backend {
   std::string git_status_;
   bool network_up_ = false;
   int volume_percent_ = -1, mic_percent_ = -1;
-  bool volume_muted_ = false;
+  bool volume_muted_ = false, mic_muted_ = false;
   Window slider_window_ = None;
   bool slider_visible_ = false;
   bool slider_dragging_ = false;
@@ -3584,6 +3718,7 @@ class X11Backend final : public Backend {
   std::size_t launcher_selection_ = 0;
   std::size_t launcher_scroll_ = 0;
   XftFont* bar_font_ = nullptr;
+  XftFont* icon_font_ = nullptr;
   XftColor bar_foreground_{};
   XftColor bar_background_{};
   XftColor bar_selected_{};

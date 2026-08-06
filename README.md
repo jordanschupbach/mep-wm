@@ -30,6 +30,19 @@ Xephyr's XKB compiler may report non-fatal laptop/media-key warnings on some
 systems. Its diagnostics are written to `/tmp/mepwm-xephyr.log` instead of the
 terminal; set `MEPWM_XEPHYR_LOG` to choose another log file.
 
+The Xephyr recipe uses xterm's FreeType `monospace` font rather than its legacy
+bitmap default, and forces software GL for clients in the nested display. This
+avoids missing-font and DRI3 warnings without changing the host session. A
+Firefox `CanCreateUserNamespace` error is instead a host/container sandbox
+restriction: enable unprivileged user namespaces in the environment running
+Xephyr, rather than disabling Firefox's content sandbox.
+
+To measure cold X11 startup in an isolated Xvfb server, run `just benchmark-startup`
+(or `just benchmark-mepwm` from the repository root). Set
+`MEPWM_STARTUP_TIMING=1` when launching `mepwm` directly to log each startup
+phase. Dynamic sidebar widget data is intentionally populated after the first
+frame so system-command probes cannot delay the window manager becoming ready.
+
 ## X11 controls
 
 The default layout is **manual**: new windows open as tabs in the selected pane.
@@ -74,6 +87,9 @@ individual notification or file-backed agent to dismiss it.
 Wi-Fi and Bluetooth open actionable device panels; their first row toggles the
 radio and device rows connect or disconnect. Media, Git, keyboard-layout, and
 theme panels likewise expose their original widget actions.
+
+The built-in widget glyphs use `UbuntuMono Nerd Font Mono`, matching MWM;
+install the Ubuntu Mono Nerd Font for those icons to render.
 
 Lua configuration can extend the bottom dock with
 `mwm.widget({ name = "…", update = function() return "…" end, click = function(button) end, highlight = true })`.
