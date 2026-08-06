@@ -397,6 +397,15 @@ class X11Backend final : public Backend {
     for (auto& entry : window_state_) entry.second.monitor = std::min(entry.second.monitor, monitors_.size() - 1);
   }
 
+  // Xephyr can change the nested root size when its host window is resized.
+  // Refresh this before laying out a workspace as well as on ConfigureNotify:
+  // a workspace switch must never reuse geometry captured before that resize.
+  void refresh_display_geometry() {
+    update_monitors();
+    if (bar_) XResizeWindow(display_, bar_, DisplayWidth(display_, screen_), kBarHeight);
+    create_docks();
+  }
+
   void send_to_monitor(Window window, std::size_t destination) {
     if (window == None || destination >= monitors_.size()) return;
     WindowState& state = window_state_[window];
@@ -3116,6 +3125,7 @@ class X11Backend final : public Backend {
 
   void switch_workspace(int index) {
     if (index == current_workspace_ || index < 0 || index >= kWorkspaceCount) return;
+    refresh_display_geometry();
     hide_workspace(workspace());
     current_workspace_ = index;
     arrange();
@@ -3536,9 +3546,7 @@ class X11Backend final : public Backend {
           break;
         }
         if (event.xconfigure.window == root_) {
-          update_monitors();
-          XResizeWindow(display_, bar_, event.xconfigure.width, kBarHeight);
-          create_docks();
+          refresh_display_geometry();
           arrange();
         }
         break;

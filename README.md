@@ -21,7 +21,7 @@ For safe X11 development inside an existing X11 desktop, run:
 just xephyr
 ```
 
-This creates a nested Xephyr display at `:1`; it never claims your host display.
+This creates a resizable nested Xephyr display at `:1`; it never claims your host display.
 If `:1` is already in use, choose another display, for example `just xephyr :2`.
 Closing either the Xephyr window or mepwm stops the other process and returns to
 your terminal.
