@@ -2843,12 +2843,12 @@ class X11Backend final : public Backend {
     if (bar_visible_ && bar_ != None) {
       // Bar-relative x now equals screen x, since bar_ starts at x=0.
       candidates.push_back({4, 4, bar_, kDockWidth / 2, kBarHeight / 2});
+      const int mode_x = kDockWidth;
+      candidates.push_back({mode_x + 4, 4, bar_, mode_x + 10, kBarHeight / 2});
       for (int index = 0; index < kWorkspaceCount; ++index) {
-        const int x = kDockWidth + index * 84;
+        const int x = workspace_start_x_ + index * 84;
         candidates.push_back({x + 4, 4, bar_, x + 10, kBarHeight / 2});
       }
-      const int mode_x = kDockWidth + 756;
-      candidates.push_back({mode_x + 4, 4, bar_, mode_x + 10, kBarHeight / 2});
       for (const BarHit& hit : task_hits_) {
         candidates.push_back({hit.left + 4, 4, bar_, (hit.left + hit.right) / 2, kBarHeight / 2});
       }
@@ -3162,7 +3162,18 @@ class X11Backend final : public Backend {
                               workspace().mode == LayoutMode::MasterStack ? kIconLayoutTile : kIconLayoutMonocle;
     draw_dock_cell_h(bar_pixmap_, width - kDockWidth, kDockWidth, kBarHeight, layout_icon);
 
-    const int content_x = kDockWidth;
+    // Current project (and layout mode) sits right after the launcher cell,
+    // ahead of the workspace numbers, so it reads left-to-right as
+    // "launcher -> where am I -> which workspace".
+    const char* mode = workspace().mode == LayoutMode::Manual
+                           ? "manual"
+                           : workspace().mode == LayoutMode::MasterStack ? "master-stack" : "monocle";
+    const std::string project = projects_.empty() ? "default" : project_label(projects_[active_project_index_].path);
+    const std::string project_label_text = project + " · " + mode;
+    text(kDockWidth + 24, project_label_text, bar_foreground_);
+
+    const int content_x = kDockWidth + 24 + text_width(project_label_text) + 32;
+    workspace_start_x_ = content_x;
     for (int index = 0; index < kWorkspaceCount; ++index) {
       const int x = content_x + index * 84;
       std::vector<Window> occupied;
@@ -3179,12 +3190,6 @@ class X11Backend final : public Backend {
       text(x + 24, std::to_string(index + 1), index == current_workspace_ ? bar_background_ : bar_foreground_);
     }
 
-    const char* mode = workspace().mode == LayoutMode::Manual
-                           ? "manual"
-                           : workspace().mode == LayoutMode::MasterStack ? "master-stack" : "monocle";
-    const std::string project = projects_.empty() ? "default" : project_label(projects_[active_project_index_].path);
-    const std::string project_label_text = project + " · " + mode;
-    text(content_x + 780, project_label_text, bar_foreground_);
     const std::string clock_widget = std::string(kIconClock) + " " + clock_text_;
     const int clock_width = text_width(clock_widget) + 32;
     const int clock_x = width - kDockWidth - clock_width - tray_pixel_width();
@@ -3193,7 +3198,7 @@ class X11Backend final : public Backend {
     std::vector<Window> windows;
     collect_windows(workspace().root.get(), windows);
     windows.insert(windows.end(), workspace().floating.begin(), workspace().floating.end());
-    bar_task_list_x_ = std::max(content_x + 960, content_x + 780 + text_width(project_label_text) + 32);
+    bar_task_list_x_ = content_x + 756 + 32;
     int x = bar_task_list_x_;
     const int end = std::max(x, clock_x);
     for (Window window : windows) {
@@ -5208,7 +5213,7 @@ class X11Backend final : public Backend {
       // Launcher and layout-mode toggle live in the outer kDockWidth corners
       // now that the bar spans the full display width.
       if (event.x < kDockWidth) {
-        if (event.button == Button1) toggle_launcher();
+        if (event.button == Button1) toggle_project_picker(false);
         return;
       }
       if (event.x >= DisplayWidth(display_, screen_) - kDockWidth) {
@@ -5216,15 +5221,19 @@ class X11Backend final : public Backend {
         if (event.button == Button3) { cycle_layout(); cycle_layout(); }
         return;
       }
-      const int workspace_index = (event.x - kDockWidth) / 84;
-      if (workspace_index >= 0 && workspace_index < kWorkspaceCount) {
-        switch_workspace(workspace_index);
-      } else if (event.x >= kDockWidth + 756 && event.x < bar_task_list_x_) {
+      if (event.x < workspace_start_x_) {
+        // Clicking the current-project/layout-mode label cycles the layout,
+        // same as clicking the layout icon in the bar's right-hand corner.
         if (event.button == Button1) cycle_layout();
         if (event.button == Button3) {
           workspace().mode = LayoutMode::Monocle;
           arrange();
         }
+        return;
+      }
+      const int workspace_index = (event.x - workspace_start_x_) / 84;
+      if (workspace_index >= 0 && workspace_index < kWorkspaceCount) {
+        switch_workspace(workspace_index);
       } else {
         for (const BarHit& hit : task_hits_) {
           if (event.x >= hit.left && event.x < hit.right) {
@@ -5340,6 +5349,7 @@ class X11Backend final : public Backend {
   std::unordered_map<FcChar32, XftFont*> fallback_fonts_;
   std::vector<BarHit> task_hits_;
   int bar_task_list_x_ = 960;
+  int workspace_start_x_ = kDockWidth;
   bool hints_visible_ = false;
   std::string hint_query_;
   std::vector<Hint> hints_;
