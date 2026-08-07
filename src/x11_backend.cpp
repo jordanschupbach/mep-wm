@@ -45,8 +45,8 @@ namespace mepwm {
 namespace {
 
 constexpr int kWorkspaceCount = 9;
-constexpr int kBarHeight = 24;
 constexpr int kDockWidth = 48;
+constexpr int kBarHeight = kDockWidth;
 constexpr int kMinWindowSize = 20;
 constexpr double kResizeStep = 0.05;
 constexpr double kMinSplitWeight = 0.05;
@@ -507,7 +507,10 @@ class X11Backend final : public Backend {
   // a workspace switch must never reuse geometry captured before that resize.
   void refresh_display_geometry() {
     update_monitors();
-    if (bar_) XResizeWindow(display_, bar_, DisplayWidth(display_, screen_), kBarHeight);
+    if (bar_) {
+      const int width = std::max(1, DisplayWidth(display_, screen_) - 2 * kDockWidth);
+      XMoveResizeWindow(display_, bar_, kDockWidth, 0, width, kBarHeight);
+    }
     create_docks();
   }
 
@@ -1338,7 +1341,7 @@ class X11Backend final : public Backend {
       XMapRaised(display_, icon.window);
       x += icon.width + kTraySpacing;
     }
-    XMoveResizeWindow(display_, tray_, DisplayWidth(display_, screen_) - width, 0, width, kBarHeight);
+    XMoveResizeWindow(display_, tray_, DisplayWidth(display_, screen_) - kDockWidth - width, 0, width, kBarHeight);
     XMapRaised(display_, tray_);
   }
 
@@ -2390,7 +2393,8 @@ class X11Backend final : public Backend {
   }
 
   void create_bar() {
-    bar_ = XCreateSimpleWindow(display_, root_, 0, 0, DisplayWidth(display_, screen_), kBarHeight,
+    const int width = std::max(1, DisplayWidth(display_, screen_) - 2 * kDockWidth);
+    bar_ = XCreateSimpleWindow(display_, root_, kDockWidth, 0, width, kBarHeight,
                                0, BlackPixel(display_, screen_), BlackPixel(display_, screen_));
     XSetWindowAttributes attributes{};
     attributes.override_redirect = True;
@@ -2399,9 +2403,9 @@ class X11Backend final : public Backend {
     XStoreName(display_, bar_, "mepwm-bar");
     XDefineCursor(display_, bar_, cursor_);
     bar_gc_ = XCreateGC(display_, bar_, 0, nullptr);
-    bar_font_ = XftFontOpenName(display_, screen_, "sans-10");
+    bar_font_ = XftFontOpenName(display_, screen_, "sans-16");
     if (!bar_font_) throw std::runtime_error("could not open an Xft bar font");
-    icon_font_ = XftFontOpenName(display_, screen_, "UbuntuMono Nerd Font Mono:size=14");
+    icon_font_ = XftFontOpenName(display_, screen_, "UbuntuMono Nerd Font Mono:size=34");
     XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_),
                       "#f8f8f2", &bar_foreground_);
     XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_),
@@ -2419,7 +2423,7 @@ class X11Backend final : public Backend {
       fallback_fonts_.emplace(codepoint, icon_font_);
       return icon_font_;
     }
-    FcPattern* pattern = FcNameParse(reinterpret_cast<const FcChar8*>("sans-10"));
+    FcPattern* pattern = FcNameParse(reinterpret_cast<const FcChar8*>("sans-16"));
     FcCharSet* charset = FcCharSetCreate();
     FcCharSetAddChar(charset, codepoint);
     FcPatternAddCharSet(pattern, FC_CHARSET, charset);
@@ -2484,7 +2488,7 @@ class X11Backend final : public Backend {
 
   void draw_bar() {
     if (!bar_) return;
-    const int width = DisplayWidth(display_, screen_);
+    const int width = std::max(1, DisplayWidth(display_, screen_) - 2 * kDockWidth);
     if (bar_pixmap_width_ != width) {
       if (bar_xft_draw_) XftDrawDestroy(bar_xft_draw_);
       if (bar_pixmap_) XFreePixmap(display_, bar_pixmap_);
@@ -2499,49 +2503,51 @@ class X11Backend final : public Backend {
     auto text = [&](int x, const std::string& value, const XftColor& color) { draw_text(x, value, color); };
 
     for (int index = 0; index < kWorkspaceCount; ++index) {
-      const int x = index * 42;
+      const int x = index * 84;
       std::vector<Window> occupied;
       collect_windows(workspaces_[index].root.get(), occupied);
       occupied.insert(occupied.end(), workspaces_[index].floating.begin(), workspaces_[index].floating.end());
       if (index == current_workspace_) {
         XSetForeground(display_, bar_gc_, bar_selected_.pixel);
-        XFillRectangle(display_, bar_pixmap_, bar_gc_, x, 0, 38, kBarHeight);
+        XFillRectangle(display_, bar_pixmap_, bar_gc_, x, 0, 76, kBarHeight);
       }
       if (!occupied.empty()) {
         XSetForeground(display_, bar_gc_, index == current_workspace_ ? bar_background_.pixel : bar_foreground_.pixel);
-        XFillRectangle(display_, bar_pixmap_, bar_gc_, x + 3, 9, 5, 5);
+        XFillRectangle(display_, bar_pixmap_, bar_gc_, x + 6, 18, 10, 10);
       }
-      text(x + 12, std::to_string(index + 1), index == current_workspace_ ? bar_background_ : bar_foreground_);
+      text(x + 24, std::to_string(index + 1), index == current_workspace_ ? bar_background_ : bar_foreground_);
     }
 
     const char* mode = workspace().mode == LayoutMode::Manual
                            ? "manual"
                            : workspace().mode == LayoutMode::MasterStack ? "master-stack" : "monocle";
     const std::string project = projects_.empty() ? "default" : project_label(projects_[active_project_index_].path);
-    text(390, project + " · " + mode, bar_foreground_);
+    const std::string project_label_text = project + " · " + mode;
+    text(780, project_label_text, bar_foreground_);
     const std::time_t now = std::time(nullptr);
     char clock[16];
     std::strftime(clock, sizeof(clock), "%H:%M", std::localtime(&now));
-    const int clock_width = text_width(clock) + 16;
+    const int clock_width = text_width(clock) + 32;
     text(width - clock_width, clock, bar_foreground_);
     task_hits_.clear();
     std::vector<Window> windows;
     collect_windows(workspace().root.get(), windows);
     windows.insert(windows.end(), workspace().floating.begin(), workspace().floating.end());
-    int x = 480;
-    const int end = tray_ == None ? width - clock_width : std::max(480, width - 140 - clock_width);
+    bar_task_list_x_ = std::max(960, 780 + text_width(project_label_text) + 32);
+    int x = bar_task_list_x_;
+    const int end = tray_ == None ? width - clock_width : std::max(x, width - 280 - clock_width);
     for (Window window : windows) {
       char* title = nullptr;
       std::string label = XFetchName(display_, window, &title) && title ? title : "untitled";
       if (title) XFree(title);
       if (label.size() > 24) label.resize(23), label += "…";
-      const int item_width = text_width(label) + 16;
+      const int item_width = text_width(label) + 32;
       if (x + item_width > end) break;
       if (window == workspace().focused) {
         XSetForeground(display_, bar_gc_, bar_selected_.pixel);
-        XFillRectangle(display_, bar_pixmap_, bar_gc_, x, 2, item_width, kBarHeight - 4);
+        XFillRectangle(display_, bar_pixmap_, bar_gc_, x, 4, item_width, kBarHeight - 8);
       }
-      text(x + 8, label, window == workspace().focused ? bar_background_ : bar_foreground_);
+      text(x + 16, label, window == workspace().focused ? bar_background_ : bar_foreground_);
       task_hits_.push_back({x, x + item_width, window});
       x += item_width + 1;
     }
@@ -4182,10 +4188,10 @@ class X11Backend final : public Backend {
       }
     }
     if (event.window == bar_) {
-      const int workspace_index = event.x / 42;
+      const int workspace_index = event.x / 84;
       if (workspace_index >= 0 && workspace_index < kWorkspaceCount) {
         switch_workspace(workspace_index);
-      } else if (event.x >= 378 && event.x < 480) {
+      } else if (event.x >= 756 && event.x < bar_task_list_x_) {
         if (event.button == Button1) cycle_layout();
         if (event.button == Button3) {
           workspace().mode = LayoutMode::Monocle;
@@ -4301,6 +4307,7 @@ class X11Backend final : public Backend {
   XftColor bar_selected_{};
   std::unordered_map<FcChar32, XftFont*> fallback_fonts_;
   std::vector<BarHit> task_hits_;
+  int bar_task_list_x_ = 960;
   Cursor cursor_ = None;
   std::array<Workspace, kWorkspaceCount> workspaces_;
   std::vector<Project> projects_;
