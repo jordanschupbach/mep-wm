@@ -192,6 +192,15 @@ struct DockWindows {
   Window left = None;
   Window bottom = None;
   Window right = None;
+  // Off-screen buffers: everything below is composited here first and blitted
+  // to the live window in one XCopyArea, so the clear+redraw each refresh
+  // never becomes a visible flash the way drawing straight to the window did.
+  Pixmap left_buffer = None;
+  Pixmap bottom_buffer = None;
+  Pixmap right_buffer = None;
+  int left_buffer_width = 0, left_buffer_height = 0;
+  int bottom_buffer_width = 0, bottom_buffer_height = 0;
+  int right_buffer_width = 0, right_buffer_height = 0;
 };
 
 struct WidgetHit {
@@ -304,6 +313,11 @@ class X11Backend final : public Backend {
     if (hint_font_ && hint_font_ != bar_font_) XftFontClose(display_, hint_font_);
     if (bar_pixmap_) XFreePixmap(display_, bar_pixmap_);
     if (launcher_pixmap_) XFreePixmap(display_, launcher_pixmap_);
+    for (const DockWindows& dock : docks_) {
+      if (dock.left_buffer) XFreePixmap(display_, dock.left_buffer);
+      if (dock.bottom_buffer) XFreePixmap(display_, dock.bottom_buffer);
+      if (dock.right_buffer) XFreePixmap(display_, dock.right_buffer);
+    }
     if (bar_gc_) XFreeGC(display_, bar_gc_);
     if (cursor_) XFreeCursor(display_, cursor_);
     if (display_) XCloseDisplay(display_);
@@ -1775,7 +1789,7 @@ class X11Backend final : public Backend {
       if (widget.second.empty()) continue;
       const int widget_width = text_width(widget.second) + 14;
       if (x + widget_width > width) break;
-      draw_dock_text(dock.bottom, x + 7, (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2, widget.second,
+      draw_dock_text(dock.bottom_buffer, x + 7, (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2, widget.second,
                      bar_foreground_);
       bottom_widget_hits_.push_back({x, x + widget_width, widget.first});
       x += widget_width;
@@ -1787,9 +1801,9 @@ class X11Backend final : public Backend {
       if (x + widget_width > width) break;
       if (widget.highlight) {
         XSetForeground(display_, bar_gc_, bar_selected_.pixel);
-        XFillRectangle(display_, dock.bottom, bar_gc_, x, 0, widget_width, kBarHeight);
+        XFillRectangle(display_, dock.bottom_buffer, bar_gc_, x, 0, widget_width, kBarHeight);
       }
-      draw_dock_text(dock.bottom, x + 7, (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2, widget.text,
+      draw_dock_text(dock.bottom_buffer, x + 7, (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2, widget.text,
                      widget.highlight ? bar_background_ : bar_foreground_);
       bottom_widget_hits_.push_back({x, x + widget_width, "lua:" + std::to_string(index)});
       x += widget_width;
@@ -2234,6 +2248,18 @@ class X11Backend final : public Backend {
     draw_docks();
   }
 
+  // (Re)creates a dock's off-screen buffer only when its size actually
+  // changed, so steady-state redraws reuse the same pixmap.
+  void ensure_dock_buffer(Pixmap& pixmap, int& buffer_width, int& buffer_height, int width, int height) {
+    width = std::max(1, width);
+    height = std::max(1, height);
+    if (pixmap != None && buffer_width == width && buffer_height == height) return;
+    if (pixmap != None) XFreePixmap(display_, pixmap);
+    pixmap = XCreatePixmap(display_, root_, width, height, DefaultDepth(display_, screen_));
+    buffer_width = width;
+    buffer_height = height;
+  }
+
   void draw_docks() {
     static const std::array<const char*, 9> left_labels = {
         kIconLauncher, kIconFirefox, kIconTerminal, kIconInkscape, kIconGimp,
@@ -2242,17 +2268,21 @@ class X11Backend final : public Backend {
     static const std::array<const char*, 3> right_labels = {kIconBell, kIconTodo, kIconAgents};
     for (std::size_t index = 0; index < monitors_.size() && index < docks_.size(); ++index) {
       const Monitor& target = monitors_[index];
-      const DockWindows& dock = docks_[index];
+      DockWindows& dock = docks_[index];
+      const int bottom_width = std::max(1, target.width - 2 * kDockWidth);
+      ensure_dock_buffer(dock.left_buffer, dock.left_buffer_width, dock.left_buffer_height, kDockWidth, target.height);
+      ensure_dock_buffer(dock.right_buffer, dock.right_buffer_width, dock.right_buffer_height, kDockWidth, target.height);
+      ensure_dock_buffer(dock.bottom_buffer, dock.bottom_buffer_width, dock.bottom_buffer_height, bottom_width, kBarHeight);
       XSetForeground(display_, bar_gc_, bar_background_.pixel);
-      XFillRectangle(display_, dock.left, bar_gc_, 0, 0, kDockWidth, target.height);
-      XFillRectangle(display_, dock.right, bar_gc_, 0, 0, kDockWidth, target.height);
-      XFillRectangle(display_, dock.bottom, bar_gc_, 0, 0, std::max(1, target.width - 2 * kDockWidth), kBarHeight);
+      XFillRectangle(display_, dock.left_buffer, bar_gc_, 0, 0, kDockWidth, target.height);
+      XFillRectangle(display_, dock.right_buffer, bar_gc_, 0, 0, kDockWidth, target.height);
+      XFillRectangle(display_, dock.bottom_buffer, bar_gc_, 0, 0, bottom_width, kBarHeight);
       for (std::size_t row = 0; row < left_labels.size(); ++row)
-        draw_dock_cell(dock.left, static_cast<int>(row) * kDockWidth, kDockWidth, kDockWidth, left_labels[row]);
-      draw_dock_cell(dock.left, target.height - kBarHeight, kDockWidth, kBarHeight, kIconNixOs);
+        draw_dock_cell(dock.left_buffer, static_cast<int>(row) * kDockWidth, kDockWidth, kDockWidth, left_labels[row]);
+      draw_dock_cell(dock.left_buffer, target.height - kBarHeight, kDockWidth, kBarHeight, kIconNixOs);
       const char* layout = workspace().mode == LayoutMode::Manual ? kIconLayoutOther :
                            workspace().mode == LayoutMode::MasterStack ? kIconLayoutTile : kIconLayoutMonocle;
-      draw_dock_cell(dock.right, 0, kDockWidth, kBarHeight, layout);
+      draw_dock_cell(dock.right_buffer, 0, kDockWidth, kBarHeight, layout);
       const int unread = static_cast<int>(std::count_if(notifications_.begin(), notifications_.end(), [](const Notification& item) {
         return item.unread;
       }));
@@ -2261,11 +2291,15 @@ class X11Backend final : public Backend {
       for (const Todo& todo : todos_) if (!todo.done) ++incomplete;
       const std::array<bool, 3> highlighted = {unread > 0, incomplete > 0, agent_needs_input_ > 0};
       for (std::size_t row = 0; row < right_labels.size(); ++row)
-        draw_dock_cell(dock.right, kBarHeight + static_cast<int>(row) * kDockWidth, kDockWidth, kDockWidth,
+        draw_dock_cell(dock.right_buffer, kBarHeight + static_cast<int>(row) * kDockWidth, kDockWidth, kDockWidth,
                        right_labels[row], highlighted[row]);
-      draw_dock_cell(dock.right, target.height - kBarHeight, kDockWidth, kBarHeight, kIconInfo);
+      draw_dock_cell(dock.right_buffer, target.height - kBarHeight, kDockWidth, kBarHeight, kIconInfo);
       draw_bottom_widgets(index);
+      XCopyArea(display_, dock.left_buffer, dock.left, bar_gc_, 0, 0, kDockWidth, target.height, 0, 0);
+      XCopyArea(display_, dock.right_buffer, dock.right, bar_gc_, 0, 0, kDockWidth, target.height, 0, 0);
+      XCopyArea(display_, dock.bottom_buffer, dock.bottom, bar_gc_, 0, 0, bottom_width, kBarHeight, 0, 0);
     }
+    XFlush(display_);
     if (startup_timer_) startup_timer_->checkpoint("draw docks");
   }
 
