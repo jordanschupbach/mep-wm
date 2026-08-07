@@ -2188,7 +2188,7 @@ class X11Backend final : public Backend {
       if (length > 0) draw_side_panel();
       return;
     }
-    if (key == XK_Escape) { close_side_panel(); return; }
+    if (key == XK_Escape || (state == Mod4Mask && key == XK_t)) { close_side_panel(); return; }
     if (state == 0 && key == XK_a) { todo_input_active_ = true; todo_input_text_.clear(); draw_side_panel(); return; }
     if (state == 0 && key == XK_d && todo_selected_ >= 0 && static_cast<std::size_t>(todo_selected_) < todos_.size()) {
       mark_todo_done(todos_[static_cast<std::size_t>(todo_selected_)]);
