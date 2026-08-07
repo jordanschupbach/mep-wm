@@ -244,10 +244,11 @@ struct Notification {
   std::time_t expires_at = 0;
 };
 
-struct Todo {
-  unsigned int id = 0;
+// `line` is the 0-based line number the item was parsed from in TODO.org, so
+// it can be located again to flip TODO -> DONE without re-scanning the file.
+struct TodoItem {
   std::string text;
-  bool done = false;
+  std::size_t line = 0;
 };
 
 struct AgentStatus {
@@ -400,6 +401,7 @@ class X11Backend final : public Backend {
       if (ready == 0) {
         draw_bar();
         draw_docks();
+        if (side_panel_ == SidePanel::Todos) draw_side_panel();
       }
       process_notification_dbus();
       if (ipc_fd_ >= 0 && fds[1].revents & POLLIN) handle_ipc_client();
@@ -765,54 +767,6 @@ class X11Backend final : public Backend {
     return 0;
   }
 
-  static int lua_todo(lua_State* state) {
-    X11Backend* backend = lua_backend(state);
-    backend->load_todos();
-    const unsigned int id = backend->next_todo_id_++;
-    backend->todos_.push_back({id, luaL_checkstring(state, 1), false});
-    backend->save_todos();
-    if (backend->side_panel_ == SidePanel::Todos) backend->draw_side_panel();
-    backend->draw_docks();
-    lua_pushinteger(state, id);
-    return 1;
-  }
-
-  static int lua_todo_toggle(lua_State* state) {
-    X11Backend* backend = lua_backend(state);
-    backend->load_todos();
-    const unsigned int id = static_cast<unsigned int>(luaL_checkinteger(state, 1));
-    for (Todo& todo : backend->todos_) if (todo.id == id) todo.done = !todo.done;
-    backend->save_todos();
-    if (backend->side_panel_ == SidePanel::Todos) backend->draw_side_panel();
-    backend->draw_docks();
-    return 0;
-  }
-
-  static int lua_todo_remove(lua_State* state) {
-    X11Backend* backend = lua_backend(state);
-    backend->load_todos();
-    const unsigned int id = static_cast<unsigned int>(luaL_checkinteger(state, 1));
-    backend->todos_.erase(std::remove_if(backend->todos_.begin(), backend->todos_.end(), [id](const Todo& todo) {
-      return todo.id == id;
-    }), backend->todos_.end());
-    backend->save_todos();
-    if (backend->side_panel_ == SidePanel::Todos) backend->draw_side_panel();
-    backend->draw_docks();
-    return 0;
-  }
-
-  static int lua_todo_clear_completed(lua_State* state) {
-    X11Backend* backend = lua_backend(state);
-    backend->load_todos();
-    backend->todos_.erase(std::remove_if(backend->todos_.begin(), backend->todos_.end(), [](const Todo& todo) {
-      return todo.done;
-    }), backend->todos_.end());
-    backend->save_todos();
-    if (backend->side_panel_ == SidePanel::Todos) backend->draw_side_panel();
-    backend->draw_docks();
-    return 0;
-  }
-
   static int lua_notify(lua_State* state) {
     X11Backend* backend = lua_backend(state);
     const char* summary = luaL_checkstring(state, 1);
@@ -1080,10 +1034,6 @@ class X11Backend final : public Backend {
     lua_setfield(lua_, LUA_REGISTRYINDEX, "mepwm.backend");
     lua_newtable(lua_);
     lua_pushcfunction(lua_, lua_set_terminal); lua_setfield(lua_, -2, "set_terminal");
-    lua_pushcfunction(lua_, lua_todo); lua_setfield(lua_, -2, "todo");
-    lua_pushcfunction(lua_, lua_todo_toggle); lua_setfield(lua_, -2, "todo_toggle");
-    lua_pushcfunction(lua_, lua_todo_remove); lua_setfield(lua_, -2, "todo_remove");
-    lua_pushcfunction(lua_, lua_todo_clear_completed); lua_setfield(lua_, -2, "todo_clear_completed");
     lua_pushcfunction(lua_, lua_notify); lua_setfield(lua_, -2, "notify");
     lua_pushcfunction(lua_, lua_widget); lua_setfield(lua_, -2, "widget");
     lua_pushcfunction(lua_, lua_set_mfact); lua_setfield(lua_, -2, "set_mfact");
@@ -1957,28 +1907,70 @@ class X11Backend final : public Backend {
     draw_docks();
   }
 
-  std::string todo_path() const {
-    const char* home = std::getenv("HOME");
-    return home ? std::string(home) + "/.local/share/mepwm/todos" : "/tmp/mepwm-todos";
+  // Todos are project-centric: sourced read-only from a TODO.org file in the
+  // active project's directory rather than a manually-managed store, so the
+  // sidebar always reflects whichever project is currently active.
+  std::string todo_org_path() const {
+    if (active_project_index_ >= projects_.size()) return {};
+    return projects_[active_project_index_].path + "/TODO.org";
   }
 
+  // True if `line` is an org headline ("* TODO text") with the given
+  // keyword; on success, *keyword_start/*text_start bound the keyword and
+  // the headline text that follows it.
+  static bool parse_org_headline(const std::string& line, const std::string& keyword,
+                                  std::size_t* keyword_start, std::size_t* text_start) {
+    const std::size_t stars = line.find_first_not_of('*');
+    if (stars == 0 || stars == std::string::npos || line[stars] != ' ') return false;
+    *keyword_start = line.find_first_not_of(' ', stars + 1);
+    if (*keyword_start == std::string::npos) return false;
+    const std::size_t space = line.find(' ', *keyword_start);
+    if (space == std::string::npos || line.compare(*keyword_start, space - *keyword_start, keyword) != 0) return false;
+    *text_start = line.find_first_not_of(' ', space + 1);
+    return *text_start != std::string::npos;
+  }
+
+  // Parses org-mode headlines ("* TODO Buy milk"); only the plain TODO
+  // keyword is treated as a pending item, DONE (and everything else) is
+  // skipped so completed items never show up.
   void load_todos() {
-    if (todos_loaded_) return;
-    todos_loaded_ = true;
-    std::ifstream file(todo_path());
-    for (std::string line; std::getline(file, line);) {
-      const std::size_t tab = line.find('\t');
-      if (tab == std::string::npos) continue;
-      todos_.push_back({next_todo_id_++, line.substr(tab + 1), line.substr(0, tab) == "1"});
+    todos_.clear();
+    std::ifstream file(todo_org_path());
+    std::size_t line_number = 0;
+    for (std::string line; std::getline(file, line); ++line_number) {
+      std::size_t keyword_start = 0, text_start = 0;
+      if (parse_org_headline(line, "TODO", &keyword_start, &text_start)) todos_.push_back({line.substr(text_start), line_number});
     }
+    if (todo_selected_ >= static_cast<int>(todos_.size())) todo_selected_ = todos_.empty() ? -1 : static_cast<int>(todos_.size()) - 1;
   }
 
-  void save_todos() const {
-    const std::string path = todo_path();
-    const std::size_t slash = path.rfind('/');
-    if (slash != std::string::npos) std::filesystem::create_directories(path.substr(0, slash));
+  // Rewrites a single line in-place, flipping its TODO keyword to DONE.
+  // Re-checks the line still looks like the expected TODO headline first, in
+  // case the file changed underneath us since it was last parsed.
+  void mark_todo_done(const TodoItem& item) {
+    const std::string path = todo_org_path();
+    if (path.empty()) return;
+    std::vector<std::string> lines;
+    {
+      std::ifstream file(path);
+      if (!file) return;
+      for (std::string line; std::getline(file, line);) lines.push_back(std::move(line));
+    }
+    if (item.line >= lines.size()) return;
+    std::size_t keyword_start = 0, text_start = 0;
+    if (!parse_org_headline(lines[item.line], "TODO", &keyword_start, &text_start)) return;
+    lines[item.line].replace(keyword_start, std::string("TODO").size(), "DONE");
     std::ofstream file(path);
-    for (const Todo& todo : todos_) file << (todo.done ? '1' : '0') << '\t' << todo.text << '\n';
+    for (const std::string& line : lines) file << line << '\n';
+  }
+
+  // Appends a new TODO headline to the project's TODO.org, creating the file
+  // if it doesn't exist yet.
+  void add_todo_item(const std::string& text) {
+    const std::string path = todo_org_path();
+    if (path.empty() || text.empty()) return;
+    std::ofstream file(path, std::ios::app);
+    if (file) file << "* TODO " << text << '\n';
   }
 
   // Kept in sync by hand with handle_key/handle_button/grab_keys -- there's
@@ -2038,15 +2030,14 @@ class X11Backend final : public Backend {
     XFillRectangle(display_, side_panel_window_, bar_gc_, 0, 0, width, height);
     std::string title;
     if (side_panel_ == SidePanel::Notifications) title = "Notifications";
-    if (side_panel_ == SidePanel::Todos) title = "Todos";
+    if (side_panel_ == SidePanel::Todos)
+      title = "Todos - " + (projects_.empty() ? std::string("no project") : project_label(projects_[active_project_index_].path));
     if (side_panel_ == SidePanel::Agents) title = "Agents";
     if (side_panel_ == SidePanel::Help) title = "Keybindings";
     if (side_panel_ == SidePanel::Info) title = info_panel_title_;
     draw_dock_text(side_panel_window_, 12, 20, title, bar_foreground_);
     if (side_panel_ == SidePanel::Notifications && !notifications_.empty())
       draw_dock_text(side_panel_window_, width - 52, 20, "clear", bar_foreground_);
-    if (side_panel_ == SidePanel::Todos && std::any_of(todos_.begin(), todos_.end(), [](const Todo& todo) { return todo.done; }))
-      draw_dock_text(side_panel_window_, width - 78, 20, "clear done", bar_foreground_);
     if (side_panel_ == SidePanel::Agents && std::any_of(agents_.begin(), agents_.end(), [](const AgentStatus& agent) { return agent.from_file; }))
       draw_dock_text(side_panel_window_, width - 52, 20, "clear", bar_foreground_);
     XSetForeground(display_, bar_gc_, border_normal_pixel_);
@@ -2071,8 +2062,14 @@ class X11Backend final : public Backend {
         row(notification.body.empty() ? "" : "  " + notification.body, notification.unread);
       }
     } else if (side_panel_ == SidePanel::Todos) {
-      row("+ Add todo via mwm.todo(\"text\")", false);
-      for (const Todo& todo : todos_) row(std::string(todo.done ? "[x] " : "[ ] ") + todo.text, todo.done);
+      row("a add   d done   ^n/^p move");
+      if (todo_input_active_) row("+ " + todo_input_text_ + "_", true);
+      if (todos_.empty() && !todo_input_active_) {
+        const std::string path = todo_org_path();
+        row(path.empty() || !std::filesystem::exists(path) ? "No TODO.org in this project" : "No pending TODO items");
+      }
+      for (std::size_t index = 0; index < todos_.size(); ++index)
+        row("[ ] " + todos_[index].text, !todo_input_active_ && static_cast<int>(index) == todo_selected_);
     } else if (side_panel_ == SidePanel::Agents) {
       if (agents_.empty()) row("No coding agents are running");
       for (const AgentStatus& agent : agents_)
@@ -2092,7 +2089,25 @@ class X11Backend final : public Backend {
     XFlush(display_);
   }
 
+  // Todos is the one side panel that takes keyboard focus (arrow/^n/^p
+  // navigation, a/d actions), so entering/leaving it grabs/ungrabs the
+  // keyboard the same way the launcher and hint overlays do.
+  void enter_todo_panel() {
+    load_todos();
+    todo_selected_ = todos_.empty() ? -1 : 0;
+    todo_input_active_ = false;
+    todo_input_text_.clear();
+    XGrabKeyboard(display_, root_, False, GrabModeAsync, GrabModeAsync, CurrentTime);
+  }
+
+  void leave_todo_panel() {
+    XUngrabKeyboard(display_, CurrentTime);
+    todo_input_active_ = false;
+    todo_input_text_.clear();
+  }
+
   void close_side_panel() {
+    if (side_panel_ == SidePanel::Todos) leave_todo_panel();
     side_panel_ = SidePanel::Closed;
     if (side_panel_window_ != None) XUnmapWindow(display_, side_panel_window_);
     draw_docks();
@@ -2111,14 +2126,89 @@ class X11Backend final : public Backend {
                                          &attributes);
       XDefineCursor(display_, side_panel_window_, cursor_);
     }
+    if (side_panel_ == SidePanel::Todos) leave_todo_panel();
     side_panel_ = panel;
     side_panel_monitor_ = current_monitor_;
     side_panel_scroll_offset_ = 0;
     if (panel == SidePanel::Notifications)
       for (Notification& notification : notifications_) notification.unread = false;
+    if (panel == SidePanel::Todos) enter_todo_panel();
     XMapRaised(display_, side_panel_window_);
     draw_side_panel();
     draw_docks();
+  }
+
+  void move_todo_selection(int delta) {
+    if (todos_.empty()) { todo_selected_ = -1; return; }
+    const int count = static_cast<int>(todos_.size());
+    todo_selected_ = todo_selected_ < 0 ? 0 : (todo_selected_ + delta + count) % count;
+  }
+
+  // Keeps the selected row inside the panel's visible scroll window,
+  // mirroring the row-height math handle_side_panel_button's wheel handler
+  // already uses for this panel.
+  void ensure_todo_selection_visible() {
+    if (todo_selected_ < 0) return;
+    const int row_height = kBarHeight + 2;
+    const int header_rows = 1 + (todo_input_active_ ? 1 : 0);
+    const int index = header_rows + todo_selected_;
+    const int visible = std::max(1, (monitor(side_panel_monitor_).height - 3 * kBarHeight) / row_height);
+    int scroll_row = side_panel_scroll_offset_ / row_height;
+    if (index < scroll_row) scroll_row = index;
+    else if (index >= scroll_row + visible) scroll_row = index - visible + 1;
+    side_panel_scroll_offset_ = std::max(0, scroll_row) * row_height;
+  }
+
+  void handle_todo_key(const XKeyEvent& event) {
+    char text[32];
+    KeySym key = NoSymbol;
+    const int length = XLookupString(const_cast<XKeyEvent*>(&event), text, sizeof(text), &key, nullptr);
+    const unsigned int state = event.state & ~(LockMask | Mod2Mask);
+    if (todo_input_active_) {
+      if (key == XK_Escape) { todo_input_active_ = false; todo_input_text_.clear(); draw_side_panel(); return; }
+      if (key == XK_Return || key == XK_KP_Enter) {
+        add_todo_item(todo_input_text_);
+        todo_input_active_ = false;
+        todo_input_text_.clear();
+        load_todos();
+        todo_selected_ = todos_.empty() ? -1 : static_cast<int>(todos_.size()) - 1;
+        ensure_todo_selection_visible();
+        draw_side_panel();
+        draw_docks();
+        return;
+      }
+      if (key == XK_BackSpace) {
+        if (!todo_input_text_.empty()) todo_input_text_.pop_back();
+        draw_side_panel();
+        return;
+      }
+      for (int index = 0; index < length && todo_input_text_.size() < 255; ++index)
+        if (std::isprint(static_cast<unsigned char>(text[index]))) todo_input_text_ += text[index];
+      if (length > 0) draw_side_panel();
+      return;
+    }
+    if (key == XK_Escape) { close_side_panel(); return; }
+    if (state == 0 && key == XK_a) { todo_input_active_ = true; todo_input_text_.clear(); draw_side_panel(); return; }
+    if (state == 0 && key == XK_d && todo_selected_ >= 0 && static_cast<std::size_t>(todo_selected_) < todos_.size()) {
+      mark_todo_done(todos_[static_cast<std::size_t>(todo_selected_)]);
+      load_todos();
+      ensure_todo_selection_visible();
+      draw_side_panel();
+      draw_docks();
+      return;
+    }
+    if (key == XK_Up || (state == ControlMask && key == XK_p)) {
+      move_todo_selection(-1);
+      ensure_todo_selection_visible();
+      draw_side_panel();
+      return;
+    }
+    if (key == XK_Down || (state == ControlMask && key == XK_n)) {
+      move_todo_selection(1);
+      ensure_todo_selection_visible();
+      draw_side_panel();
+      return;
+    }
   }
 
   void open_info_panel(const std::string& title, const std::string& body) {
@@ -2216,7 +2306,7 @@ class X11Backend final : public Backend {
     if (event.button == Button4 || event.button == Button5) {
       const int delta = event.button == Button4 ? -3 * (kBarHeight + 2) : 3 * (kBarHeight + 2);
       const int rows = side_panel_ == SidePanel::Notifications ? static_cast<int>(notifications_.size() * 2) :
-                       side_panel_ == SidePanel::Todos ? static_cast<int>(todos_.size()) + 1 :
+                       side_panel_ == SidePanel::Todos ? static_cast<int>(todos_.size()) :
                        side_panel_ == SidePanel::Agents ? static_cast<int>(agents_.size()) : static_cast<int>(side_panel_rows_.size());
       const int visible = std::max(1, (monitor(side_panel_monitor_).height - 3 * kBarHeight) / (kBarHeight + 2));
       side_panel_scroll_offset_ = std::clamp(side_panel_scroll_offset_ + delta, 0, std::max(0, (rows - visible) * (kBarHeight + 2)));
@@ -2227,13 +2317,6 @@ class X11Backend final : public Backend {
       for (const Notification& notification : notifications_) emit_notification_closed(notification.id, 2);
       notifications_.clear();
       draw_side_panel(); draw_docks(); return;
-    }
-    if (side_panel_ == SidePanel::Todos && event.y < kBarHeight && event.button == Button1 && event.x >= 240) {
-      todos_.erase(std::remove_if(todos_.begin(), todos_.end(), [](const Todo& todo) { return todo.done; }), todos_.end());
-      save_todos();
-      draw_side_panel();
-      draw_docks();
-      return;
     }
     if (side_panel_ == SidePanel::Agents && event.y < kBarHeight && event.button == Button1 && event.x >= 260) {
       for (const AgentStatus& agent : agents_) if (agent.from_file && !agent.file_path.empty()) unlink(agent.file_path.c_str());
@@ -2279,14 +2362,6 @@ class X11Backend final : public Backend {
         emit_notification_closed(id, 2);
       } else {
         notifications_[notification_index].unread = false;
-      }
-    } else if (side_panel_ == SidePanel::Todos) {
-      load_todos();
-      if (row > 0 && static_cast<std::size_t>(row - 1) < todos_.size()) {
-        Todo& todo = todos_[row - 1];
-        if (event.button == Button1) todo.done = !todo.done;
-        if (event.button == Button2) todos_.erase(todos_.begin() + row - 1);
-        save_todos();
       }
     } else if (side_panel_ == SidePanel::Agents && static_cast<std::size_t>(row) < agents_.size()) {
       if (event.button == Button2 && agents_[row].from_file && !agents_[row].file_path.empty()) {
@@ -2348,10 +2423,8 @@ class X11Backend final : public Backend {
       const int unread = static_cast<int>(std::count_if(notifications_.begin(), notifications_.end(), [](const Notification& item) {
         return item.unread;
       }));
-      int incomplete = 0;
       load_todos();
-      for (const Todo& todo : todos_) if (!todo.done) ++incomplete;
-      const std::array<bool, 3> highlighted = {unread > 0, incomplete > 0, agent_needs_input_ > 0};
+      const std::array<bool, 3> highlighted = {unread > 0, !todos_.empty(), agent_needs_input_ > 0};
       for (std::size_t row = 0; row < right_labels.size(); ++row)
         draw_dock_cell(dock.right_buffer, static_cast<int>(row) * kDockWidth, kDockWidth, kDockWidth,
                        right_labels[row], highlighted[row]);
@@ -4886,6 +4959,7 @@ class X11Backend final : public Backend {
       case KeyPress:
         if (hints_visible_) handle_hint_key(event.xkey);
         else if (launcher_visible_) handle_launcher_key(event.xkey);
+        else if (side_panel_ == SidePanel::Todos) handle_todo_key(event.xkey);
         else handle_key(event.xkey);
         break;
       case PropertyNotify:
@@ -5060,9 +5134,10 @@ class X11Backend final : public Backend {
   int side_panel_scroll_offset_ = 0;
   std::vector<Notification> notifications_;
   unsigned int next_notification_id_ = 1;
-  std::vector<Todo> todos_;
-  unsigned int next_todo_id_ = 1;
-  bool todos_loaded_ = false;
+  std::vector<TodoItem> todos_;
+  int todo_selected_ = -1;
+  bool todo_input_active_ = false;
+  std::string todo_input_text_;
   std::string info_panel_title_;
   std::string info_panel_body_;
   InfoAction info_action_ = InfoAction::NoneAction;
