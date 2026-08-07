@@ -393,7 +393,7 @@ class X11Backend final : public Backend {
     for (const Project& project : projects_) file << project.path << '\n';
   }
 
-  bool add_project(const std::string& raw_path, bool save = true) {
+  static bool normalize_project_path(const std::string& raw_path, std::string* normalized) {
     if (raw_path.empty()) return false;
     std::filesystem::path path(raw_path);
     if (raw_path == "~" || raw_path.rfind("~/", 0) == 0) {
@@ -404,8 +404,15 @@ class X11Backend final : public Backend {
     std::error_code error;
     path = std::filesystem::weakly_canonical(path, error);
     if (error || !std::filesystem::is_directory(path, error)) return false;
-    const std::string normalized = path.string();
-    if (std::any_of(projects_.begin(), projects_.end(), [&](const Project& project) { return project.path == normalized; }))
+    *normalized = path.string();
+    return true;
+  }
+
+  bool add_project(const std::string& raw_path, bool save = true) {
+    std::string normalized;
+    if (!normalize_project_path(raw_path, &normalized)) return false;
+    if (std::any_of(projects_.begin(), projects_.end(),
+                    [&](const Project& project) { return project.path == normalized; }))
       return true;
     projects_.push_back({normalized, {}});
     if (save) save_projects();
@@ -2648,11 +2655,24 @@ class X11Backend final : public Backend {
 
   void launch_selected_app() {
     if (launcher_mode_ != LauncherMode::Applications) {
-      if (project_matches_.empty()) {
-        if (launcher_mode_ != LauncherMode::Projects || !add_project(launcher_query_)) return;
-        filter_launcher_apps();
-        if (project_matches_.empty()) return;
+      // A typed, valid directory takes precedence over fuzzy matches. Without
+      // this, entering a path that happens to fuzzy-match an existing project
+      // launches that match and makes it impossible to add the new directory.
+      if (launcher_mode_ == LauncherMode::Projects && !launcher_query_.empty()) {
+        std::string entered_path;
+        if (normalize_project_path(launcher_query_, &entered_path)) {
+          add_project(entered_path);
+          const auto it = std::find_if(projects_.begin(), projects_.end(),
+                                       [&](const Project& project) { return project.path == entered_path; });
+          if (it == projects_.end()) return;
+          const std::size_t project = static_cast<std::size_t>(it - projects_.begin());
+          close_launcher();
+          switch_project(project);
+          spawn_terminal_in(entered_path);
+          return;
+        }
       }
+      if (project_matches_.empty()) return;
       const std::size_t project = project_matches_[launcher_selection_];
       const bool open_terminal = launcher_mode_ == LauncherMode::Projects;
       const std::string path = projects_[project].path;
