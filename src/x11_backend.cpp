@@ -3765,8 +3765,10 @@ class X11Backend final : public Backend {
       }
       if (primary <= 0) continue;
 
-      // Prioritize distance along the requested axis, then alignment with it.
-      const long score = static_cast<long>(primary) * 10000L + secondary;
+      // Prioritize alignment with the requested axis, then distance along it,
+      // so a directly-adjacent window (e.g. the other pane in the same
+      // column) wins over a merely-closer window that sits off to the side.
+      const long score = static_cast<long>(secondary) * 10000L + primary;
       if (best == None || score < best_score) {
         best = candidate;
         best_score = score;
@@ -3882,7 +3884,9 @@ class X11Backend final : public Backend {
         return;
       }
       if (primary <= 0) continue;
-      const long score = static_cast<long>(primary) * 10000L + secondary;
+      // Prioritize alignment with the requested axis, then distance along it
+      // -- see the matching comment in focus_direction above.
+      const long score = static_cast<long>(secondary) * 10000L + primary;
       if (!found || score < best_score) {
         found = true;
         best_score = score;
