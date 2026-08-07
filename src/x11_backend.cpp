@@ -542,8 +542,8 @@ class X11Backend final : public Backend {
   void refresh_display_geometry() {
     update_monitors();
     if (bar_) {
-      const int width = std::max(1, DisplayWidth(display_, screen_) - 2 * kDockWidth);
-      XMoveResizeWindow(display_, bar_, kDockWidth, 0, width, kBarHeight);
+      const int width = std::max(1, DisplayWidth(display_, screen_));
+      XMoveResizeWindow(display_, bar_, 0, 0, width, kBarHeight);
     }
     create_docks();
   }
@@ -1458,10 +1458,15 @@ class X11Backend final : public Backend {
     for (std::size_t index = 0; index < monitors_.size(); ++index) {
       const Monitor& target = monitors_[index];
       const DockWindows& dock = docks_[index];
-      XMoveResizeWindow(display_, dock.left, target.x, target.y, kDockWidth, target.height);
-      XMoveResizeWindow(display_, dock.right, target.x + target.width - kDockWidth, target.y, kDockWidth, target.height);
-      XMoveResizeWindow(display_, dock.bottom, target.x + kDockWidth, target.y + target.height - kBarHeight,
-                        std::max(1, target.width - 2 * kDockWidth), kBarHeight);
+      const int side_height = std::max(1, target.height - 2 * kBarHeight);
+      // The vertical docks now sit between the top and bottom bars (which
+      // own the corners: launcher/layout up top, os/info down below), and
+      // the bottom dock spans the full monitor width to match the top bar.
+      XMoveResizeWindow(display_, dock.left, target.x, target.y + kBarHeight, kDockWidth, side_height);
+      XMoveResizeWindow(display_, dock.right, target.x + target.width - kDockWidth, target.y + kBarHeight,
+                        kDockWidth, side_height);
+      XMoveResizeWindow(display_, dock.bottom, target.x, target.y + target.height - kBarHeight,
+                        std::max(1, target.width), kBarHeight);
       XMapRaised(display_, dock.left);
       XMapRaised(display_, dock.bottom);
       XMapRaised(display_, dock.right);
@@ -1493,6 +1498,19 @@ class X11Backend final : public Backend {
     }
     const int text_x = std::max(3, (width - text_width(label)) / 2);
     draw_dock_text(window, text_x, y + (height + bar_font_->ascent - bar_font_->descent) / 2, label,
+                   selected ? bar_background_ : bar_foreground_);
+  }
+
+  // Same as draw_dock_cell but laid out along x instead of y, for cells that
+  // sit inside a horizontal bar (the launcher/layout corners of the top bar,
+  // the os/info corners of the bottom bar).
+  void draw_dock_cell_h(Window window, int x, int width, int height, const std::string& label, bool selected = false) {
+    if (selected) {
+      XSetForeground(display_, bar_gc_, bar_selected_.pixel);
+      XFillRectangle(display_, window, bar_gc_, x, 0, width, height);
+    }
+    const int text_x = x + std::max(3, (width - text_width(label)) / 2);
+    draw_dock_text(window, text_x, (height + bar_font_->ascent - bar_font_->descent) / 2, label,
                    selected ? bar_background_ : bar_foreground_);
   }
 
@@ -1803,6 +1821,10 @@ class X11Backend final : public Backend {
         {"keyboard", keyboard_layouts_.size() > 1 ? std::string(kIconKeyboard) + " " + keyboard_layout_ : ""},
     }};
     bottom_widget_hits_.clear();
+    // The bottom bar now spans the full monitor width with the os/info icons
+    // in its outer kDockWidth corners, so the widget group is packed into the
+    // same span it always had, just offset past the left (os) corner.
+    const int content_x = kDockWidth;
     const int width = std::max(1, monitors_[monitor_index].width - 2 * kDockWidth);
     int total_width = 0;
     for (const auto& widget : widgets)
@@ -1812,11 +1834,11 @@ class X11Backend final : public Backend {
     // The bottom dock is a system-status area, so anchor its complete widget
     // group to the right edge. Keep the existing left margin as a safe
     // fallback when a narrow monitor cannot fit every widget.
-    int x = std::max(8, width - total_width);
+    int x = std::max(content_x + 8, content_x + width - total_width);
     for (const auto& widget : widgets) {
       if (widget.second.empty()) continue;
       const int widget_width = text_width(widget.second) + 14;
-      if (x + widget_width > width) break;
+      if (x + widget_width > content_x + width) break;
       draw_dock_text(dock.bottom_buffer, x + 7, (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2, widget.second,
                      bar_foreground_);
       bottom_widget_hits_.push_back({x, x + widget_width, widget.first});
@@ -1826,7 +1848,7 @@ class X11Backend final : public Backend {
       const LuaWidget& widget = lua_widgets_[index];
       if (widget.text.empty()) continue;
       const int widget_width = text_width(widget.text) + 14;
-      if (x + widget_width > width) break;
+      if (x + widget_width > content_x + width) break;
       if (widget.highlight) {
         XSetForeground(display_, bar_gc_, bar_selected_.pixel);
         XFillRectangle(display_, dock.bottom_buffer, bar_gc_, x, 0, widget_width, kBarHeight);
@@ -2289,28 +2311,27 @@ class X11Backend final : public Backend {
   }
 
   void draw_docks() {
-    static const std::array<const char*, 9> left_labels = {
-        kIconLauncher, kIconFirefox, kIconTerminal, kIconInkscape, kIconGimp,
+    static const std::array<const char*, 8> left_labels = {
+        kIconFirefox, kIconTerminal, kIconInkscape, kIconGimp,
         kIconLibreOffice, kIconVsCode, kIconEmacs, kIconNeovim,
     };
     static const std::array<const char*, 3> right_labels = {kIconBell, kIconTodo, kIconAgents};
     for (std::size_t index = 0; index < monitors_.size() && index < docks_.size(); ++index) {
       const Monitor& target = monitors_[index];
       DockWindows& dock = docks_[index];
-      const int bottom_width = std::max(1, target.width - 2 * kDockWidth);
-      ensure_dock_buffer(dock.left_buffer, dock.left_buffer_width, dock.left_buffer_height, kDockWidth, target.height);
-      ensure_dock_buffer(dock.right_buffer, dock.right_buffer_width, dock.right_buffer_height, kDockWidth, target.height);
+      // The vertical docks sit between the top and bottom bars now, so they
+      // are shorter than the monitor by one bar-height on each end.
+      const int side_height = std::max(1, target.height - 2 * kBarHeight);
+      const int bottom_width = std::max(1, target.width);
+      ensure_dock_buffer(dock.left_buffer, dock.left_buffer_width, dock.left_buffer_height, kDockWidth, side_height);
+      ensure_dock_buffer(dock.right_buffer, dock.right_buffer_width, dock.right_buffer_height, kDockWidth, side_height);
       ensure_dock_buffer(dock.bottom_buffer, dock.bottom_buffer_width, dock.bottom_buffer_height, bottom_width, kBarHeight);
       XSetForeground(display_, bar_gc_, bar_background_.pixel);
-      XFillRectangle(display_, dock.left_buffer, bar_gc_, 0, 0, kDockWidth, target.height);
-      XFillRectangle(display_, dock.right_buffer, bar_gc_, 0, 0, kDockWidth, target.height);
+      XFillRectangle(display_, dock.left_buffer, bar_gc_, 0, 0, kDockWidth, side_height);
+      XFillRectangle(display_, dock.right_buffer, bar_gc_, 0, 0, kDockWidth, side_height);
       XFillRectangle(display_, dock.bottom_buffer, bar_gc_, 0, 0, bottom_width, kBarHeight);
       for (std::size_t row = 0; row < left_labels.size(); ++row)
         draw_dock_cell(dock.left_buffer, static_cast<int>(row) * kDockWidth, kDockWidth, kDockWidth, left_labels[row]);
-      draw_dock_cell(dock.left_buffer, target.height - kBarHeight, kDockWidth, kBarHeight, kIconNixOs);
-      const char* layout = workspace().mode == LayoutMode::Manual ? kIconLayoutOther :
-                           workspace().mode == LayoutMode::MasterStack ? kIconLayoutTile : kIconLayoutMonocle;
-      draw_dock_cell(dock.right_buffer, 0, kDockWidth, kBarHeight, layout);
       const int unread = static_cast<int>(std::count_if(notifications_.begin(), notifications_.end(), [](const Notification& item) {
         return item.unread;
       }));
@@ -2319,12 +2340,15 @@ class X11Backend final : public Backend {
       for (const Todo& todo : todos_) if (!todo.done) ++incomplete;
       const std::array<bool, 3> highlighted = {unread > 0, incomplete > 0, agent_needs_input_ > 0};
       for (std::size_t row = 0; row < right_labels.size(); ++row)
-        draw_dock_cell(dock.right_buffer, kBarHeight + static_cast<int>(row) * kDockWidth, kDockWidth, kDockWidth,
+        draw_dock_cell(dock.right_buffer, static_cast<int>(row) * kDockWidth, kDockWidth, kDockWidth,
                        right_labels[row], highlighted[row]);
-      draw_dock_cell(dock.right_buffer, target.height - kBarHeight, kDockWidth, kBarHeight, kIconInfo);
       draw_bottom_widgets(index);
-      XCopyArea(display_, dock.left_buffer, dock.left, bar_gc_, 0, 0, kDockWidth, target.height, 0, 0);
-      XCopyArea(display_, dock.right_buffer, dock.right, bar_gc_, 0, 0, kDockWidth, target.height, 0, 0);
+      // The os and info icons anchor the bottom bar's outer corners, mirroring
+      // the launcher/layout corners of the top bar.
+      draw_dock_cell_h(dock.bottom_buffer, 0, kDockWidth, kBarHeight, kIconNixOs);
+      draw_dock_cell_h(dock.bottom_buffer, bottom_width - kDockWidth, kDockWidth, kBarHeight, kIconInfo);
+      XCopyArea(display_, dock.left_buffer, dock.left, bar_gc_, 0, 0, kDockWidth, side_height, 0, 0);
+      XCopyArea(display_, dock.right_buffer, dock.right, bar_gc_, 0, 0, kDockWidth, side_height, 0, 0);
       XCopyArea(display_, dock.bottom_buffer, dock.bottom, bar_gc_, 0, 0, bottom_width, kBarHeight, 0, 0);
     }
     XFlush(display_);
@@ -2526,29 +2550,27 @@ class X11Backend final : public Backend {
     const DockWindows& dock = docks_[current_monitor_];
     if (event.window == dock.left && event.button == Button1) {
       switch (event.y / kDockWidth) {
-        case 0: toggle_launcher(); break;
-        case 1: spawn_command("firefox"); break;
-        case 2: spawn_terminal(); break;
-        case 3: spawn_command("inkscape"); break;
-        case 4: spawn_command("gimp"); break;
-        case 5: spawn_command("libreoffice"); break;
-        case 6: spawn_command("code"); break;
-        case 7: spawn_command("if command -v nix >/dev/null 2>&1; then exec nix run 'git:jordanschupbach/emc' --refresh; else exec emacs; fi"); break;
-        case 8: spawn_command("${TERMINAL:-xterm} -e nvim"); break;
+        case 0: spawn_command("firefox"); break;
+        case 1: spawn_terminal(); break;
+        case 2: spawn_command("inkscape"); break;
+        case 3: spawn_command("gimp"); break;
+        case 4: spawn_command("libreoffice"); break;
+        case 5: spawn_command("code"); break;
+        case 6: spawn_command("if command -v nix >/dev/null 2>&1; then exec nix run 'git:jordanschupbach/emc' --refresh; else exec emacs; fi"); break;
+        case 7: spawn_command("${TERMINAL:-xterm} -e nvim"); break;
       }
     } else if (event.window == dock.bottom) {
-      handle_bottom_widget(event);
-    } else if (event.window == dock.right && event.y < kBarHeight) {
-      if (event.button == Button1) cycle_layout();
-      if (event.button == Button3) { cycle_layout(); cycle_layout(); }
-    } else if (event.window == dock.right && event.button == Button1) {
-      if (event.y >= monitors_[current_monitor_].height - kBarHeight) toggle_side_panel(SidePanel::Help);
-      else {
-        const int row = (event.y - kBarHeight) / kDockWidth;
-        if (row == 0) toggle_side_panel(SidePanel::Notifications);
-        if (row == 1) toggle_side_panel(SidePanel::Todos);
-        if (row == 2) toggle_side_panel(SidePanel::Agents);
+      // The info icon lives in the bottom bar's right-hand corner now.
+      if (event.button == Button1 && event.x >= monitors_[current_monitor_].width - kDockWidth) {
+        toggle_side_panel(SidePanel::Help);
+      } else {
+        handle_bottom_widget(event);
       }
+    } else if (event.window == dock.right && event.button == Button1) {
+      const int row = event.y / kDockWidth;
+      if (row == 0) toggle_side_panel(SidePanel::Notifications);
+      if (row == 1) toggle_side_panel(SidePanel::Todos);
+      if (row == 2) toggle_side_panel(SidePanel::Agents);
     }
     draw_docks();
   }
@@ -2584,36 +2606,43 @@ class X11Backend final : public Backend {
     std::vector<Candidate> candidates;
 
     if (bar_visible_ && bar_ != None) {
+      // Bar-relative x now equals screen x, since bar_ starts at x=0.
+      candidates.push_back({4, 4, bar_, kDockWidth / 2, kBarHeight / 2});
       for (int index = 0; index < kWorkspaceCount; ++index) {
-        candidates.push_back({kDockWidth + index * 84 + 4, 4, bar_, index * 84 + 10, kBarHeight / 2});
+        const int x = kDockWidth + index * 84;
+        candidates.push_back({x + 4, 4, bar_, x + 10, kBarHeight / 2});
       }
-      candidates.push_back({kDockWidth + 756 + 4, 4, bar_, 756 + 10, kBarHeight / 2});
+      const int mode_x = kDockWidth + 756;
+      candidates.push_back({mode_x + 4, 4, bar_, mode_x + 10, kBarHeight / 2});
       for (const BarHit& hit : task_hits_) {
-        candidates.push_back({kDockWidth + hit.left + 4, 4, bar_, (hit.left + hit.right) / 2, kBarHeight / 2});
+        candidates.push_back({hit.left + 4, 4, bar_, (hit.left + hit.right) / 2, kBarHeight / 2});
       }
+      const int layout_x = DisplayWidth(display_, screen_) - kDockWidth;
+      candidates.push_back({layout_x + 4, 4, bar_, layout_x + kDockWidth / 2, kBarHeight / 2});
     }
 
     for (std::size_t index = 0; index < monitors_.size() && index < docks_.size(); ++index) {
       const Monitor& target_monitor = monitors_[index];
       const DockWindows& dock = docks_[index];
-      for (int row = 0; row < 9; ++row) {
-        candidates.push_back({target_monitor.x + 4, target_monitor.y + row * kDockWidth + 4, dock.left, kDockWidth / 2,
+      const int dock_y = target_monitor.y + kBarHeight;
+      for (int row = 0; row < 8; ++row) {
+        candidates.push_back({target_monitor.x + 4, dock_y + row * kDockWidth + 4, dock.left, kDockWidth / 2,
                               row * kDockWidth + kDockWidth / 2});
       }
       const int dock_right_x = target_monitor.x + target_monitor.width - kDockWidth;
-      candidates.push_back({dock_right_x + 4, target_monitor.y + 4, dock.right, kDockWidth / 2, kBarHeight / 2});
       for (int row = 0; row < 3; ++row) {
-        candidates.push_back({dock_right_x + 4, target_monitor.y + kBarHeight + row * kDockWidth + 4, dock.right,
-                              kDockWidth / 2, kBarHeight + row * kDockWidth + kDockWidth / 2});
+        candidates.push_back({dock_right_x + 4, dock_y + row * kDockWidth + 4, dock.right,
+                              kDockWidth / 2, row * kDockWidth + kDockWidth / 2});
       }
-      candidates.push_back({dock_right_x + 4, target_monitor.y + target_monitor.height - kBarHeight + 4, dock.right,
-                            kDockWidth / 2, target_monitor.height - kBarHeight / 2});
       draw_bottom_widgets(index);
+      const int bottom_y = target_monitor.y + target_monitor.height - kBarHeight;
+      candidates.push_back({target_monitor.x + 4, bottom_y + 4, dock.bottom, kDockWidth / 2, kBarHeight / 2});
       for (const WidgetHit& hit : bottom_widget_hits_) {
-        candidates.push_back({target_monitor.x + kDockWidth + hit.left + 4,
-                              target_monitor.y + target_monitor.height - kBarHeight + 4, dock.bottom,
+        candidates.push_back({target_monitor.x + hit.left + 4, bottom_y + 4, dock.bottom,
                               (hit.left + hit.right) / 2, kBarHeight / 2});
       }
+      candidates.push_back({target_monitor.x + target_monitor.width - kDockWidth + 4, bottom_y + 4, dock.bottom,
+                            target_monitor.width - kDockWidth / 2, kBarHeight / 2});
     }
 
     std::vector<Window> windows;
@@ -2773,8 +2802,8 @@ class X11Backend final : public Backend {
   }
 
   void create_bar() {
-    const int width = std::max(1, DisplayWidth(display_, screen_) - 2 * kDockWidth);
-    bar_ = XCreateSimpleWindow(display_, root_, kDockWidth, 0, width, kBarHeight,
+    const int width = std::max(1, DisplayWidth(display_, screen_));
+    bar_ = XCreateSimpleWindow(display_, root_, 0, 0, width, kBarHeight,
                                0, BlackPixel(display_, screen_), BlackPixel(display_, screen_));
     XSetWindowAttributes attributes{};
     attributes.override_redirect = True;
@@ -2876,7 +2905,7 @@ class X11Backend final : public Backend {
 
   void draw_bar() {
     if (!bar_) return;
-    const int width = std::max(1, DisplayWidth(display_, screen_) - 2 * kDockWidth);
+    const int width = std::max(1, DisplayWidth(display_, screen_));
     if (bar_pixmap_width_ != width) {
       if (bar_xft_draw_) XftDrawDestroy(bar_xft_draw_);
       if (bar_pixmap_) XFreePixmap(display_, bar_pixmap_);
@@ -2890,8 +2919,17 @@ class X11Backend final : public Backend {
 
     auto text = [&](int x, const std::string& value, const XftColor& color) { draw_text(x, value, color); };
 
+    // The launcher and layout-mode toggle live in the outermost kDockWidth
+    // cells so the bar can span the full display width; everything else
+    // that used to be bar-relative x=0 now starts after the launcher cell.
+    draw_dock_cell_h(bar_pixmap_, 0, kDockWidth, kBarHeight, kIconLauncher);
+    const char* layout_icon = workspace().mode == LayoutMode::Manual ? kIconLayoutOther :
+                              workspace().mode == LayoutMode::MasterStack ? kIconLayoutTile : kIconLayoutMonocle;
+    draw_dock_cell_h(bar_pixmap_, width - kDockWidth, kDockWidth, kBarHeight, layout_icon);
+
+    const int content_x = kDockWidth;
     for (int index = 0; index < kWorkspaceCount; ++index) {
-      const int x = index * 84;
+      const int x = content_x + index * 84;
       std::vector<Window> occupied;
       collect_windows(workspaces_[index].root.get(), occupied);
       occupied.insert(occupied.end(), workspaces_[index].floating.begin(), workspaces_[index].floating.end());
@@ -2911,16 +2949,16 @@ class X11Backend final : public Backend {
                            : workspace().mode == LayoutMode::MasterStack ? "master-stack" : "monocle";
     const std::string project = projects_.empty() ? "default" : project_label(projects_[active_project_index_].path);
     const std::string project_label_text = project + " · " + mode;
-    text(780, project_label_text, bar_foreground_);
+    text(content_x + 780, project_label_text, bar_foreground_);
     const std::string clock_widget = std::string(kIconClock) + " " + clock_text_;
     const int clock_width = text_width(clock_widget) + 32;
-    const int clock_x = width - clock_width - tray_pixel_width();
+    const int clock_x = width - kDockWidth - clock_width - tray_pixel_width();
     text(clock_x, clock_widget, bar_foreground_);
     task_hits_.clear();
     std::vector<Window> windows;
     collect_windows(workspace().root.get(), windows);
     windows.insert(windows.end(), workspace().floating.begin(), workspace().floating.end());
-    bar_task_list_x_ = std::max(960, 780 + text_width(project_label_text) + 32);
+    bar_task_list_x_ = std::max(content_x + 960, content_x + 780 + text_width(project_label_text) + 32);
     int x = bar_task_list_x_;
     const int end = std::max(x, clock_x);
     for (Window window : windows) {
@@ -4588,10 +4626,21 @@ class X11Backend final : public Backend {
       }
     }
     if (event.window == bar_) {
-      const int workspace_index = event.x / 84;
+      // Launcher and layout-mode toggle live in the outer kDockWidth corners
+      // now that the bar spans the full display width.
+      if (event.x < kDockWidth) {
+        if (event.button == Button1) toggle_launcher();
+        return;
+      }
+      if (event.x >= DisplayWidth(display_, screen_) - kDockWidth) {
+        if (event.button == Button1) cycle_layout();
+        if (event.button == Button3) { cycle_layout(); cycle_layout(); }
+        return;
+      }
+      const int workspace_index = (event.x - kDockWidth) / 84;
       if (workspace_index >= 0 && workspace_index < kWorkspaceCount) {
         switch_workspace(workspace_index);
-      } else if (event.x >= 756 && event.x < bar_task_list_x_) {
+      } else if (event.x >= kDockWidth + 756 && event.x < bar_task_list_x_) {
         if (event.button == Button1) cycle_layout();
         if (event.button == Button3) {
           workspace().mode = LayoutMode::Monocle;
