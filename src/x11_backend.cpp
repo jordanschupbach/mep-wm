@@ -3965,8 +3965,12 @@ class X11Backend final : public Backend {
   }
 
   // Resize across the nearest split boundary that has the requested axis.
-  // At an outer edge, use the only available boundary, but retain the key's
-  // resize intent: h/k shrink the selected pane and j/l grow it.
+  // h/l/j/k move that boundary left/right/down/up respectively, regardless
+  // of whether the selected pane sits before or after it: l/j grow whichever
+  // pane has the lower index and shrink the higher-index one (the boundary
+  // moves toward the higher index), while h/k do the reverse. This keeps the
+  // resize direction tied to screen position rather than to which pane
+  // happens to be selected.
   void resize_pane(KeySym key) {
     Workspace& target = workspace();
     if (target.mode != LayoutMode::Manual) return;
@@ -3990,30 +3994,23 @@ class X11Backend final : public Backend {
     const bool has_before = index > 0;
     const bool has_after = index + 1 < split->children.size();
     if (!has_before && !has_after) return;
+    if (key != XK_h && key != XK_l && key != XK_j && key != XK_k) return;
 
-    bool grow = false;
-    std::size_t neighbour = 0;
-    if (key == XK_h) {
-      grow = false;
-      neighbour = has_before ? index - 1 : index + 1;
-    } else if (key == XK_l) {
-      grow = true;
-      neighbour = has_after ? index + 1 : index - 1;
-    } else if (key == XK_j) {
-      grow = true;
-      neighbour = has_before ? index - 1 : index + 1;
-    } else if (key == XK_k) {
-      grow = false;
-      neighbour = has_after ? index + 1 : index - 1;
-    } else {
-      return;
-    }
+    // l/j prefer the boundary after the selected pane; h/k prefer the one
+    // before it. At an outer edge only one boundary exists, so fall back.
+    const bool towards_higher_index = (key == XK_l || key == XK_j);
+    const std::size_t neighbour = towards_higher_index ? (has_after ? index + 1 : index - 1)
+                                                        : (has_before ? index - 1 : index + 1);
 
-    const std::size_t donor = grow ? neighbour : index;
+    const std::size_t lower = std::min(index, neighbour);
+    const std::size_t higher = std::max(index, neighbour);
+    const std::size_t grower = towards_higher_index ? lower : higher;
+    const std::size_t donor = towards_higher_index ? higher : lower;
+
     if (split->weights[donor] <= kMinSplitWeight) return;
     const double amount = std::min(kResizeStep, split->weights[donor] - kMinSplitWeight);
-    split->weights[index] += grow ? amount : -amount;
-    split->weights[neighbour] += grow ? -amount : amount;
+    split->weights[grower] += amount;
+    split->weights[donor] -= amount;
     arrange();
   }
 
