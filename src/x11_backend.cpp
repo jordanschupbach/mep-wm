@@ -1356,6 +1356,15 @@ class X11Backend final : public Backend {
     }
   }
 
+  // On-screen width currently occupied by the tray window (0 when hidden),
+  // so the bar can reserve space for it and avoid overlapping tray icons.
+  int tray_pixel_width() const {
+    if (tray_ == None) return 0;
+    int width = 0;
+    for (const TrayIcon& icon : tray_icons_) if (icon.mapped) width += icon.width + kTraySpacing;
+    return width == 0 ? 0 : width + kTraySpacing;
+  }
+
   void update_tray() {
     if (tray_ == None) return;
     int width = 0;
@@ -1757,7 +1766,7 @@ class X11Backend final : public Backend {
                               : volume_muted_ || volume_percent_ == 0 ? kIconVolumeMuted
                               : volume_percent_ < 50 ? kIconVolumeLow
                                                      : kIconVolumeHigh;
-    const std::array<std::pair<const char*, std::string>, 15> widgets = {{
+    const std::array<std::pair<const char*, std::string>, 14> widgets = {{
         {"battery", battery_percent_ < 0 ? std::string(kIconBatteryFull) + " n/a" : std::string(battery_icon) + " " + std::to_string(battery_percent_) + "%"},
         {"backlight", kIconBacklight},
         {"volume", volume_icon},
@@ -1772,7 +1781,6 @@ class X11Backend final : public Backend {
         {"wifi", wifi_interface_.empty() ? std::string(kIconWifi) + " n/a" : std::string(kIconWifi) + " " + (wifi_ssid_.empty() ? wifi_interface_ : wifi_ssid_)},
         {"bluetooth", bluetooth_status_.empty() ? kIconBluetooth : std::string(kIconBluetooth) + " " + bluetooth_status_},
         {"keyboard", keyboard_layouts_.size() > 1 ? std::string(kIconKeyboard) + " " + keyboard_layout_ : ""},
-        {"clock", std::string(kIconClock) + " " + clock_text_},
     }};
     bottom_widget_hits_.clear();
     const int width = std::max(1, monitors_[monitor_index].width - 2 * kDockWidth);
@@ -2803,18 +2811,17 @@ class X11Backend final : public Backend {
     const std::string project = projects_.empty() ? "default" : project_label(projects_[active_project_index_].path);
     const std::string project_label_text = project + " · " + mode;
     text(780, project_label_text, bar_foreground_);
-    const std::time_t now = std::time(nullptr);
-    char clock[16];
-    std::strftime(clock, sizeof(clock), "%H:%M", std::localtime(&now));
-    const int clock_width = text_width(clock) + 32;
-    text(width - clock_width, clock, bar_foreground_);
+    const std::string clock_widget = std::string(kIconClock) + " " + clock_text_;
+    const int clock_width = text_width(clock_widget) + 32;
+    const int clock_x = width - clock_width - tray_pixel_width();
+    text(clock_x, clock_widget, bar_foreground_);
     task_hits_.clear();
     std::vector<Window> windows;
     collect_windows(workspace().root.get(), windows);
     windows.insert(windows.end(), workspace().floating.begin(), workspace().floating.end());
     bar_task_list_x_ = std::max(960, 780 + text_width(project_label_text) + 32);
     int x = bar_task_list_x_;
-    const int end = tray_ == None ? width - clock_width : std::max(x, width - 280 - clock_width);
+    const int end = std::max(x, clock_x);
     for (Window window : windows) {
       char* title = nullptr;
       std::string label = XFetchName(display_, window, &title) && title ? title : "untitled";
