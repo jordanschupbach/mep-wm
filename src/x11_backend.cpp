@@ -49,6 +49,9 @@ namespace {
 constexpr int kWorkspaceCount = 9;
 constexpr int kDockWidth = 48;
 constexpr int kBarHeight = kDockWidth;
+// Height reserved above a manual-mode pane when it holds more than one
+// client, for the row of clickable tabs naming each client in that pane.
+constexpr int kPaneTabBarHeight = 24;
 constexpr int kMinWindowSize = 20;
 constexpr double kResizeStep = 0.05;
 constexpr double kMinSplitWeight = 0.05;
@@ -132,6 +135,14 @@ enum class LauncherMode { Applications, Projects, ActiveProjects, Windows };
 // Xlib.h) #defines None to 0L, which breaks enum class member declarations.
 enum class InfoAction { NoneAction, Wifi, Bluetooth, Media, Git, Keyboard, Theme };
 
+// A leaf's last-arranged screen rect on a given monitor pass. Recorded even
+// for leaves with zero tabs so an empty pane (freshly split, nothing opened
+// in it yet) can still be targeted by directional pane selection and have a
+// highlight/tab-bar window placed against it.
+struct Rect {
+  int x = 0, y = 0, w = 0, h = 0;
+};
+
 struct Node {
   Node* parent = nullptr;
   Orientation orientation = Orientation::Vertical;
@@ -140,6 +151,7 @@ struct Node {
   std::vector<double> weights;
   std::vector<Window> tabs;
   std::size_t active_tab = 0;
+  std::unordered_map<std::size_t, Rect> rect_by_monitor;
 
   bool is_leaf() const { return children.empty(); }
 };
@@ -1980,7 +1992,7 @@ class X11Backend final : public Backend {
         {"Super+f", "Element hints (click anything by typing its label)"},
         {"Super+i", "Recent projects picker"},
         {"Super+o", "Active projects picker"},
-        {"Super+h/j/k/l", "Focus direction"},
+        {"Super+h/j/k/l", "Focus direction (selects empty panes too in manual layout)"},
         {"Super+Ctrl+j/k", "Focus next/previous in stack order"},
         {"Super+Ctrl+h/l", "Shrink/grow master area"},
         {"Super+v", "Split pane vertically"},
@@ -3705,8 +3717,11 @@ class X11Backend final : public Backend {
     set_active_window(window);
   }
 
-  // In manual layout the visible clients are the active tabs, so this selects
-  // panes there and clients in automatic layouts.
+  // Window-geometry-based directional focus, used for the automatic layouts
+  // (MasterStack/Monocle) where there is no pane tree to select against --
+  // only real, mapped windows exist as candidates. Manual mode uses
+  // select_pane_direction below instead, which can also land on an empty
+  // pane that has no window yet.
   void focus_direction(KeySym key) {
     const Window selected = workspace().focused;
     if (selected == None) return;
@@ -3759,6 +3774,129 @@ class X11Backend final : public Backend {
     if (best != None) focus(best);
   }
 
+  // Selects a pane outright: focuses its active tab if it has one, or -- for
+  // a pane freshly created by split() and still empty -- just marks it as
+  // the selected_leaf and clears real window focus, so the next spawned
+  // client (Super+Return) or split (Super+v/s) lands there instead of
+  // wherever focus last was.
+  void select_pane(Node* leaf) {
+    if (!leaf) return;
+    Workspace& target = workspace();
+    target.selected_leaf = leaf;
+    if (!leaf->tabs.empty()) {
+      focus(leaf->tabs[leaf->active_tab]);
+    } else {
+      if (previously_focused_ != None) {
+        update_border(previously_focused_, false);
+        previously_focused_ = None;
+      }
+      target.focused = None;
+      XSetInputFocus(display_, root_, RevertToPointerRoot, CurrentTime);
+      Window none = None;
+      set_active_window(none);
+    }
+    // Either branch can change which pane is empty-and-selected, so refresh
+    // the highlight overlay (and pane tab bars) either way -- focus() alone
+    // doesn't touch them.
+    arrange();
+  }
+
+  // Directional pane selection for manual mode: like focus_direction, but
+  // the candidates are the panes in the tree (using their last-arranged
+  // rects) rather than only real windows, so an empty pane can be selected
+  // and later opened into without having to open something in it the
+  // instant it's split off.
+  void select_pane_direction(KeySym key) {
+    Workspace& target = workspace();
+    Node* current_leaf = target.selected_leaf;
+
+    // selected_leaf is the source of truth for "where we are" -- it can
+    // diverge from target.focused right after a split, since split() moves
+    // selection to the new empty pane without touching real window focus
+    // (there's nothing to focus yet). Preferring target.focused's geometry
+    // here would silently navigate from the stale, pre-split position.
+    int selected_x = 0, selected_y = 0;
+    bool have_reference = false;
+    if (current_leaf) {
+      if (const Rect* rect = leaf_rect(current_leaf, current_monitor_)) {
+        selected_x = rect->x + rect->w / 2;
+        selected_y = rect->y + rect->h / 2;
+        have_reference = true;
+      }
+    }
+    if (!have_reference && target.focused != None) {
+      XWindowAttributes attributes;
+      if (XGetWindowAttributes(display_, target.focused, &attributes) &&
+          attributes.map_state == IsViewable) {
+        selected_x = attributes.x + attributes.width / 2;
+        selected_y = attributes.y + attributes.height / 2;
+        have_reference = true;
+      }
+    }
+    if (!have_reference) { focus_direction(key); return; }
+
+    struct Candidate {
+      int x, y;
+      Node* leaf;
+      Window window;
+    };
+    std::vector<Candidate> candidates;
+
+    std::vector<Node*> leaves;
+    collect_leaves(target.root.get(), leaves);
+    for (Node* leaf : leaves) {
+      if (leaf == current_leaf) continue;
+      const Rect* rect = leaf_rect(leaf, current_monitor_);
+      if (!rect) continue;
+      const Window window = leaf->tabs.empty() ? None : leaf->tabs[leaf->active_tab];
+      candidates.push_back({rect->x + rect->w / 2, rect->y + rect->h / 2, leaf, window});
+    }
+    for (Window window : target.floating) {
+      if (window == target.focused || window_state_[window].monitor != current_monitor_) continue;
+      XWindowAttributes attributes;
+      if (!XGetWindowAttributes(display_, window, &attributes) || attributes.map_state != IsViewable) continue;
+      candidates.push_back({attributes.x + attributes.width / 2, attributes.y + attributes.height / 2,
+                            nullptr, window});
+    }
+
+    bool found = false;
+    long best_score = 0;
+    Node* best_leaf = nullptr;
+    Window best_window = None;
+    for (const Candidate& candidate : candidates) {
+      int primary = 0, secondary = 0;
+      if (key == XK_h) {
+        primary = selected_x - candidate.x;
+        secondary = std::abs(selected_y - candidate.y);
+      } else if (key == XK_j) {
+        primary = candidate.y - selected_y;
+        secondary = std::abs(selected_x - candidate.x);
+      } else if (key == XK_k) {
+        primary = selected_y - candidate.y;
+        secondary = std::abs(selected_x - candidate.x);
+      } else if (key == XK_l) {
+        primary = candidate.x - selected_x;
+        secondary = std::abs(selected_y - candidate.y);
+      } else {
+        return;
+      }
+      if (primary <= 0) continue;
+      const long score = static_cast<long>(primary) * 10000L + secondary;
+      if (!found || score < best_score) {
+        found = true;
+        best_score = score;
+        best_leaf = candidate.leaf;
+        best_window = candidate.window;
+      }
+    }
+    if (!found) return;
+    if (best_leaf) {
+      select_pane(best_leaf);
+    } else if (best_window != None) {
+      focus(best_window);
+    }
+  }
+
   void next_tab() {
     Node* leaf = workspace().selected_leaf;
     if (!leaf || leaf->tabs.size() < 2) return;
@@ -3783,12 +3921,16 @@ class X11Backend final : public Backend {
     container->orientation = orientation;
     old_leaf->parent = container.get();
     auto new_leaf = make_leaf(container.get());
-    target.selected_leaf = new_leaf.get();
+    Node* new_leaf_ptr = new_leaf.get();
     container->children.push_back(std::move(old_leaf));
     container->children.push_back(std::move(new_leaf));
     container->weights = {1.0, 1.0};
     *slot = std::move(container);
-    arrange();
+    // select_pane, not a bare assignment: the new pane is empty, so this
+    // also drops real window focus off the old pane's client (otherwise
+    // target.focused would keep pointing at it, out of sync with
+    // selected_leaf, until something is opened here).
+    select_pane(new_leaf_ptr);
   }
 
   // Resize across the nearest split boundary that has the requested axis.
@@ -3796,8 +3938,10 @@ class X11Backend final : public Backend {
   // resize intent: h/k shrink the selected pane and j/l grow it.
   void resize_pane(KeySym key) {
     Workspace& target = workspace();
-    if (target.mode != LayoutMode::Manual || target.focused == None) return;
-    Node* child = find_leaf(target.root.get(), target.focused);
+    if (target.mode != LayoutMode::Manual) return;
+    // selected_leaf rather than target.focused, so resizing works on a
+    // selected-but-still-empty pane too.
+    Node* child = target.selected_leaf;
     if (!child) return;
 
     const Orientation axis = (key == XK_h || key == XK_l) ? Orientation::Vertical
@@ -4102,16 +4246,38 @@ class X11Backend final : public Backend {
   }
 
   void arrange_leaf(Node* leaf, int x, int y, int width, int height, std::size_t monitor_index) {
+    // Recorded unconditionally, including for empty leaves, so a freshly
+    // split pane with nothing open in it yet still has a rect to select,
+    // highlight, and place a tab bar against.
+    leaf->rect_by_monitor[monitor_index] = Rect{x, y, width, height};
     if (leaf->tabs.empty()) return;
     leaf->active_tab %= leaf->tabs.size();
+    int content_y = y;
+    int content_height = height;
+    if (leaf->tabs.size() > 1) {
+      content_y = y + kPaneTabBarHeight;
+      content_height = std::max(1, height - kPaneTabBarHeight);
+    }
     for (std::size_t index = 0; index < leaf->tabs.size(); ++index) {
       if (window_state_[leaf->tabs[index]].monitor != monitor_index) continue;
       if (index == leaf->active_tab) {
-        resize(leaf->tabs[index], x, y, width, height);
+        resize(leaf->tabs[index], x, content_y, width, content_height);
       } else {
         hide_window(leaf->tabs[index]);
       }
     }
+  }
+
+  const Rect* leaf_rect(const Node* leaf, std::size_t monitor_index) const {
+    if (!leaf) return nullptr;
+    const auto it = leaf->rect_by_monitor.find(monitor_index);
+    return it != leaf->rect_by_monitor.end() ? &it->second : nullptr;
+  }
+
+  void collect_leaves(Node* node, std::vector<Node*>& leaves) const {
+    if (!node) return;
+    if (node->is_leaf()) { leaves.push_back(node); return; }
+    for (auto& child : node->children) collect_leaves(child.get(), leaves);
   }
 
   void arrange_manual(Node* node, int x, int y, int width, int height, std::size_t monitor_index) {
@@ -4214,11 +4380,153 @@ class X11Backend final : public Backend {
       }
     }
     arrange_floating(target);
+    sync_pane_tab_bars();
+    update_empty_pane_highlight();
     XRaiseWindow(display_, bar_);
     draw_bar();
     draw_docks();
     update_tray();
     XFlush(display_);
+  }
+
+  void ensure_empty_pane_highlight() {
+    if (empty_pane_highlight_ != None) return;
+    XSetWindowAttributes attributes{};
+    attributes.override_redirect = True;
+    attributes.background_pixel = bar_background_.pixel;
+    attributes.event_mask = ExposureMask;
+    empty_pane_highlight_ =
+        XCreateWindow(display_, root_, 0, 0, 1, 1, config_.border_width, DefaultDepth(display_, screen_),
+                     CopyFromParent, DefaultVisual(display_, screen_),
+                     CWOverrideRedirect | CWBackPixel | CWEventMask, &attributes);
+    XSetWindowBorder(display_, empty_pane_highlight_, border_focused_pixel_);
+  }
+
+  void draw_empty_pane_highlight() {
+    if (empty_pane_highlight_ == None) return;
+    Window root_return; int x, y; unsigned int width, height, border, depth;
+    if (!XGetGeometry(display_, empty_pane_highlight_, &root_return, &x, &y, &width, &height, &border, &depth))
+      return;
+    XSetForeground(display_, bar_gc_, bar_background_.pixel);
+    XFillRectangle(display_, empty_pane_highlight_, bar_gc_, 0, 0, width, height);
+    const std::string hint = "Empty pane -- Super+Return to open a terminal here";
+    draw_dock_text(empty_pane_highlight_, 12, (static_cast<int>(height) + bar_font_->ascent - bar_font_->descent) / 2,
+                   hint, bar_foreground_);
+  }
+
+  // Shows/hides and positions the one highlight window that marks the
+  // currently selected pane when it has no client in it yet -- otherwise
+  // there would be nothing on screen to show where a split landed, and
+  // Super+hjkl would have no visible effect when moving onto it.
+  void update_empty_pane_highlight() {
+    Workspace& target = workspace();
+    Node* leaf = target.selected_leaf;
+    const bool show = target.mode == LayoutMode::Manual && leaf && leaf->is_leaf() && leaf->tabs.empty();
+    if (!show) {
+      if (empty_pane_highlight_ != None) XUnmapWindow(display_, empty_pane_highlight_);
+      return;
+    }
+    ensure_empty_pane_highlight();
+    const Rect* rect = leaf_rect(leaf, current_monitor_);
+    if (!rect) {
+      XUnmapWindow(display_, empty_pane_highlight_);
+      return;
+    }
+    XMoveResizeWindow(display_, empty_pane_highlight_, rect->x, rect->y, std::max(1, rect->w),
+                      std::max(1, rect->h));
+    draw_empty_pane_highlight();
+    XMapRaised(display_, empty_pane_highlight_);
+  }
+
+  Node* pane_tab_bar_leaf_for(Window window) const {
+    for (const auto& entry : pane_tab_bars_) {
+      if (entry.second == window) return entry.first;
+    }
+    return nullptr;
+  }
+
+  void draw_pane_tab_bar(Node* leaf, Window window, int width) {
+    XSetForeground(display_, bar_gc_, bar_background_.pixel);
+    XFillRectangle(display_, window, bar_gc_, 0, 0, width, kPaneTabBarHeight);
+    const int count = static_cast<int>(leaf->tabs.size());
+    if (count == 0) return;
+    const int cell_width = std::max(1, width / count);
+    for (int index = 0; index < count; ++index) {
+      char* raw_title = nullptr;
+      std::string label =
+          XFetchName(display_, leaf->tabs[index], &raw_title) && raw_title ? raw_title : "untitled";
+      if (raw_title) XFree(raw_title);
+      if (label.size() > 20) { label.resize(19); label += "\xe2\x80\xa6"; }
+      const int x = index * cell_width;
+      const int cell = (index == count - 1) ? (width - x) : cell_width;
+      draw_dock_cell_h(window, x, cell, kPaneTabBarHeight, label, index == static_cast<int>(leaf->active_tab));
+      if (index > 0) {
+        XSetForeground(display_, bar_gc_, border_normal_pixel_);
+        XFillRectangle(display_, window, bar_gc_, x, 0, 1, kPaneTabBarHeight);
+      }
+    }
+  }
+
+  // Creates/destroys/repositions the small tab-bar window sitting above each
+  // manual-mode pane that currently holds more than one client, and redraws
+  // each one. Run every arrange() so it always tracks the live tree: a pane
+  // gets a bar the moment a second client lands in it, and loses it again
+  // the moment it's back down to one (or zero).
+  void sync_pane_tab_bars() {
+    std::vector<Node*> wanted;
+    if (workspace().mode == LayoutMode::Manual) {
+      std::vector<Node*> leaves;
+      collect_leaves(workspace().root.get(), leaves);
+      for (Node* leaf : leaves) {
+        if (leaf->tabs.size() > 1) wanted.push_back(leaf);
+      }
+    }
+    for (auto it = pane_tab_bars_.begin(); it != pane_tab_bars_.end();) {
+      if (std::find(wanted.begin(), wanted.end(), it->first) == wanted.end()) {
+        XDestroyWindow(display_, it->second);
+        it = pane_tab_bars_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    for (Node* leaf : wanted) {
+      auto existing = pane_tab_bars_.find(leaf);
+      Window window;
+      if (existing == pane_tab_bars_.end()) {
+        XSetWindowAttributes attributes{};
+        attributes.override_redirect = True;
+        attributes.background_pixel = bar_background_.pixel;
+        attributes.event_mask = ExposureMask | ButtonPressMask;
+        window = XCreateWindow(display_, root_, 0, 0, 1, kPaneTabBarHeight, 0, DefaultDepth(display_, screen_),
+                               CopyFromParent, DefaultVisual(display_, screen_),
+                               CWOverrideRedirect | CWBackPixel | CWEventMask, &attributes);
+        XDefineCursor(display_, window, cursor_);
+        pane_tab_bars_.emplace(leaf, window);
+      } else {
+        window = existing->second;
+      }
+      const Rect* rect = leaf_rect(leaf, current_monitor_);
+      if (!rect) {
+        XUnmapWindow(display_, window);
+        continue;
+      }
+      XMoveResizeWindow(display_, window, rect->x, rect->y, std::max(1, rect->w), kPaneTabBarHeight);
+      draw_pane_tab_bar(leaf, window, rect->w);
+      XMapRaised(display_, window);
+    }
+  }
+
+  void handle_pane_tab_bar_button(Node* leaf, const XButtonEvent& event) {
+    if (leaf->tabs.empty()) return;
+    const Rect* rect = leaf_rect(leaf, current_monitor_);
+    const int width = rect ? rect->w : 1;
+    const int count = static_cast<int>(leaf->tabs.size());
+    const int cell_width = std::max(1, width / count);
+    const int index = std::clamp(event.x / cell_width, 0, count - 1);
+    leaf->active_tab = static_cast<std::size_t>(index);
+    workspace().selected_leaf = leaf;
+    focus(leaf->tabs[static_cast<std::size_t>(index)]);
+    arrange();
   }
 
   void spawn_command(const std::string& command) const {
@@ -4497,6 +4805,8 @@ class X11Backend final : public Backend {
           if (launcher_visible_) draw_launcher();
         } else if (dock_monitor(event.xbutton.window) >= 0) {
           handle_dock_button(event.xbutton);
+        } else if (Node* tab_bar_leaf = pane_tab_bar_leaf_for(event.xbutton.window)) {
+          handle_pane_tab_bar_button(tab_bar_leaf, event.xbutton);
         } else {
           handle_button(event.xbutton);
         }
@@ -4514,6 +4824,13 @@ class X11Backend final : public Backend {
         if (event.xexpose.window == launcher_window_ && event.xexpose.count == 0) draw_launcher();
         if (event.xexpose.window == slider_window_ && event.xexpose.count == 0) draw_slider_popup();
         if (event.xexpose.window == side_panel_window_ && event.xexpose.count == 0) draw_side_panel();
+        if (event.xexpose.window == empty_pane_highlight_ && event.xexpose.count == 0) draw_empty_pane_highlight();
+        if (event.xexpose.count == 0) {
+          if (Node* leaf = pane_tab_bar_leaf_for(event.xexpose.window)) {
+            const Rect* rect = leaf_rect(leaf, current_monitor_);
+            draw_pane_tab_bar(leaf, event.xexpose.window, rect ? rect->w : 1);
+          }
+        }
         if (dock_monitor(event.xexpose.window) >= 0 && event.xexpose.count == 0) draw_docks();
         break;
       case ClientMessage:
@@ -4600,7 +4917,10 @@ class X11Backend final : public Backend {
     if (key == XK_f) toggle_hints();
     if (key == XK_b) toggle_bar();
     if (key == XK_d) adjust_nmaster(-1);
-    if (key == XK_h || key == XK_j || key == XK_k || key == XK_l) focus_direction(key);
+    if (key == XK_h || key == XK_j || key == XK_k || key == XK_l) {
+      if (workspace().mode == LayoutMode::Manual) select_pane_direction(key);
+      else focus_direction(key);
+    }
     if (key == XK_v) split(Orientation::Vertical);
     if (key == XK_s) split(Orientation::Horizontal);
     if (key == XK_Tab) next_tab();
@@ -4702,6 +5022,8 @@ class X11Backend final : public Backend {
   bool slider_visible_ = false;
   bool slider_dragging_ = false;
   SliderKind slider_kind_ = SliderKind::Backlight;
+  Window empty_pane_highlight_ = None;
+  std::unordered_map<Node*, Window> pane_tab_bars_;
   Window side_panel_window_ = None;
   SidePanel side_panel_ = SidePanel::Closed;
   std::size_t side_panel_monitor_ = 0;
