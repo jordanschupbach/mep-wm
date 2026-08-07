@@ -126,7 +126,7 @@ enum class Orientation { Vertical, Horizontal };
 enum class LayoutMode { Manual, MasterStack, Monocle };
 enum class SliderKind { Backlight, Volume, Microphone };
 enum class SidePanel { Closed, Notifications, Todos, Agents, Help, Info };
-enum class LauncherMode { Applications, Projects, ActiveProjects };
+enum class LauncherMode { Applications, Projects, ActiveProjects, Windows };
 // Note: cannot use "None" as a member name here — X11/X.h (pulled in via
 // Xlib.h) #defines None to 0L, which breaks enum class member declarations.
 enum class InfoAction { NoneAction, Wifi, Bluetooth, Media, Git, Keyboard, Theme };
@@ -242,6 +242,8 @@ struct LuaKeybind {
   KeyCode keycode = 0;
   unsigned int modifiers = 0;
   int callback = LUA_NOREF;
+  std::string spec;
+  std::string description;
 };
 struct LuaMousebind { std::string context; unsigned int button = 0, modifiers = 0; int callback = LUA_NOREF; };
 struct LuaWidget { std::string name; std::string text; bool highlight = false; int update = LUA_NOREF; int click = LUA_NOREF; };
@@ -864,7 +866,8 @@ class X11Backend final : public Backend {
     if (!keycode) return luaL_error(state, "invalid keybinding: %s", spec.c_str());
     lua_pushvalue(state, 2);
     const int callback = luaL_ref(state, LUA_REGISTRYINDEX);
-    backend->lua_keybinds_.push_back({keycode, modifiers, callback});
+    const std::string description = luaL_optstring(state, 3, "");
+    backend->lua_keybinds_.push_back({keycode, modifiers, callback, spec, description});
     const unsigned int ignored[] = {0, LockMask, Mod2Mask, LockMask | Mod2Mask};
     for (unsigned int mask : ignored)
       XGrabKey(backend->display_, keycode, modifiers | mask, backend->root_, True, GrabModeAsync, GrabModeAsync);
@@ -909,6 +912,105 @@ class X11Backend final : public Backend {
     return 0;
   }
 
+  static int lua_exec(lua_State* state) {
+    lua_pushstring(state, capture_command(luaL_checkstring(state, 1)).c_str());
+    return 1;
+  }
+
+  static int lua_zoom(lua_State* state) { lua_backend(state)->zoom(); return 0; }
+  static int lua_toggle_floating(lua_State* state) { lua_backend(state)->toggle_floating(); return 0; }
+  static int lua_kill_client(lua_State* state) { lua_backend(state)->kill_focused(); return 0; }
+  static int lua_scratchpad_set(lua_State* state) { lua_backend(state)->set_scratchpad(); return 0; }
+  static int lua_scratchpad_toggle(lua_State* state) { lua_backend(state)->toggle_scratchpad(); return 0; }
+  static int lua_toggle_bar(lua_State* state) { lua_backend(state)->toggle_bar(); return 0; }
+
+  static int lua_set_layout(lua_State* state) {
+    X11Backend* backend = lua_backend(state);
+    std::string name = luaL_checkstring(state, 1);
+    for (char& letter : name) letter = static_cast<char>(std::tolower(static_cast<unsigned char>(letter)));
+    LayoutMode mode;
+    if (name == "tile" || name == "master" || name == "masterstack" || name == "master-stack") mode = LayoutMode::MasterStack;
+    else if (name == "monocle") mode = LayoutMode::Monocle;
+    else if (name == "manual" || name == "floating") mode = LayoutMode::Manual;
+    else return luaL_error(state, "unknown layout: %s (expected tile, monocle, or manual)", name.c_str());
+    backend->workspace().mode = mode;
+    backend->arrange();
+    return 0;
+  }
+
+  static int lua_cycle_layout(lua_State* state) {
+    X11Backend* backend = lua_backend(state);
+    if (luaL_optinteger(state, 1, 1) < 0) backend->cycle_layout_reverse(); else backend->cycle_layout();
+    return 0;
+  }
+
+  static int lua_list_projects(lua_State* state) {
+    X11Backend* backend = lua_backend(state);
+    lua_newtable(state);
+    for (std::size_t index = 0; index < backend->projects_.size(); ++index) {
+      lua_pushstring(state, backend->projects_[index].path.c_str());
+      lua_rawseti(state, -2, static_cast<int>(index + 1));
+    }
+    return 1;
+  }
+
+  static int lua_current_project(lua_State* state) {
+    X11Backend* backend = lua_backend(state);
+    if (backend->active_project_index_ >= backend->projects_.size()) { lua_pushnil(state); return 1; }
+    lua_pushstring(state, backend->projects_[backend->active_project_index_].path.c_str());
+    return 1;
+  }
+
+  static int lua_switch_project(lua_State* state) {
+    X11Backend* backend = lua_backend(state);
+    const std::string raw_path = luaL_checkstring(state, 1);
+    std::string normalized;
+    if (!normalize_project_path(raw_path, &normalized)) return luaL_error(state, "not a directory: %s", raw_path.c_str());
+    backend->add_project(normalized);
+    const auto it = std::find_if(backend->projects_.begin(), backend->projects_.end(),
+                                 [&](const Project& project) { return project.path == normalized; });
+    if (it == backend->projects_.end()) return 0;
+    backend->switch_project(static_cast<std::size_t>(it - backend->projects_.begin()));
+    backend->spawn_terminal_in(normalized);
+    return 0;
+  }
+
+  static int lua_agent_command(lua_State* state) {
+    lua_backend(state)->config_.agent_command = luaL_checkstring(state, 1);
+    return 0;
+  }
+
+  // Adapted from mwm's mwm.theme({topbar={normal=,selected=},...}) to
+  // mep-wm's simpler palette-cycling bar (fg/bg/selected, no separate
+  // light/dark tables): mwm.theme({name=, fg=, bg=, selected=}) adds a new
+  // cyclable theme, or replaces the built-in of the same name.
+  static int lua_theme(lua_State* state) {
+    X11Backend* backend = lua_backend(state);
+    luaL_checktype(state, 1, LUA_TTABLE);
+    std::array<std::string, 3> palette = backend->theme_palettes_.empty()
+        ? std::array<std::string, 3>{"#f8f8f2", "#202124", "#5294e2"} : backend->theme_palettes_[0];
+    std::string name = "theme" + std::to_string(backend->theme_palettes_.size() + 1);
+    auto string_field = [&](const char* field, std::string* out) {
+      lua_getfield(state, 1, field);
+      if (lua_isstring(state, -1)) *out = lua_tostring(state, -1);
+      lua_pop(state, 1);
+    };
+    string_field("name", &name);
+    string_field("fg", &palette[0]);
+    string_field("bg", &palette[1]);
+    string_field("selected", &palette[2]);
+    const auto it = std::find(backend->theme_names_.begin(), backend->theme_names_.end(), name);
+    if (it != backend->theme_names_.end()) {
+      const std::size_t index = static_cast<std::size_t>(it - backend->theme_names_.begin());
+      backend->theme_palettes_[index] = palette;
+      if (static_cast<int>(index) == backend->theme_index_) backend->apply_current_theme();
+    } else {
+      backend->theme_names_.push_back(name);
+      backend->theme_palettes_.push_back(palette);
+    }
+    return 0;
+  }
+
   void initialize_lua() {
     if (lua_) lua_close(lua_);
     lua_ = luaL_newstate();
@@ -932,6 +1034,20 @@ class X11Backend final : public Backend {
     lua_pushcfunction(lua_, lua_rule); lua_setfield(lua_, -2, "rule");
     lua_pushcfunction(lua_, lua_keybind); lua_setfield(lua_, -2, "keybind");
     lua_pushcfunction(lua_, lua_mousebind); lua_setfield(lua_, -2, "mousebind");
+    lua_pushcfunction(lua_, lua_exec); lua_setfield(lua_, -2, "exec");
+    lua_pushcfunction(lua_, lua_zoom); lua_setfield(lua_, -2, "zoom");
+    lua_pushcfunction(lua_, lua_toggle_floating); lua_setfield(lua_, -2, "toggle_floating");
+    lua_pushcfunction(lua_, lua_kill_client); lua_setfield(lua_, -2, "kill_client");
+    lua_pushcfunction(lua_, lua_scratchpad_set); lua_setfield(lua_, -2, "scratchpad_set");
+    lua_pushcfunction(lua_, lua_scratchpad_toggle); lua_setfield(lua_, -2, "scratchpad_toggle");
+    lua_pushcfunction(lua_, lua_toggle_bar); lua_setfield(lua_, -2, "toggle_bar");
+    lua_pushcfunction(lua_, lua_set_layout); lua_setfield(lua_, -2, "set_layout");
+    lua_pushcfunction(lua_, lua_cycle_layout); lua_setfield(lua_, -2, "cycle_layout");
+    lua_pushcfunction(lua_, lua_list_projects); lua_setfield(lua_, -2, "list_projects");
+    lua_pushcfunction(lua_, lua_current_project); lua_setfield(lua_, -2, "current_project");
+    lua_pushcfunction(lua_, lua_switch_project); lua_setfield(lua_, -2, "switch_project");
+    lua_pushcfunction(lua_, lua_agent_command); lua_setfield(lua_, -2, "agent_command");
+    lua_pushcfunction(lua_, lua_theme); lua_setfield(lua_, -2, "theme");
     lua_setglobal(lua_, "mwm");
     const char* home = std::getenv("HOME");
     if (home) {
@@ -944,11 +1060,20 @@ class X11Backend final : public Backend {
   }
 
   void reload_lua() {
+    reset_theme_palettes();
     lua_rules_.clear();
     lua_keybinds_.clear();
+    // Unconditional, even though the vector is about to be emptied anyway:
+    // a reload that registers fewer (or zero) mousebinds than before must
+    // still drop the old X-server grabs, or they outlive the C++-side
+    // bindings that would have handled them.
+    XUngrabButton(display_, AnyButton, AnyModifier, root_);
+    XUngrabButton(display_, AnyButton, AnyModifier, bar_);
+    for (const auto& entry : window_state_) XUngrabButton(display_, AnyButton, AnyModifier, entry.first);
     lua_mousebinds_.clear();
     lua_widgets_.clear();
     initialize_lua();
+    apply_current_theme();
     XUngrabKey(display_, AnyKey, AnyModifier, root_);
     grab_keys();
     arrange();
@@ -1760,6 +1885,48 @@ class X11Backend final : public Backend {
     for (const Todo& todo : todos_) file << (todo.done ? '1' : '0') << '\t' << todo.text << '\n';
   }
 
+  // Kept in sync by hand with handle_key/handle_button/grab_keys -- there's
+  // no single compiled keybind table to derive this from (unlike mwm.cpp's
+  // keys[]), since mep-wm dispatches via if-chains keyed on (state, KeySym).
+  static const std::vector<std::pair<std::string, std::string>>& compiled_keybind_help() {
+    static const std::vector<std::pair<std::string, std::string>> bindings = {
+        {"Super+Return", "Open a terminal"},
+        {"Super+p", "Application picker"},
+        {"Super+w", "Window switcher"},
+        {"Super+i", "Recent projects picker"},
+        {"Super+o", "Active projects picker"},
+        {"Super+h/j/k/l", "Focus direction"},
+        {"Super+Ctrl+j/k", "Focus next/previous in stack order"},
+        {"Super+Ctrl+h/l", "Shrink/grow master area"},
+        {"Super+v", "Split pane vertically"},
+        {"Super+s", "Split pane horizontally"},
+        {"Super+Tab", "Next tab"},
+        {"Super+Space / Super+a", "Cycle layout"},
+        {"Super+Ctrl+Space", "Cycle layout (reverse, Lua-bound)"},
+        {"Super+z", "Zoom focused window to master"},
+        {"Super+m", "Toggle maximize"},
+        {"Super+d", "Decrease master count"},
+        {"Super+Shift+d", "Increase master count"},
+        {"Super+b", "Toggle bar"},
+        {"Super+minus", "Toggle scratchpad"},
+        {"Super+Shift+minus", "Designate scratchpad"},
+        {"Super+Shift+space", "Toggle floating"},
+        {"Super+Shift+c", "Kill focused window"},
+        {"Super+Shift+h/j/k/l", "Resize pane"},
+        {"Super+comma / Super+period", "Focus previous/next monitor"},
+        {"Super+Shift+comma / Super+Shift+period", "Send window to previous/next monitor"},
+        {"Super+1..9", "Switch workspace"},
+        {"Super+r", "Reload config"},
+        {"Super+Shift+r", "Restart mepwm"},
+        {"Super+Shift+t", "Theme picker"},
+        {"Super+Shift+slash", "Toggle this help panel"},
+        {"Super+Shift+q", "Quit"},
+        {"Super+drag (left click)", "Move window"},
+        {"Super+drag (right click)", "Resize window"},
+    };
+    return bindings;
+  }
+
   void draw_side_panel() {
     if (side_panel_ == SidePanel::Closed || side_panel_window_ == None) return;
     if (side_panel_ == SidePanel::Todos) load_todos();
@@ -1813,9 +1980,13 @@ class X11Backend final : public Backend {
       for (const AgentStatus& agent : agents_)
         row(agent.kind + " " + agent.status + ": " + (agent.label.empty() ? agent.cwd : agent.label), agent.needs_input);
     } else if (side_panel_ == SidePanel::Help) {
-      for (const char* binding : {"Super+p  Application picker", "Super+Enter  Terminal", "Super+h/j/k/l  Focus direction",
-                                  "Super+Shift+h/j/k/l  Resize pane", "Super+Space  Cycle layout", "Super+1…9  Workspace",
-                                  "Super+Shift+q  Exit", "Right-click  Close panel"}) row(binding);
+      for (const auto& [spec, description] : compiled_keybind_help()) row(spec + "  " + description);
+      if (!lua_keybinds_.empty()) {
+        row("");
+        row("-- from config.lua --");
+        for (const LuaKeybind& binding : lua_keybinds_)
+          row(binding.spec + "  " + (binding.description.empty() ? "(no description)" : binding.description));
+      }
     } else {
       std::istringstream lines(info_panel_body_);
       for (std::string line; std::getline(lines, line);) row(line);
@@ -1935,7 +2106,10 @@ class X11Backend final : public Backend {
   }
 
   void open_theme_panel() {
-    open_action_panel(InfoAction::Theme, "Theme", "Default\nLight\nNord");
+    std::string body;
+    for (std::size_t index = 0; index < theme_names_.size(); ++index)
+      body += (index ? "\n" : "") + std::string(static_cast<int>(index) == theme_index_ ? "• " : "  ") + theme_names_[index];
+    open_action_panel(InfoAction::Theme, "Theme", body);
   }
 
   void handle_side_panel_button(const XButtonEvent& event) {
@@ -1986,7 +2160,7 @@ class X11Backend final : public Backend {
       } else if (info_action_ == InfoAction::Keyboard && static_cast<std::size_t>(row) < keyboard_layouts_.size()) {
         XkbLockGroup(display_, XkbUseCoreKbd, row);
         widgets_refreshed_ = 0;
-      } else if (info_action_ == InfoAction::Theme && row >= 0 && row < 3) {
+      } else if (info_action_ == InfoAction::Theme && row >= 0 && static_cast<std::size_t>(row) < theme_palettes_.size()) {
         const int direction = row - theme_index_;
         if (direction) cycle_theme(direction);
       } else if (info_action_ == InfoAction::Git) {
@@ -2092,19 +2266,31 @@ class X11Backend final : public Backend {
     widgets_refreshed_ = 0;
   }
 
-  void cycle_theme(int direction) {
-    static constexpr std::array<std::array<const char*, 3>, 3> palettes = {{
-        {{"#f8f8f2", "#202124", "#5294e2"}}, {{"#202124", "#f4f4f4", "#3971ed"}},
-        {{"#d8dee9", "#2e3440", "#88c0d0"}},
-    }};
-    theme_index_ = (theme_index_ + direction + static_cast<int>(palettes.size())) % static_cast<int>(palettes.size());
+  // Built-ins plus anything mwm.theme() registered from Lua; reset back to
+  // just the built-ins on reload_lua() (see reset_theme_palettes()).
+  void apply_current_theme() {
+    if (theme_palettes_.empty()) return;
+    theme_index_ = std::clamp(theme_index_, 0, static_cast<int>(theme_palettes_.size()) - 1);
+    const std::array<std::string, 3>& palette = theme_palettes_[static_cast<std::size_t>(theme_index_)];
     XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &bar_foreground_);
     XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &bar_background_);
     XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &bar_selected_);
-    XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), palettes[theme_index_][0], &bar_foreground_);
-    XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), palettes[theme_index_][1], &bar_background_);
-    XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), palettes[theme_index_][2], &bar_selected_);
+    XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), palette[0].c_str(), &bar_foreground_);
+    XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), palette[1].c_str(), &bar_background_);
+    XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), palette[2].c_str(), &bar_selected_);
     draw_bar(); draw_docks();
+  }
+
+  void cycle_theme(int direction) {
+    if (theme_palettes_.empty()) return;
+    theme_index_ = (theme_index_ + direction + static_cast<int>(theme_palettes_.size())) % static_cast<int>(theme_palettes_.size());
+    apply_current_theme();
+  }
+
+  void reset_theme_palettes() {
+    theme_palettes_ = {{{"#f8f8f2", "#202124", "#5294e2"}}, {{"#202124", "#f4f4f4", "#3971ed"}}, {{"#d8dee9", "#2e3440", "#88c0d0"}}};
+    theme_names_ = {"dark", "blue", "nord"};
+    if (theme_index_ >= static_cast<int>(theme_palettes_.size())) theme_index_ = 0;
   }
 
   void cycle_keyboard_layout() {
@@ -2497,7 +2683,47 @@ class X11Backend final : public Backend {
     return std::max(0, score - static_cast<int>((candidate.size() - query.size()) / 8));
   }
 
+  // Scoped to the current project's own 9 workspaces (mep-wm's per-project
+  // workspace model), unlike mwm's single global tag list.
+  void collect_project_windows(std::vector<Window>* windows) const {
+    windows->clear();
+    for (const Workspace& value : workspaces_) {
+      windows->insert(windows->end(), value.stack_order.begin(), value.stack_order.end());
+      windows->insert(windows->end(), value.floating.begin(), value.floating.end());
+    }
+  }
+
+  void scan_windows() {
+    window_candidates_.clear();
+    std::vector<Window> windows;
+    collect_project_windows(&windows);
+    for (Window window : windows) {
+      char* raw_title = nullptr;
+      std::string title = "untitled";
+      if (XFetchName(display_, window, &raw_title) && raw_title) { title = raw_title; XFree(raw_title); }
+      window_candidates_.push_back({window, title});
+    }
+  }
+
   void filter_launcher_apps() {
+    if (launcher_mode_ == LauncherMode::Windows) {
+      std::vector<std::pair<int, std::size_t>> matches;
+      for (std::size_t index = 0; index < window_candidates_.size(); ++index) {
+        const int score = fuzzy_score(launcher_query_, window_candidates_[index].second);
+        if (score >= 0) matches.emplace_back(score, index);
+      }
+      if (!launcher_query_.empty()) {
+        std::sort(matches.begin(), matches.end(), [&](const auto& left, const auto& right) {
+          return left.first != right.first ? left.first > right.first
+                                           : window_candidates_[left.second].second < window_candidates_[right.second].second;
+        });
+      }
+      window_matches_.clear();
+      for (const auto& match : matches) window_matches_.push_back(match.second);
+      launcher_selection_ = 0;
+      launcher_scroll_ = 0;
+      return;
+    }
     if (launcher_mode_ != LauncherMode::Applications) {
       std::vector<std::pair<int, std::size_t>> matches;
       for (std::size_t index = 0; index < projects_.size(); ++index) {
@@ -2552,8 +2778,7 @@ class X11Backend final : public Backend {
 
   void draw_launcher() {
     if (launcher_window_ == None) return;
-    const std::size_t match_count = launcher_mode_ == LauncherMode::Applications ? launcher_matches_.size()
-                                                                                   : project_matches_.size();
+    const std::size_t match_count = launcher_match_count();
     const int shown = std::min<int>(kLauncherMaxRows, match_count - launcher_scroll_);
     const int height = kBarHeight * (std::max(1, shown) + 1);
     const Monitor& target_monitor = monitor(current_monitor_);
@@ -2569,6 +2794,7 @@ class X11Backend final : public Backend {
     XSetForeground(display_, bar_gc_, bar_background_.pixel);
     XFillRectangle(display_, launcher_pixmap_, bar_gc_, 0, 0, width, height);
     const char* title = launcher_mode_ == LauncherMode::Applications ? "Run: "
+                      : launcher_mode_ == LauncherMode::Windows ? "Window: "
                       : launcher_mode_ == LauncherMode::Projects ? "Projects: " : "Active projects: ";
     draw_launcher_text(10, (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2,
                        std::string(title) + launcher_query_, bar_foreground_);
@@ -2576,6 +2802,8 @@ class X11Backend final : public Backend {
       draw_launcher_text(10, kBarHeight + (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2,
                          launcher_mode_ == LauncherMode::Applications
                              ? (launcher_apps_.empty() ? "No applications found" : "No matching applications")
+                         : launcher_mode_ == LauncherMode::Windows
+                             ? (window_candidates_.empty() ? "No open windows" : "No matching windows")
                              : "No matching projects", bar_foreground_);
     }
     for (int row = 0; row < shown; ++row) {
@@ -2586,6 +2814,8 @@ class X11Backend final : public Backend {
       }
       const std::string label = launcher_mode_ == LauncherMode::Applications
                                     ? launcher_apps_[launcher_matches_[launcher_scroll_ + row]].name
+                                : launcher_mode_ == LauncherMode::Windows
+                                    ? window_candidates_[window_matches_[launcher_scroll_ + row]].second
                                     : project_label(projects_[project_matches_[launcher_scroll_ + row]].path);
       draw_launcher_text(10, y_offset + (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2, label,
                          launcher_scroll_ + static_cast<std::size_t>(row) == launcher_selection_
@@ -2606,6 +2836,7 @@ class X11Backend final : public Backend {
   void open_launcher(LauncherMode mode = LauncherMode::Applications) {
     launcher_mode_ = mode;
     if (mode == LauncherMode::Applications) scan_launcher_apps();
+    if (mode == LauncherMode::Windows) scan_windows();
     launcher_query_.clear();
     filter_launcher_apps();
     if (launcher_window_ == None) {
@@ -2640,8 +2871,16 @@ class X11Backend final : public Backend {
     }
   }
 
+  void open_window_switcher() {
+    if (launcher_visible_ && launcher_mode_ == LauncherMode::Windows) { close_launcher(); return; }
+    if (launcher_visible_) close_launcher();
+    open_launcher(LauncherMode::Windows);
+  }
+
   std::size_t launcher_match_count() const {
-    return launcher_mode_ == LauncherMode::Applications ? launcher_matches_.size() : project_matches_.size();
+    return launcher_mode_ == LauncherMode::Applications ? launcher_matches_.size()
+         : launcher_mode_ == LauncherMode::Windows ? window_matches_.size()
+                                                    : project_matches_.size();
   }
 
   void move_launcher_selection(int delta) {
@@ -2653,7 +2892,18 @@ class X11Backend final : public Backend {
       launcher_scroll_ = launcher_selection_ - kLauncherMaxRows + 1;
   }
 
-  void launch_selected_app() {
+  void launch_selected_app(bool with_agent = false) {
+    if (launcher_mode_ == LauncherMode::Windows) {
+      if (window_matches_.empty()) return;
+      const Window window = window_candidates_[window_matches_[launcher_selection_]].first;
+      close_launcher();
+      const int index = find_workspace(window);
+      if (index < 0) return;
+      if (index != current_workspace_) switch_workspace(index);
+      focus(window);
+      arrange();
+      return;
+    }
     if (launcher_mode_ != LauncherMode::Applications) {
       // A typed, valid directory takes precedence over fuzzy matches. Without
       // this, entering a path that happens to fuzzy-match an existing project
@@ -2669,6 +2919,7 @@ class X11Backend final : public Backend {
           close_launcher();
           switch_project(project);
           spawn_terminal_in(entered_path);
+          if (with_agent) spawn_terminal_running(entered_path, config_.agent_command);
           return;
         }
       }
@@ -2679,6 +2930,7 @@ class X11Backend final : public Backend {
       close_launcher();
       switch_project(project);
       if (open_terminal) spawn_terminal_in(path);
+      if (open_terminal && with_agent) spawn_terminal_running(path, config_.agent_command);
       return;
     }
     if (launcher_matches_.empty()) return;
@@ -2693,7 +2945,7 @@ class X11Backend final : public Backend {
     const int length = XLookupString(const_cast<XKeyEvent*>(&event), text, sizeof(text), &key, nullptr);
     const unsigned int state = event.state & ~(LockMask | Mod2Mask);
     if (key == XK_Escape) { close_launcher(); return; }
-    if (key == XK_Return || key == XK_KP_Enter) { launch_selected_app(); return; }
+    if (key == XK_Return || key == XK_KP_Enter) { launch_selected_app(state == ControlMask); return; }
     if (key == XK_BackSpace) {
       if (!launcher_query_.empty()) launcher_query_.pop_back();
       filter_launcher_apps();
@@ -2723,8 +2975,10 @@ class X11Backend final : public Backend {
     const unsigned int ignored_modifiers[] = {0, LockMask, Mod2Mask, LockMask | Mod2Mask};
     const KeySym plain_keys[] = {XK_Return, XK_q, XK_h, XK_i, XK_j, XK_k, XK_l, XK_o, XK_p, XK_v, XK_s, XK_Tab, XK_space,
                                  XK_a, XK_z, XK_m, XK_r, XK_minus, XK_comma, XK_period, XK_1, XK_2, XK_3,
-                                 XK_4, XK_5, XK_6, XK_7, XK_8, XK_9};
-    const KeySym shift_keys[] = {XK_q, XK_space, XK_c, XK_minus, XK_comma, XK_period, XK_h, XK_j, XK_k, XK_l};
+                                 XK_4, XK_5, XK_6, XK_7, XK_8, XK_9, XK_w, XK_b, XK_d};
+    const KeySym shift_keys[] = {XK_q, XK_space, XK_c, XK_minus, XK_comma, XK_period, XK_h, XK_j, XK_k, XK_l,
+                                 XK_r, XK_d, XK_t, XK_slash};
+    const KeySym ctrl_keys[] = {XK_h, XK_j, XK_k, XK_l};
     for (const unsigned int ignored : ignored_modifiers) {
       for (const KeySym key : plain_keys) {
         XGrabKey(display_, XKeysymToKeycode(display_, key), Mod4Mask | ignored, root_, True,
@@ -2732,6 +2986,10 @@ class X11Backend final : public Backend {
       }
       for (const KeySym key : shift_keys) {
         XGrabKey(display_, XKeysymToKeycode(display_, key), Mod4Mask | ShiftMask | ignored, root_,
+                 True, GrabModeAsync, GrabModeAsync);
+      }
+      for (const KeySym key : ctrl_keys) {
+        XGrabKey(display_, XKeysymToKeycode(display_, key), Mod4Mask | ControlMask | ignored, root_,
                  True, GrabModeAsync, GrabModeAsync);
       }
     }
@@ -3161,6 +3419,64 @@ class X11Backend final : public Backend {
     arrange();
   }
 
+  void cycle_layout_reverse() {
+    Workspace& target = workspace();
+    target.mode = target.mode == LayoutMode::Manual
+                      ? LayoutMode::Monocle
+                      : target.mode == LayoutMode::Monocle ? LayoutMode::MasterStack : LayoutMode::Manual;
+    arrange();
+  }
+
+  // Visual-only: unmaps the bar without reclaiming its screen space in the
+  // tiling math (kBarHeight is baked into dozens of geometry calculations).
+  void toggle_bar() {
+    bar_visible_ = !bar_visible_;
+    if (bar_visible_) { XMapRaised(display_, bar_); draw_bar(); } else { XUnmapWindow(display_, bar_); }
+  }
+
+  void adjust_nmaster(int delta) {
+    config_.nmaster = static_cast<unsigned int>(std::max(0, static_cast<int>(config_.nmaster) + delta));
+    arrange();
+  }
+
+  void adjust_mfact(double delta) {
+    config_.mfact = std::clamp(config_.mfact + static_cast<float>(delta), 0.05f, 0.95f);
+    arrange();
+  }
+
+  // Cycles through master-stack order, distinct from focus_direction's
+  // spatial h/j/k/l focus.
+  void focus_stack(int direction) {
+    Workspace& target = workspace();
+    if (target.stack_order.empty()) return;
+    const auto it = std::find(target.stack_order.begin(), target.stack_order.end(), target.focused);
+    int index = it == target.stack_order.end() ? 0 : static_cast<int>(it - target.stack_order.begin());
+    const int count = static_cast<int>(target.stack_order.size());
+    index = ((index + direction) % count + count) % count;
+    focus(target.stack_order[static_cast<std::size_t>(index)]);
+  }
+
+  // Re-execs the running binary with its original argv, read back from
+  // /proc/self/cmdline rather than plumbed through Backend::run -- avoids
+  // threading argv through WindowManager/Config just for this.
+  void restart() {
+    std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
+    const std::string data((std::istreambuf_iterator<char>(cmdline)), std::istreambuf_iterator<char>());
+    std::vector<std::string> parts;
+    for (std::size_t start = 0; start < data.size();) {
+      std::size_t nul = data.find('\0', start);
+      if (nul == std::string::npos) nul = data.size();
+      parts.push_back(data.substr(start, nul - start));
+      start = nul + 1;
+    }
+    if (parts.empty()) { std::cerr << "mepwm: restart failed: could not read /proc/self/cmdline\n"; return; }
+    std::vector<char*> argv;
+    for (std::string& part : parts) argv.push_back(part.data());
+    argv.push_back(nullptr);
+    execv("/proc/self/exe", argv.data());
+    std::cerr << "mepwm: restart failed: " << std::strerror(errno) << '\n';
+  }
+
   // Moves the focused tiled window to the front of master-stack order.
   void zoom() {
     Workspace& target = workspace();
@@ -3490,6 +3806,28 @@ class X11Backend final : public Backend {
 
   void spawn_terminal() const { spawn_command(config_.terminal); }
 
+  // Independent of config_.terminal (which is a full launch expression, not
+  // just a binary), so the agent command is run in its own terminal rather
+  // than trying to splice it into an arbitrary user-configured launcher.
+  void spawn_terminal_running(const std::string& directory, const std::string& command) const {
+    const pid_t child = fork();
+    if (child < 0) {
+      std::cerr << "mepwm: could not start agent: " << std::strerror(errno) << '\n';
+      return;
+    }
+    if (child == 0) {
+      setsid();
+      if (chdir(directory.c_str()) != 0) _exit(127);
+      setenv("MEPWM_AGENT_COMMAND", command.c_str(), 1);
+      const char* wrapped =
+          "command -v kitty >/dev/null 2>&1 && exec kitty -e sh -c \"$MEPWM_AGENT_COMMAND\" "
+          "|| exec xterm -e sh -c \"$MEPWM_AGENT_COMMAND\"";
+      execl("/bin/sh", "sh", "-c", wrapped, static_cast<char*>(nullptr));
+      _exit(127);
+    }
+    signal(SIGCHLD, SIG_IGN);
+  }
+
   void spawn_terminal_in(const std::string& directory) const {
     const pid_t child = fork();
     if (child < 0) {
@@ -3797,6 +4135,17 @@ class X11Backend final : public Backend {
       if (key == XK_period) send_to_monitor(workspace().focused,
                                             (current_monitor_ + 1) % monitors_.size());
       if (key == XK_h || key == XK_j || key == XK_k || key == XK_l) resize_pane(key);
+      if (key == XK_r) restart();
+      if (key == XK_d) adjust_nmaster(1);
+      if (key == XK_t) open_theme_panel();
+      if (key == XK_slash) toggle_side_panel(SidePanel::Help);
+      return;
+    }
+    if (state == (Mod4Mask | ControlMask)) {
+      if (key == XK_h) adjust_mfact(-kResizeStep);
+      if (key == XK_l) adjust_mfact(kResizeStep);
+      if (key == XK_j) focus_stack(1);
+      if (key == XK_k) focus_stack(-1);
       return;
     }
     if (state != Mod4Mask) return;
@@ -3804,6 +4153,9 @@ class X11Backend final : public Backend {
     if (key == XK_i) toggle_project_picker(false);
     if (key == XK_o) toggle_project_picker(true);
     if (key == XK_p) toggle_launcher();
+    if (key == XK_w) open_window_switcher();
+    if (key == XK_b) toggle_bar();
+    if (key == XK_d) adjust_nmaster(-1);
     if (key == XK_h || key == XK_j || key == XK_k || key == XK_l) focus_direction(key);
     if (key == XK_v) split(Orientation::Vertical);
     if (key == XK_s) split(Orientation::Horizontal);
@@ -3920,6 +4272,9 @@ class X11Backend final : public Backend {
   std::string keyboard_layout_;
   std::vector<std::string> keyboard_layouts_;
   int theme_index_ = 0;
+  std::vector<std::array<std::string, 3>> theme_palettes_ = {
+      {{"#f8f8f2", "#202124", "#5294e2"}}, {{"#202124", "#f4f4f4", "#3971ed"}}, {{"#d8dee9", "#2e3440", "#88c0d0"}}};
+  std::vector<std::string> theme_names_ = {"dark", "blue", "nord"};
   std::vector<AgentStatus> agents_;
   int agent_needs_input_ = 0;
   GC bar_gc_ = nullptr;
@@ -3935,6 +4290,8 @@ class X11Backend final : public Backend {
   std::vector<std::size_t> launcher_matches_;
   LauncherMode launcher_mode_ = LauncherMode::Applications;
   std::vector<std::size_t> project_matches_;
+  std::vector<std::pair<Window, std::string>> window_candidates_;
+  std::vector<std::size_t> window_matches_;
   std::size_t launcher_selection_ = 0;
   std::size_t launcher_scroll_ = 0;
   XftFont* bar_font_ = nullptr;
@@ -3956,6 +4313,7 @@ class X11Backend final : public Backend {
   Window previously_focused_ = None;
   Window scratchpad_ = None;
   bool scratchpad_hidden_ = false;
+  bool bar_visible_ = true;
   unsigned long border_normal_pixel_ = 0;
   unsigned long border_focused_pixel_ = 0;
   bool running_ = true;

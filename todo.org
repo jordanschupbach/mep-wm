@@ -3,234 +3,166 @@
 
 Reference implementation: pkgs/mwm/mwm.cpp (17,380 lines, dwm derivative),
 pkgs/mwm/mwm-cli.c (IPC client), pkgs/mwm/config.lua.example (target Lua API
-surface). Line numbers below refer to mwm.cpp as audited 2026-08-06.
+surface). Rewritten 2026-08-06 after discovering the previous version of this
+file was stale: it was written once right after an early commit and never
+updated, so it still marked Phases 5-7 as TODO while several later commits
+("Add bars and widgets", "implement project workspaces", "update project
+picker", ...) had already landed most of that work. Keep this file in sync
+going forward -- update it in the same commit as the feature, not later.
 
 Skip/adapt anything that only makes sense for mwm's dwm-tag model, not
-mep-wm's manual split/tab tree -- called out per phase below where relevant.
+mep-wm's manual split/tab tree or per-project workspace model -- called out
+per phase below where relevant.
 
 * DONE Phase 1: Core WM mechanics
 CLOSED: [2026-08-06]
 
-Added to pkgs/mep-wm/src/x11_backend.cpp (config knobs in
-include/mepwm/window_manager.hpp):
-
-- Borders: configurable width + focused/unfocused colors, repainted on focus
-  change.
-- Floating windows: Mod4+Shift+space toggle (matches mwm's compiled default);
-  transient/_NET_WM_WINDOW_TYPE_DIALOG windows auto-float centered, like
-  mwm's manage()/updatewindowtype().
-- Mouse move/resize: Mod4+drag moves, Mod4+right-drag resizes, with
-  edge-snapping and drag-to-float promotion for tiled windows (mirrors dwm's
-  movemouse/resizemouse, mwm.cpp:15351/15697).
-- Fullscreen: EWMH _NET_WM_STATE_FULLSCREEN via ClientMessage (ADD/REMOVE/
-  TOGGLE), mirrors setfullscreen (mwm.cpp:16160).
-- Maximize: Mod4+m, matches togglemaximize (mwm.cpp:16598) -- floating-only,
-  resizes to work area, reversible.
-- Zoom: Mod4+z swaps focused window to master-stack front (mwm.cpp:17348).
-- Kill client: Mod4+Shift+c, graceful WM_DELETE_WINDOW then XKillClient
-  fallback (mwm.cpp:15194).
-- EWMH: _NET_SUPPORTING_WM_CHECK, _NET_SUPPORTED, _NET_CLIENT_LIST,
-  _NET_ACTIVE_WINDOW. This is what cfgs/configuration.nix's mwmzz session
-  polls via `xprop -root _NET_SUPPORTING_WM_CHECK` before launching
-  nm-applet -- mepwmzz can get the same treatment once Phase 3 (systray)
-  lands.
-- mfact/nmaster: master-stack layout now configurable instead of hardcoded
-  50/50 (Config.mfact/nmaster).
-
-Verified live under Xvfb: borders, split/master-stack geometry, fullscreen
-enter/exit, floating toggle + drag-to-float deltas, graceful kill leaving
-the right window count, _NET_CLIENT_LIST staying accurate, single-window
-workspace hide/show. Fixed two real bugs found along the way: a duplicate
-UnmapNotify (from selecting StructureNotifyMask on both root and client,
-which double-delivers unmap and was misfiring the tab-hide logic as a real
-close) and a BadMatch from focusing a window before it was mapped.
-
-** Follow-up / not fully nailed down
-- A synthetic-input test combining 2 tiled/floating windows + workspace
-  switch-away-and-back looked like a hang/crash under heavy sandbox CPU
-  load; turned out to be the test's own xterms hitting their `sleep 30`
-  timeout because the run took >30s under contention, not a mep-wm bug --
-  but the scenario (N>1 windows, mixed floating+tiled, switch away then
-  back) is worth one more clean re-run with a longer synthetic timeout
-  before fully trusting it.
-- cfact (per-client weight within a tile() column, mwm.cpp Client::cfact) not
-  ported -- mep-wm's master-stack columns are still evenly split.
-  resizebydir (Mod4+Shift+hjkl, mwm.cpp:15584) depends on cfact; not ported.
-- focusdir (Mod4+hjkl spatial/directional focus, mwm.cpp:14838) not ported --
-  mep-wm still has only focus_relative (Mod4+j/k, flat cycle through
-  tiled+floating windows). Directional focus is easy in master-stack/monocle
-  but ambiguous in manual mode's tree; worth revisiting once there's a
-  concrete manual-mode notion of "spatial" position.
+Borders, floating/tiling, mouse move/resize, fullscreen, maximize, zoom,
+kill client, EWMH (_NET_SUPPORTING_WM_CHECK/_NET_SUPPORTED/_NET_CLIENT_LIST/
+_NET_ACTIVE_WINDOW), configurable mfact/nmaster. Directional focus
+(focus_direction, Mod4+hjkl) is also done, despite an earlier note in this
+file claiming otherwise.
 
 * DONE Phase 2: Multi-monitor (Xinerama)
 CLOSED: [2026-08-06]
 
-Reference: Monitor struct (mwm.cpp:850), updategeom (16909),
-isuniquegeom (15143), createmon (14097), cleanupmon (13860),
-sendmon (15993), tagmon/focusmon/dirtomon (16502/14787/14154).
-
-Implemented in =src/x11_backend.cpp=:
-
-- Enumerates Xinerama screens, deduplicating mirror geometries; uses a root
-  sized fallback monitor when Xinerama is inactive or has no usable screens.
-- Keeps the existing nine workspaces global (the selected model): every
-  managed window has a monitor assignment, and each monitor arranges its
-  portion of the active workspace independently.
-- =Mod4+,/.= focus the previous/next monitor; =Mod4+Shift+,/.= send the
-  focused window. Floating drag/resize transfers a window when released over
-  another monitor.
-- Root ConfigureNotify refreshes monitor geometry and safely migrates windows
-  assigned to a removed monitor to the last surviving monitor.
-
-Built with the Xinerama dependency and smoke-tested under isolated Xvfb:
-two managed windows, workspace switch away/back, floating toggle, and EWMH
-client/active-window properties all remained correct. Multi-head geometry needs
-a physical/Xephyr multi-output run for visual confirmation when available.
+Xinerama enumeration with mirror dedup, per-monitor arrangement of the
+active workspace, Mod4+,/. focus/move-window-between-monitors, geometry
+refresh on root ConfigureNotify.
 
 * DONE Phase 3: System tray (XEMBED)
 CLOSED: [2026-08-06]
 
-Reference: Systray struct (mwm.cpp:828), selection-ownership handoff +
-MANAGER broadcast (updatebars, ~16839), dock request handling in
-clientmessage() (13904), XEMBED_EMBEDDED_NOTIFY, updatesystrayicongeom
-(17046), updatesystrayiconstate (17068, reads _XEMBED_INFO mapped flag),
-updatesystray layout (17096).
-
-Implemented XEMBED tray support in =src/x11_backend.cpp=:
-
-- Claims =_NET_SYSTEM_TRAY_S0=, sets horizontal orientation, and broadcasts
-  the standard =MANAGER= client message once it owns the selection.
-- Handles =_NET_SYSTEM_TRAY_OPCODE= dock requests, reparents the icon into a
-  dedicated tray window, sends =XEMBED_EMBEDDED_NOTIFY=, and honors the
-  mapped flag in =_XEMBED_INFO=.
-- Scales and lays out icons at the right edge of the bar; icon property,
-  configure, map/unmap, and destroy events update the tray without treating
-  its clients as managed windows.
-- =mepwmzz= now follows =mwmzz='s EWMH-ready wait before launching
-  =nm-applet=.
-
-Verified under isolated Xvfb with a small XEMBED client: it observed mepwm as
-the selection owner and, after its dock request, confirmed that its parent was
-the tray window. The manager remained alive through the test.
+_NET_SYSTEM_TRAY_S0 ownership + MANAGER broadcast, dock request handling,
+XEMBED_EMBEDDED_NOTIFY, _XEMBED_INFO-aware icon state, right-edge bar layout.
 
 * DONE Phase 4: Bar upgrade (Xft fonts, styled tags, task list)
 CLOSED: [2026-08-06]
 
-Reference: font stack (drw_fontset_create 416, drw_text 491 -- Xft +
-Fontconfig fallback-by-codepoint, no HarfBuzz/Pango), drawbar (14192),
-drawtasklist (14308), double-buffering via one off-screen Pixmap
-(drw_create/drw_resize 328-353, drw_map 641).
+Xft/Fontconfig text with per-codepoint fallback-font selection, off-screen
+Pixmap double-buffering, tag state coloring, clickable task list.
 
-Implemented in =src/x11_backend.cpp=:
+* DONE Phase 5: Lua config + IPC socket
+CLOSED: [2026-08-06]
 
-- Uses Xft/Fontconfig instead of core-font =XDrawString=. Missing Unicode
-  codepoints select and cache a Fontconfig fallback font, so title glyphs do
-  not degrade to core-font tofu.
-- Renders through one off-screen Pixmap before copying to the bar window.
-- Fixed workspace tags distinguish selected, empty, and occupied workspaces;
-  occupied tags have a filled indicator.
-- Shows a bounded list of current-workspace window titles, highlights the
-  focused entry, and focuses an entry when it is clicked.
-- The layout label cycles on left click and switches directly to monocle on
-  right click.
+Lua embedded via liblua, ~/.config/mep-wm/config.lua loaded on startup and
+on reload (Mod4+r), errors logged-and-continued rather than crashing the WM.
+Unix-socket IPC server at $XDG_RUNTIME_DIR/mep-wm-$DISPLAY.sock (mep-wm-cli
+client), blocking one-client-at-a-time inside the main loop -- same
+tradeoff mwm makes, not yet made non-blocking/multiplexed.
 
-Verified with an isolated Xvfb run using two task entries, bar click handling,
-and a Unicode title (=日本語 ☃=) through the fallback rendering path.
+mwm.* Lua API surface implemented in src/x11_backend.cpp's initialize_lua():
+set_terminal, set_mfact, set_nmaster, set_snap, set_gaps, set_border_width,
+rule, keybind (spec, fn, [description]), mousebind, widget, exec,
+zoom, toggle_floating, kill_client, scratchpad_set, scratchpad_toggle,
+toggle_bar, set_layout(name), cycle_layout([direction]), list_projects,
+current_project, switch_project(path), agent_command(cmd), theme(table).
+Plus mep-wm-only additions with no mwm equivalent: todo/todo_toggle/
+todo_remove/todo_clear_completed, notify.
 
-* TODO Phase 5: Lua config + IPC socket
+Config reload (Mod4+r) drops and re-registers all Lua-side rules/keybinds/
+mousebinds/widgets/themes, restores compiled defaults, unconditionally
+ungrabs *and* re-grabs both keys and mouse buttons (root/bar/every managed
+window) before re-running config.lua, so a reload that removes a binding
+doesn't leave a stale X-server grab behind. Live window/workspace state is
+untouched by a reload.
 
-This is the single biggest remaining phase. Reference: Lua embedding setup
-(load_config_from_lua 13591, lua_register_mwm_api 13522-13589), IPC socket
-server (wm_command_server_init 13712, wm_command_handle_client 13677,
-wm_eval_lua_buffer 13634), config.lua.example for the target API surface,
-mwm-cli.c for the exact wire protocol.
+** Deliberately adapted rather than ported 1:1
+- *Layout naming*: mwm's tile/floating/monocle map to mep-wm's own
+  MasterStack/Manual/Monocle model (Manual is mep-wm's BSP/tab-tree layout,
+  which mwm doesn't have at all). mwm.set_layout("tile"|"manual"|"monocle")
+  and mwm.cycle_layout() use mep-wm's own 3 modes; there is still no
+  mwm.layout({arrange=fn}) custom-tiling-algorithm hook (real gap, see
+  below) -- would need a Lua-callable arrange(clients, area) dispatch
+  analogous to mwm.cpp:6897-6940, not yet ported.
+- *mwm.theme()*: mwm's table shape is {topbar={normal=,selected=},
+  topbar_light={...}} (separate dark/light tables with fg/bg/border each).
+  mep-wm's bar only ever had one fg/bg/selected triple, cycled through a
+  fixed palette list (click/scroll the theme widget, or now Mod4+Shift+t).
+  mwm.theme({name=, fg=, bg=, selected=}) adds/replaces one cyclable entry
+  in that same list rather than introducing a separate light/dark axis.
+  There is still no xdg-desktop-portal dark/light auto-detection (mwm's
+  system_prefers_dark, mwm.cpp:5545) -- real gap if that matters later.
+- *mwm.agent_command()*: launches the configured agent (default "claude")
+  in its own terminal via Ctrl+Enter in the project picker, rather than
+  trying to splice it into mep-wm's arbitrary user-configured
+  config_.terminal launch expression.
 
-- Embed Lua (nixpkgs `lua`), load ~/.config/mep-wm/config.lua if present,
-  silently skip if absent, log-and-continue on syntax/runtime error (matches
-  mwm's forgiving behavior -- don't crash the WM over a bad config file).
-- Priority subset of the mwm.* API (see config.lua.example for exact
-  semantics of each):
-  - mwm.keybind(spec, fn, [desc]) / mwm.mousebind(context, spec, fn) --
-    stack additively with compiled-in bindings, don't replace them.
-  - mwm.rule({class=, instance=, title=, workspace=, floating=}) (ties into
-    Phase 6).
-  - mwm.set_terminal / set_mfact / set_nmaster / set_snap /
-    set_border_width / set_gaps -- straightforward, mep-wm already has all
-    these as Config fields from Phase 1, just need Lua setters that mutate
-    them live and re-arrange/re-grab as needed.
-  - mwm.layout({name=, symbol=, arrange=fn}) custom tiling algorithms --
-    contract: arrange(clients, area) where area={x,y,w,h,nmaster,mfact},
-    return one {x,y,w,h} per client in input order, in outer/border-
-    inclusive coords. NOTE: mwm's own current code has a bug here --
-    lua_mwm_layout (mwm.cpp:6927) looks up the Lua field via the literal
-    string "wm->arrange" instead of "arrange" (an over-eager find/replace
-    artifact), so config.lua.example's custom layouts currently don't
-    actually register in mwm as shipped. Use the *documented* contract
-    (field name "arrange") when porting -- don't copy the bug.
-  - mwm.widget({name=, update=fn, click=fn, highlight=}) -- lower priority,
-    ties into Phase 7's bar.
-- Unix-socket control protocol + `mep-wm-cli` binary equivalent to
-  mwm-cli.c: connect to $XDG_RUNTIME_DIR/mep-wm-$DISPLAY.sock (or /tmp
-  fallback), write a raw Lua chunk, shutdown(SHUT_WR), read until EOF.
-  Server: accept, read to EOF, luaL_loadbuffer + lua_pcall, "ERR " prefix +
-  message on error, else stringify+print every returned value. print()
-  itself should redirect to the requesting connection (or nowhere, if this
-  is an internal call) rather than mepwm's own stdout/stderr.
-  IMPORTANT lesson from the mwm audit: mwm's socket handler does a *blocking*
-  read-to-EOF for one client at a time directly inside the main select()
-  loop, so a slow/misbehaving client stalls the whole WM. Either accept that
-  same tradeoff (simplest, matches mwm) or budget time to make it properly
-  non-blocking/multiplexed -- don't silently inherit the footgun without
-  deciding on purpose.
-- Config reload (Mod4+r): drop all Lua-registered keybinds/mousebinds/
-  rules/layouts/widgets, restore compiled defaults, re-run config.lua from
-  scratch, re-grab keys unconditionally (important specifically when a
-  reload registers *fewer* bindings than before -- stale X grabs need an
-  unconditional re-grab to actually go away). Live window/workspace state
-  must NOT be touched by a reload.
+* DONE Phase 6: Window rules, scratchpad, workspace-per-project
+CLOSED: [2026-08-06]
 
-* TODO Phase 6: Window rules, scratchpad, workspace-per-project
+Window rules (class/instance/title substring match -> floating and/or
+workspace, applied at manage() time, Lua-driven via mwm.rule()). Scratchpad
+(Mod4+minus toggle, Mod4+Shift+minus designate; survives between toggles by
+re-tagging rather than unmapping). Workspace-per-project: each project gets
+its own 9 numbered workspaces (src/x11_backend.cpp's Project struct),
+created/switched via the project picker (Mod4+i recent, Mod4+o active-only)
+or mwm.switch_project(path) from Lua/mwm-cli.
 
-Reference: applyrules (mwm.cpp:5061), Rule struct (877) + rules[] (2156),
-scratchpad_set/_hide/_show/_toggle (16074/16038/16053/16096),
-project_workspace_name (9428), project_launch (9787).
+** Known gap: named workspaces
+mwm workspaces carry a name (mwm.workspaces({...}), mwm.focus_workspace
+(name), mwm.list_workspaces()); mep-wm's are still plain numeric indices
+(kWorkspaceCount = 9, switched via Mod4+1..9). Not ported -- would need a
+real design decision (a name field on Workspace, IPC/Lua surface for it,
+and reconciling with the per-project workspace model) rather than a
+mechanical port, and nothing currently using mep-wm depends on named
+workspaces the way mwm's own config/scripts do.
 
-- Window rules (class/instance/title substring match -> floating and/or
-  workspace assignment), applied once at manage() time. Depends on Phase 5
-  for the Lua-facing mwm.rule() surface, but a small compiled-in rules[]
-  table (like mwm's Gimp/Firefox examples) could land standalone first.
-- Scratchpad: designate focused window (Mod4+Shift+minus), toggle
-  show/hide (Mod4+minus) by re-tagging onto a hidden workspace rather than
-  unmapping/destroying -- window survives between toggles.
-- Workspace-per-project (bigger, optional): mwm gives each project its own
-  9 numbered workspaces, created lazily, named "<project-basename>/1".."9".
-  This is a real design fork from mep-wm's current fixed global 9
-  workspaces -- decide whether it's worth adopting before starting, since
-  it changes the Phase 2 multi-monitor tagset design too (see note there).
+* DONE Phase 7: Desktop-shell layer (substantially complete)
+CLOSED: [2026-08-06]
 
-* TODO Phase 7: Desktop-shell layer
+This turned out far more complete than earlier phases assumed -- most of it
+had already landed by the time of this rewrite:
 
-By far the largest remaining scope -- effectively "mwm is also its own
-notification daemon, app launcher, and Wi-Fi/Bluetooth manager." Consider
-sub-splitting this further (e.g. one pass for the widget bar, a separate
-pass for pickers, a separate pass for the notification daemon) rather than
-tackling it as one block.
+- *Widget bar*: clock, cpu/mem/disk/load (/proc), battery/backlight
+  (sysfs), volume/mic (amixer subprocess), wifi/bluetooth (nmcli/
+  bluetoothctl/rfkill), git (reads .git/HEAD directly, no subprocess),
+  media (playerctl), keyboard layout, theme -- all implemented, all with
+  click/scroll actions where it makes sense. Custom Lua widgets via
+  mwm.widget({name=, update=, click=, highlight=}).
+- *D-Bus notification daemon*: implements org.freedesktop.Notifications
+  (Notify/CloseNotification/GetCapabilities/GetServerInformation +
+  NotificationClosed signal), self-contained in src/x11_backend.cpp.
+- *Side panels*: notifications, todos (mwm.todo() API), agent status
+  (reads $XDG_RUNTIME_DIR/mwm-agents/*.json, matching mwm's coding-agent
+  status-file convention), keybinding help (now dynamically generated from
+  a hand-maintained compiled-binding list plus live Lua keybind
+  descriptions -- Mod4+Shift+slash, previously a static stale 8-line list
+  with no keybind), and a generic info panel (wifi/bluetooth/media/
+  keyboard/theme sub-panels, each with click actions).
+- *Pickers* (all built on shared fuzzy_score/launcher overlay infra):
+  application launcher (Mod4+p), project/active-project pickers (Mod4+i/o,
+  Ctrl+Enter also launches the configured coding agent), window switcher
+  (Mod4+w, fuzzy-jumps to any window across the current project's
+  workspaces), theme picker (Mod4+Shift+t, lists every cyclable theme
+  including Lua-registered ones).
 
-Reference: widget bar + WidgetId enum (897) and draw order (2047),
-brightness via direct sysfs read/write (no `light` CLI -- widget_init_paths
-3015, widget_set_backlight_percent_absolute 4060), slider popup shared by
-backlight/volume/mic (draw_slider_popup 4320), left/right dock bars
-(drawleftbar 14462, drawrightbar 14509), notif/todo/agent sidebars,
-project/app/theme/window/wallpaper/ssh/workspace picker overlay
-(PickerMode enum 1090, project_fuzzy_score 9895), D-Bus notification daemon
-implementing org.freedesktop.Notifications (notif_dbus_* 7181-7455 --
-mwm's own dbus-1 dependency is for *being* a notification daemon like dunst/
-mako, not for anything else), dark/light auto theme via xdg-desktop-portal
-busctl call (system_prefers_dark 5545).
+** Known gaps (not ported -- scoped out, not forgotten)
+- *Wallpaper picker* (mwm's Mod4+Shift+w, PickerModeWallpaper,
+  mwm.cpp:1096/2247): mep-wm has no wallpaper-setting feature at all
+  (no feh/hsetroot integration). Would be new functionality, not just a
+  picker UI, so scoped out of this parity pass.
+- *SSH host picker* (mwm's Mod4+e, PickerModeSSH, mwm.cpp:1097/2249):
+  fuzzy-jump into a Host from ~/.ssh/config. Same shared launcher infra as
+  the window switcher would make this cheap to add later; just not done
+  yet.
+- *Combined picker* (mwm's PickerModeCombined, projects+apps fuzzy-matched
+  in one list): mep-wm keeps these as separate modes (Mod4+p vs Mod4+i/o).
+- *mwm.layout({arrange=fn})* custom tiling algorithms from Lua: not ported
+  (see Phase 5 adaptation note above).
+- *cfact* (per-client weight within a master-stack column) and
+  *resizebydir* (Mod4+Shift+hjkl resize-by-direction, which depends on
+  cfact): not ported. mep-wm's master-stack columns are still evenly
+  split; Mod4+Shift+hjkl instead resizes manual-mode panes, which doesn't
+  need cfact.
+- *Mod4+0 / Mod4+Shift+0* (view-all-workspaces / tag-on-all-workspaces):
+  structurally tied to mwm's dwm bitmask-tag model; has no equivalent in
+  mep-wm's one-workspace-per-window model.
+- *Mod4+Shift+colon* interactive Lua command prompt: mep-wm has the IPC
+  socket for scripted eval (mep-wm-cli) but no on-screen interactive REPL
+  bound to a key.
+- xdg-desktop-portal dark/light auto theme detection (see Phase 5 note).
 
-- Built-in widgets to prioritize if picked up piecemeal: clock (trivial),
-  cpu/mem/disk/load (all /proc reads, no subprocess), battery/backlight
-  (sysfs), then volume/mic (amixer subprocess), then git/media/wifi/
-  bluetooth/theme (each its own subprocess integration + popup UI).
-- The D-Bus notification daemon is the most self-contained big chunk --
-  could be built and tested independently of the rest of the bar.
+None of the above are silently missing -- each was checked against
+mwm.cpp and is listed here so the next pass doesn't have to re-derive it
+from scratch.

@@ -16,6 +16,7 @@ struct Config {
   unsigned int snap = 32;
   float mfact = 0.55f;
   unsigned int nmaster = 1;
+  std::string agent_command = "claude";
 };
 
 class WindowManager {
