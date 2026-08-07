@@ -77,7 +77,6 @@ constexpr const char kIconWifi[] = "\uf1eb";
 constexpr const char kIconBluetooth[] = "\uf293";
 constexpr const char kIconMicrophone[] = "\uf130";
 constexpr const char kIconMicrophoneMuted[] = "\uf131";
-constexpr const char kIconLoad[] = "\uf0e4";
 constexpr const char kIconGit[] = "\uf126";
 constexpr const char kIconMedia[] = "\uf001";
 constexpr const char kIconKeyboard[] = "\uf11c";
@@ -1669,9 +1668,6 @@ class X11Backend final : public Backend {
                         ? static_cast<int>(100 * (filesystem.f_blocks - filesystem.f_bfree) /
                                            std::max<fsblkcnt_t>(1, filesystem.f_blocks - filesystem.f_bfree + filesystem.f_bavail))
                         : -1;
-    std::ifstream load("/proc/loadavg");
-    load >> load_average_;
-
     std::ifstream routes("/proc/net/route");
     std::string line;
     std::getline(routes, line);
@@ -1756,25 +1752,33 @@ class X11Backend final : public Backend {
   void draw_bottom_widgets(std::size_t monitor_index) {
     refresh_widgets();
     const DockWindows& dock = docks_[monitor_index];
-    const char* battery_icon = battery_charging_ ? kIconBatteryCharging
-                               : battery_percent_ >= 90 ? kIconBatteryFull
-                               : battery_percent_ >= 65 ? kIconBattery75
-                               : battery_percent_ >= 40 ? kIconBattery50
-                               : battery_percent_ >= 15 ? kIconBattery25
-                                                        : kIconBatteryEmpty;
+    const char* battery_level_icon = battery_percent_ >= 90 ? kIconBatteryFull
+                                     : battery_percent_ >= 65 ? kIconBattery75
+                                     : battery_percent_ >= 40 ? kIconBattery50
+                                     : battery_percent_ >= 15 ? kIconBattery25
+                                                              : kIconBatteryEmpty;
+    std::string battery_text;
+    if (battery_percent_ < 0) {
+      battery_text = std::string(kIconBatteryFull) + " n/a";
+    } else {
+      battery_text = battery_level_icon;
+      if (battery_charging_) battery_text += kIconBatteryCharging;
+      // Below 20% the icon alone is too coarse to judge urgency, so fall
+      // back to the exact number; otherwise the icon carries enough detail.
+      if (battery_percent_ < 20) battery_text += " " + std::to_string(battery_percent_) + "%";
+    }
     const char* volume_icon = volume_percent_ < 0 ? kIconVolumeHigh
                               : volume_muted_ || volume_percent_ == 0 ? kIconVolumeMuted
                               : volume_percent_ < 50 ? kIconVolumeLow
                                                      : kIconVolumeHigh;
-    const std::array<std::pair<const char*, std::string>, 14> widgets = {{
-        {"battery", battery_percent_ < 0 ? std::string(kIconBatteryFull) + " n/a" : std::string(battery_icon) + " " + std::to_string(battery_percent_) + "%"},
+    const std::array<std::pair<const char*, std::string>, 13> widgets = {{
+        {"battery", battery_text},
         {"backlight", kIconBacklight},
         {"volume", volume_icon},
         {"mic", mic_percent_ < 0 ? "" : (mic_muted_ ? kIconMicrophoneMuted : kIconMicrophone)},
         {"media", media_title_.empty() ? "" : std::string(kIconMedia) + " " + media_title_},
         {"theme", theme_index_ == 1 ? kIconThemeLight : kIconThemeDark},
         {"git", git_status_.empty() ? "" : std::string(kIconGit) + " " + git_status_},
-        {"load", load_average_ < 0 ? std::string(kIconLoad) + " n/a" : std::string(kIconLoad) + " " + std::to_string(load_average_).substr(0, 4)},
         {"cpu", cpu_percent_ < 0 ? std::string(kIconCpu) + " ..." : std::string(kIconCpu) + " " + std::to_string(cpu_percent_) + "%"},
         {"memory", mem_percent_ < 0 ? std::string(kIconMemory) + " n/a" : std::string(kIconMemory) + " " + std::to_string(mem_percent_) + "%"},
         {"disk", disk_percent_ < 0 ? std::string(kIconDisk) + " n/a" : std::string(kIconDisk) + " " + std::to_string(disk_percent_) + "%"},
@@ -2414,7 +2418,6 @@ class X11Backend final : public Backend {
       if (hit->id == "cpu") open_info_panel("CPU", cpu_percent_ < 0 ? "Collecting samples" : std::to_string(cpu_percent_) + "% in use");
       if (hit->id == "memory") open_info_panel("Memory", std::to_string(mem_percent_) + "% in use");
       if (hit->id == "disk") open_info_panel("Disk", std::to_string(disk_percent_) + "% in use");
-      if (hit->id == "load") open_info_panel("Load", std::to_string(load_average_));
     }
   }
 
@@ -4533,7 +4536,6 @@ class X11Backend final : public Backend {
   int backlight_percent_ = -1;
   long cpu_previous_total_ = -1, cpu_previous_idle_ = -1;
   int cpu_percent_ = -1, mem_percent_ = -1, disk_percent_ = -1;
-  double load_average_ = -1;
   std::string network_interface_, wifi_interface_, media_title_, clock_text_;
   std::string git_status_;
   bool network_up_ = false;

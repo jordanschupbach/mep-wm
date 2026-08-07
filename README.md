@@ -85,7 +85,7 @@ home directory is available as the default project.
 MEPWM provides a left application dock, a bottom system-widget dock, and a
 right dock for notifications, todos, agents, layouts, and keybinding help.
 The bottom dock reports battery, brightness, volume, microphone, media, theme,
-Git branch, load, CPU, memory, disk, Wi-Fi, Bluetooth, keyboard layout, and clock state. Set
+Git branch, CPU, memory, disk, Wi-Fi, Bluetooth, keyboard layout, and clock state. Set
 `MEPWM_PROJECT_DIR` to a repository path to enable the Git branch indicator. Scroll
 brightness, volume, or microphone to adjust it; left-click opens its slider.
 Middle-click volume/microphone toggles mute, and media controls use middle
