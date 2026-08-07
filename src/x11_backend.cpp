@@ -246,9 +246,12 @@ struct Notification {
 
 // `line` is the 0-based line number the item was parsed from in TODO.org, so
 // it can be located again to flip TODO -> DONE without re-scanning the file.
+// `active` mirrors org-mode clocking: true when an open (unterminated) CLOCK
+// line sits in this headline's :LOGBOOK: drawer.
 struct TodoItem {
   std::string text;
   std::size_t line = 0;
+  bool active = false;
 };
 
 struct AgentStatus {
@@ -362,6 +365,8 @@ class X11Backend final : public Backend {
 
     border_normal_pixel_ = alloc_color(config_.border_color_normal);
     border_focused_pixel_ = alloc_color(config_.border_color_focused);
+    todo_active_pixel_ = alloc_color("#2ecc71");
+    todo_inactive_pixel_ = alloc_color("#e74c3c");
     update_monitors();
     startup.checkpoint("configure display and monitors");
 
@@ -1788,6 +1793,23 @@ class X11Backend final : public Backend {
     // same span it always had, just offset past the left (os) corner.
     const int content_x = kDockWidth;
     const int width = std::max(1, monitors_[monitor_index].width - 2 * kDockWidth);
+
+    // Active-TODO pill: always visible at the left of the content area, red
+    // when nothing is clocked in and green while a todo is active, so the
+    // running state stays visible without opening the sidebar.
+    load_todos();
+    const auto active_todo = std::find_if(todos_.begin(), todos_.end(), [](const TodoItem& item) { return item.active; });
+    const bool has_active_todo = active_todo != todos_.end();
+    std::string todo_pill_text = std::string(kIconTodo) + " ";
+    if (has_active_todo) todo_pill_text += active_todo->text.size() > 36 ? active_todo->text.substr(0, 35) + "…" : active_todo->text;
+    else todo_pill_text += "No active TODO";
+    const int todo_pill_width = text_width(todo_pill_text) + 14;
+    XSetForeground(display_, bar_gc_, has_active_todo ? todo_active_pixel_ : todo_inactive_pixel_);
+    XFillRectangle(display_, dock.bottom_buffer, bar_gc_, content_x, 0, todo_pill_width, kBarHeight);
+    draw_dock_text(dock.bottom_buffer, content_x + 7, (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2,
+                   todo_pill_text, bar_background_);
+    bottom_widget_hits_.push_back({content_x, content_x + todo_pill_width, "todo-active"});
+
     int total_width = 0;
     for (const auto& widget : widgets)
       if (!widget.second.empty()) total_width += text_width(widget.second) + 14;
@@ -1930,16 +1952,62 @@ class X11Backend final : public Backend {
     return *text_start != std::string::npos;
   }
 
+  // True if `line` is any org headline, regardless of keyword -- used to
+  // find the end of a headline's body (its :LOGBOOK: drawer, clock lines,
+  // etc.) when scanning for the next headline.
+  static bool is_org_headline(const std::string& line) {
+    const std::size_t stars = line.find_first_not_of('*');
+    return stars != 0 && stars != std::string::npos && line[stars] == ' ';
+  }
+
+  // Formats a time as an org-mode clock timestamp: "[2026-08-07 Fri 10:23]".
+  static std::string org_timestamp(std::time_t time) {
+    char buffer[32];
+    std::strftime(buffer, sizeof(buffer), "[%Y-%m-%d %a %H:%M]", std::localtime(&time));
+    return buffer;
+  }
+
+  // Inverse of org_timestamp, given the text between the brackets
+  // ("2026-08-07 Fri 10:23").
+  static std::time_t parse_org_timestamp(const std::string& text) {
+    std::tm tm{};
+    std::istringstream stream(text);
+    std::string date, day, time;
+    stream >> date >> day >> time;
+    char dash = 0, colon = 0;
+    std::istringstream(date) >> tm.tm_year >> dash >> tm.tm_mon >> dash >> tm.tm_mday;
+    std::istringstream(time) >> tm.tm_hour >> colon >> tm.tm_min;
+    tm.tm_year -= 1900;
+    tm.tm_mon -= 1;
+    tm.tm_isdst = -1;
+    return std::mktime(&tm);
+  }
+
+  // Finds an open (unterminated, i.e. no "--" end range) CLOCK line inside
+  // `headline`'s body, stopping at the next headline or EOF.
+  static std::optional<std::size_t> find_open_clock_line(const std::vector<std::string>& lines, std::size_t headline) {
+    for (std::size_t scan = headline + 1; scan < lines.size() && !is_org_headline(lines[scan]); ++scan) {
+      const std::size_t clock_at = lines[scan].find("CLOCK:");
+      if (clock_at != std::string::npos && lines[scan].find("--", clock_at) == std::string::npos) return scan;
+    }
+    return std::nullopt;
+  }
+
   // Parses org-mode headlines ("* TODO Buy milk"); only the plain TODO
   // keyword is treated as a pending item, DONE (and everything else) is
-  // skipped so completed items never show up.
+  // skipped so completed items never show up. A headline is "active" when
+  // its body has an open CLOCK line, mirroring org-clock-in/out.
   void load_todos() {
     todos_.clear();
-    std::ifstream file(todo_org_path());
-    std::size_t line_number = 0;
-    for (std::string line; std::getline(file, line); ++line_number) {
+    std::vector<std::string> lines;
+    {
+      std::ifstream file(todo_org_path());
+      for (std::string line; std::getline(file, line);) lines.push_back(std::move(line));
+    }
+    for (std::size_t line_number = 0; line_number < lines.size(); ++line_number) {
       std::size_t keyword_start = 0, text_start = 0;
-      if (parse_org_headline(line, "TODO", &keyword_start, &text_start)) todos_.push_back({line.substr(text_start), line_number});
+      if (!parse_org_headline(lines[line_number], "TODO", &keyword_start, &text_start)) continue;
+      todos_.push_back({lines[line_number].substr(text_start), line_number, find_open_clock_line(lines, line_number).has_value()});
     }
     if (todo_selected_ >= static_cast<int>(todos_.size())) todo_selected_ = todos_.empty() ? -1 : static_cast<int>(todos_.size()) - 1;
   }
@@ -1971,6 +2039,80 @@ class X11Backend final : public Backend {
     if (path.empty() || text.empty()) return;
     std::ofstream file(path, std::ios::app);
     if (file) file << "* TODO " << text << '\n';
+  }
+
+  // Opens a fresh clock for `item`, reusing an existing :LOGBOOK: drawer
+  // right under the headline if there is one, otherwise creating it --
+  // matching org-clock-in's on-disk format so the file stays readable in
+  // Emacs.
+  void start_todo_clock(const TodoItem& item) {
+    const std::string path = todo_org_path();
+    if (path.empty()) return;
+    std::vector<std::string> lines;
+    {
+      std::ifstream file(path);
+      if (!file) return;
+      for (std::string line; std::getline(file, line);) lines.push_back(std::move(line));
+    }
+    if (item.line >= lines.size()) return;
+    std::size_t keyword_start = 0, text_start = 0;
+    if (!parse_org_headline(lines[item.line], "TODO", &keyword_start, &text_start)) return;
+    const std::string clock_line = "CLOCK: " + org_timestamp(std::time(nullptr));
+    if (item.line + 1 < lines.size() && trim(lines[item.line + 1]) == ":LOGBOOK:")
+      lines.insert(lines.begin() + static_cast<long>(item.line) + 2, clock_line);
+    else
+      lines.insert(lines.begin() + static_cast<long>(item.line) + 1, {":LOGBOOK:", clock_line, ":END:"});
+    std::ofstream file(path);
+    for (const std::string& line : lines) file << line << '\n';
+  }
+
+  // Closes item's open CLOCK line with an end timestamp and duration,
+  // matching org-clock-out's on-disk format. No-op if the item has no open
+  // clock (e.g. the file changed underneath us).
+  void stop_todo_clock(const TodoItem& item) {
+    const std::string path = todo_org_path();
+    if (path.empty()) return;
+    std::vector<std::string> lines;
+    {
+      std::ifstream file(path);
+      if (!file) return;
+      for (std::string line; std::getline(file, line);) lines.push_back(std::move(line));
+    }
+    if (item.line >= lines.size()) return;
+    const auto clock_line = find_open_clock_line(lines, item.line);
+    if (!clock_line) return;
+    const std::size_t open_bracket = lines[*clock_line].find('[');
+    const std::size_t close_bracket = open_bracket == std::string::npos ? std::string::npos : lines[*clock_line].find(']', open_bracket);
+    if (open_bracket == std::string::npos || close_bracket == std::string::npos) return;
+    const std::string start_text = lines[*clock_line].substr(open_bracket + 1, close_bracket - open_bracket - 1);
+    const std::time_t start = parse_org_timestamp(start_text);
+    const std::time_t end = std::time(nullptr);
+    const long minutes = std::max<long>(0, (end - start) / 60);
+    char duration[32];
+    std::snprintf(duration, sizeof(duration), "%ld:%02ld", minutes / 60, minutes % 60);
+    lines[*clock_line] = "CLOCK: [" + start_text + "]--" + org_timestamp(end) + " =>  " + duration;
+    std::ofstream file(path);
+    for (const std::string& line : lines) file << line << '\n';
+  }
+
+  // Toggles the active/inactive clock on the selected todo. Only one todo
+  // can be active at a time (it drives the bottom-bar pill), so starting a
+  // new one first stops whichever was previously running -- mirroring how
+  // org-clock-in auto-clocks-out any other running clock.
+  void toggle_todo_active() {
+    if (todo_selected_ < 0 || static_cast<std::size_t>(todo_selected_) >= todos_.size()) return;
+    const TodoItem selected = todos_[static_cast<std::size_t>(todo_selected_)];
+    if (selected.active) {
+      stop_todo_clock(selected);
+    } else {
+      const auto currently_active = std::find_if(todos_.begin(), todos_.end(), [](const TodoItem& todo) { return todo.active; });
+      if (currently_active != todos_.end()) stop_todo_clock(*currently_active);
+      start_todo_clock(selected);
+    }
+    load_todos();
+    ensure_todo_selection_visible();
+    draw_side_panel();
+    draw_docks();
   }
 
   // Kept in sync by hand with handle_key/handle_button/grab_keys -- there's
@@ -2063,14 +2205,14 @@ class X11Backend final : public Backend {
         row(notification.body.empty() ? "" : "  " + notification.body, notification.unread);
       }
     } else if (side_panel_ == SidePanel::Todos) {
-      row("a add   d done   ^n/^p move");
+      row("a add   d done   s start/stop   ^n/^p move");
       if (todo_input_active_) row("+ " + todo_input_text_ + "_", true);
       if (todos_.empty() && !todo_input_active_) {
         const std::string path = todo_org_path();
         row(path.empty() || !std::filesystem::exists(path) ? "No TODO.org in this project" : "No pending TODO items");
       }
       for (std::size_t index = 0; index < todos_.size(); ++index)
-        row("[ ] " + todos_[index].text, !todo_input_active_ && static_cast<int>(index) == todo_selected_);
+        row((todos_[index].active ? "[*] " : "[ ] ") + todos_[index].text, !todo_input_active_ && static_cast<int>(index) == todo_selected_);
     } else if (side_panel_ == SidePanel::Agents) {
       if (agents_.empty()) row("No coding agents are running");
       for (const AgentStatus& agent : agents_)
@@ -2196,6 +2338,10 @@ class X11Backend final : public Backend {
       ensure_todo_selection_visible();
       draw_side_panel();
       draw_docks();
+      return;
+    }
+    if (state == 0 && key == XK_s && todo_selected_ >= 0 && static_cast<std::size_t>(todo_selected_) < todos_.size()) {
+      toggle_todo_active();
       return;
     }
     if (key == XK_Up || (state == ControlMask && key == XK_p)) {
@@ -2582,7 +2728,9 @@ class X11Backend final : public Backend {
       return event.x >= item.left && event.x < item.right;
     });
     if (hit == bottom_widget_hits_.end()) return;
-    if (hit->id == "backlight") {
+    if (hit->id == "todo-active" && event.button == Button1) {
+      toggle_side_panel(SidePanel::Todos);
+    } else if (hit->id == "backlight") {
       if (event.button == Button1) slider_visible_ && slider_kind_ == SliderKind::Backlight ? close_slider_popup() : open_slider_popup(SliderKind::Backlight);
       if (event.button == Button4) adjust_backlight(5);
       if (event.button == Button3 || event.button == Button5) adjust_backlight(-5);
@@ -5209,6 +5357,8 @@ class X11Backend final : public Backend {
   bool bar_visible_ = true;
   unsigned long border_normal_pixel_ = 0;
   unsigned long border_focused_pixel_ = 0;
+  unsigned long todo_active_pixel_ = 0;
+  unsigned long todo_inactive_pixel_ = 0;
   bool running_ = true;
   lua_State* lua_ = nullptr;
   int ipc_fd_ = -1;
