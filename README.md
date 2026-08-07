@@ -64,6 +64,13 @@ marks the current one, and displays its active project and layout.
 name; type to fuzzy-filter, use Up/Down (or Ctrl+p/Ctrl+n) to choose, Enter to
 launch, and Escape to dismiss.
 
+`Super+f` opens Vimium-style element hints: a small labeled chip appears over
+every clickable spot currently on screen — workspace numbers, the layout and
+task-bar entries, every dock icon and bottom-bar widget on every monitor, and
+every visible window — and typing a chip's label clicks that element exactly
+as a real click would. Backspace erases the last typed letter and Escape (or
+a real mouse click) cancels.
+
 ## Projects
 
 Each project owns an independent set of nine workspaces. `Super+i` opens the

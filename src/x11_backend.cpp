@@ -200,6 +200,19 @@ struct WidgetHit {
   std::string id;
 };
 
+// One hint chip in a Vimium-style "click anything" overlay: a root-window
+// position/size for its label chip, plus a synthetic click (window + local
+// coordinates) replayed through the normal click handlers on selection so
+// hint targets stay in lockstep with real click behavior.
+struct Hint {
+  std::string label;
+  int x = 0, y = 0;
+  int width = 0, height = 0;
+  Window target = None;
+  int click_x = 0, click_y = 0;
+  unsigned int button = Button1;
+};
+
 struct Notification {
   unsigned int id = 0;
   std::string app;
@@ -278,6 +291,9 @@ class X11Backend final : public Backend {
       XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &bar_foreground_);
       XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &bar_background_);
       XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &bar_selected_);
+      XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &hint_background_);
+      XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &hint_foreground_);
+      XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &hint_matched_);
     }
     for (auto& entry : fallback_fonts_)
       if (entry.second != bar_font_ && entry.second != icon_font_) XftFontClose(display_, entry.second);
@@ -285,6 +301,7 @@ class X11Backend final : public Backend {
     if (launcher_xft_draw_) XftDrawDestroy(launcher_xft_draw_);
     if (bar_font_) XftFontClose(display_, bar_font_);
     if (icon_font_) XftFontClose(display_, icon_font_);
+    if (hint_font_ && hint_font_ != bar_font_) XftFontClose(display_, hint_font_);
     if (bar_pixmap_) XFreePixmap(display_, bar_pixmap_);
     if (launcher_pixmap_) XFreePixmap(display_, launcher_pixmap_);
     if (bar_gc_) XFreeGC(display_, bar_gc_);
@@ -1896,6 +1913,7 @@ class X11Backend final : public Backend {
         {"Super+Return", "Open a terminal"},
         {"Super+p", "Application picker"},
         {"Super+w", "Window switcher"},
+        {"Super+f", "Element hints (click anything by typing its label)"},
         {"Super+i", "Recent projects picker"},
         {"Super+o", "Active projects picker"},
         {"Super+h/j/k/l", "Focus direction"},
@@ -2392,6 +2410,225 @@ class X11Backend final : public Backend {
     draw_docks();
   }
 
+  // Vimium-style "click anything" overlay bound to Super+f. Builds a hint for
+  // every bar/dock element and every currently visible window, then lets the
+  // user type a short label to trigger it. Selecting a hint replays a
+  // synthetic click through the same handlers a real click would use
+  // (handle_button/handle_dock_button), so hint targets can never drift out
+  // of sync with actual click behavior.
+  static std::string hint_label(std::size_t index, std::size_t total) {
+    static constexpr char kCharset[] = "asdfghjklqwertyuiopzxcvbnm";
+    constexpr std::size_t kBase = 26;
+    if (total <= kBase) return std::string(1, kCharset[index]);
+    const std::size_t first = std::min(index / kBase, kBase - 1);
+    return std::string(1, kCharset[first]) + kCharset[index % kBase];
+  }
+
+  int hint_text_width(const std::string& value) const {
+    XGlyphInfo extent{};
+    XftTextExtentsUtf8(display_, hint_font_, reinterpret_cast<const FcChar8*>(value.data()),
+                       static_cast<int>(value.size()), &extent);
+    return extent.xOff;
+  }
+
+  void build_hints() {
+    hints_.clear();
+    struct Candidate {
+      int x, y;
+      Window target;
+      int click_x, click_y;
+    };
+    std::vector<Candidate> candidates;
+
+    if (bar_visible_ && bar_ != None) {
+      for (int index = 0; index < kWorkspaceCount; ++index) {
+        candidates.push_back({kDockWidth + index * 84 + 4, 4, bar_, index * 84 + 10, kBarHeight / 2});
+      }
+      candidates.push_back({kDockWidth + 756 + 4, 4, bar_, 756 + 10, kBarHeight / 2});
+      for (const BarHit& hit : task_hits_) {
+        candidates.push_back({kDockWidth + hit.left + 4, 4, bar_, (hit.left + hit.right) / 2, kBarHeight / 2});
+      }
+    }
+
+    for (std::size_t index = 0; index < monitors_.size() && index < docks_.size(); ++index) {
+      const Monitor& target_monitor = monitors_[index];
+      const DockWindows& dock = docks_[index];
+      for (int row = 0; row < 9; ++row) {
+        candidates.push_back({target_monitor.x + 4, target_monitor.y + row * kDockWidth + 4, dock.left, kDockWidth / 2,
+                              row * kDockWidth + kDockWidth / 2});
+      }
+      const int dock_right_x = target_monitor.x + target_monitor.width - kDockWidth;
+      candidates.push_back({dock_right_x + 4, target_monitor.y + 4, dock.right, kDockWidth / 2, kBarHeight / 2});
+      for (int row = 0; row < 3; ++row) {
+        candidates.push_back({dock_right_x + 4, target_monitor.y + kBarHeight + row * kDockWidth + 4, dock.right,
+                              kDockWidth / 2, kBarHeight + row * kDockWidth + kDockWidth / 2});
+      }
+      candidates.push_back({dock_right_x + 4, target_monitor.y + target_monitor.height - kBarHeight + 4, dock.right,
+                            kDockWidth / 2, target_monitor.height - kBarHeight / 2});
+      draw_bottom_widgets(index);
+      for (const WidgetHit& hit : bottom_widget_hits_) {
+        candidates.push_back({target_monitor.x + kDockWidth + hit.left + 4,
+                              target_monitor.y + target_monitor.height - kBarHeight + 4, dock.bottom,
+                              (hit.left + hit.right) / 2, kBarHeight / 2});
+      }
+    }
+
+    std::vector<Window> windows;
+    collect_windows(workspace().root.get(), windows);
+    windows.insert(windows.end(), workspace().floating.begin(), workspace().floating.end());
+    for (Window window : windows) {
+      XWindowAttributes attributes;
+      if (!XGetWindowAttributes(display_, window, &attributes) || attributes.map_state != IsViewable) continue;
+      candidates.push_back({attributes.x + 4, attributes.y + 4, window, attributes.width / 2, attributes.height / 2});
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& left, const Candidate& right) {
+      return left.y != right.y ? left.y < right.y : left.x < right.x;
+    });
+
+    hints_.reserve(candidates.size());
+    for (std::size_t index = 0; index < candidates.size(); ++index) {
+      const Candidate& candidate = candidates[index];
+      Hint hint;
+      hint.label = hint_label(index, candidates.size());
+      hint.x = candidate.x;
+      hint.y = candidate.y;
+      hint.target = candidate.target;
+      hint.click_x = candidate.click_x;
+      hint.click_y = candidate.click_y;
+      hints_.push_back(std::move(hint));
+    }
+  }
+
+  void draw_hint_chip(std::size_t index) {
+    const Hint& hint = hints_[index];
+    const Window window = hint_windows_[index];
+    if (window == None) return;
+    XSetForeground(display_, bar_gc_, hint_background_.pixel);
+    XFillRectangle(display_, window, bar_gc_, 0, 0, hint.width, hint.height);
+    XftDraw* draw = XftDrawCreate(display_, window, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_));
+    if (!draw) return;
+    const int baseline = (hint.height + hint_font_->ascent - hint_font_->descent) / 2;
+    int cursor = 4;
+    for (std::size_t character = 0; character < hint.label.size(); ++character) {
+      const XftColor& color = character < hint_query_.size() ? hint_matched_ : hint_foreground_;
+      XftDrawStringUtf8(draw, &color, hint_font_, cursor, baseline,
+                        reinterpret_cast<const FcChar8*>(&hint.label[character]), 1);
+      XGlyphInfo extent{};
+      XftTextExtentsUtf8(display_, hint_font_, reinterpret_cast<const FcChar8*>(&hint.label[character]), 1, &extent);
+      cursor += extent.xOff;
+    }
+    XftDrawDestroy(draw);
+  }
+
+  void show_hint_windows() {
+    hint_windows_.assign(hints_.size(), None);
+    for (std::size_t index = 0; index < hints_.size(); ++index) {
+      Hint& hint = hints_[index];
+      hint.width = hint_text_width(hint.label) + 8;
+      hint.height = hint_font_->ascent + hint_font_->descent + 6;
+      XSetWindowAttributes attributes{};
+      attributes.override_redirect = True;
+      attributes.background_pixel = hint_background_.pixel;
+      attributes.border_pixel = bar_selected_.pixel;
+      Window window = XCreateWindow(display_, root_, hint.x, hint.y, hint.width, hint.height, 1,
+                                    DefaultDepth(display_, screen_), CopyFromParent, DefaultVisual(display_, screen_),
+                                    CWOverrideRedirect | CWBackPixel | CWBorderPixel, &attributes);
+      hint_windows_[index] = window;
+      XMapRaised(display_, window);
+      draw_hint_chip(index);
+    }
+    XFlush(display_);
+  }
+
+  void close_hints() {
+    if (hints_visible_) {
+      hints_visible_ = false;
+      XUngrabKeyboard(display_, CurrentTime);
+    }
+    for (Window window : hint_windows_)
+      if (window != None) XDestroyWindow(display_, window);
+    hint_windows_.clear();
+    hints_.clear();
+    hint_query_.clear();
+    XFlush(display_);
+  }
+
+  void toggle_hints() {
+    if (hints_visible_) { close_hints(); return; }
+    if (launcher_visible_ || slider_visible_ || bar_ == None) return;
+    draw_bar();
+    draw_docks();
+    build_hints();
+    if (hints_.empty()) return;
+    if (XGrabKeyboard(display_, root_, False, GrabModeAsync, GrabModeAsync, CurrentTime) != GrabSuccess) return;
+    hints_visible_ = true;
+    hint_query_.clear();
+    show_hint_windows();
+  }
+
+  // Dispatches a click at the hint's target exactly as handle_button/
+  // handle_dock_button would receive it from the X server, so the action
+  // taken always matches what a literal click at that spot would do.
+  void trigger_hint(const Hint& hint) {
+    const Window target = hint.target;
+    const int click_x = hint.click_x;
+    const int click_y = hint.click_y;
+    const unsigned int button = hint.button;
+    close_hints();
+    XButtonEvent synthetic{};
+    synthetic.type = ButtonPress;
+    synthetic.display = display_;
+    synthetic.window = target;
+    synthetic.root = root_;
+    synthetic.x = click_x;
+    synthetic.y = click_y;
+    synthetic.button = button;
+    synthetic.state = 0;
+    synthetic.time = CurrentTime;
+    synthetic.same_screen = True;
+    if (dock_monitor(target) >= 0) handle_dock_button(synthetic);
+    else handle_button(synthetic);
+  }
+
+  void refresh_hint_visibility() {
+    const Hint* exact = nullptr;
+    for (std::size_t index = 0; index < hints_.size(); ++index) {
+      const Hint& hint = hints_[index];
+      const bool visible = hint.label.compare(0, hint_query_.size(), hint_query_) == 0;
+      if (visible) {
+        draw_hint_chip(index);
+        XMapRaised(display_, hint_windows_[index]);
+        if (hint.label == hint_query_) exact = &hint;
+      } else {
+        XUnmapWindow(display_, hint_windows_[index]);
+      }
+    }
+    XFlush(display_);
+    if (exact) trigger_hint(*exact);
+  }
+
+  void handle_hint_key(const XKeyEvent& event) {
+    char text[8];
+    KeySym key = NoSymbol;
+    const int length = XLookupString(const_cast<XKeyEvent*>(&event), text, sizeof(text), &key, nullptr);
+    if (key == XK_Escape) { close_hints(); return; }
+    if (key == XK_BackSpace) {
+      if (!hint_query_.empty()) { hint_query_.pop_back(); refresh_hint_visibility(); }
+      return;
+    }
+    for (int index = 0; index < length; ++index) {
+      const char typed = static_cast<char>(std::tolower(static_cast<unsigned char>(text[index])));
+      if (typed < 'a' || typed > 'z') continue;
+      const std::string candidate = hint_query_ + typed;
+      const bool any_match = std::any_of(hints_.begin(), hints_.end(), [&](const Hint& hint) {
+        return hint.label.compare(0, candidate.size(), candidate) == 0;
+      });
+      if (any_match) hint_query_ = candidate;
+    }
+    refresh_hint_visibility();
+  }
+
   void create_bar() {
     const int width = std::max(1, DisplayWidth(display_, screen_) - 2 * kDockWidth);
     bar_ = XCreateSimpleWindow(display_, root_, kDockWidth, 0, width, kBarHeight,
@@ -2412,6 +2649,14 @@ class X11Backend final : public Backend {
                       "#202124", &bar_background_);
     XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_),
                       "#5294e2", &bar_selected_);
+    hint_font_ = XftFontOpenName(display_, screen_, "sans-11");
+    if (!hint_font_) hint_font_ = bar_font_;
+    XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_),
+                      "#ffd76e", &hint_background_);
+    XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_),
+                      "#202124", &hint_foreground_);
+    XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_),
+                      "#c23616", &hint_matched_);
     XMapRaised(display_, bar_);
     draw_bar();
   }
@@ -2981,7 +3226,7 @@ class X11Backend final : public Backend {
     const unsigned int ignored_modifiers[] = {0, LockMask, Mod2Mask, LockMask | Mod2Mask};
     const KeySym plain_keys[] = {XK_Return, XK_q, XK_h, XK_i, XK_j, XK_k, XK_l, XK_o, XK_p, XK_v, XK_s, XK_Tab, XK_space,
                                  XK_a, XK_z, XK_m, XK_r, XK_minus, XK_comma, XK_period, XK_1, XK_2, XK_3,
-                                 XK_4, XK_5, XK_6, XK_7, XK_8, XK_9, XK_w, XK_b, XK_d};
+                                 XK_4, XK_5, XK_6, XK_7, XK_8, XK_9, XK_w, XK_b, XK_d, XK_f};
     const KeySym shift_keys[] = {XK_q, XK_space, XK_c, XK_minus, XK_comma, XK_period, XK_h, XK_j, XK_k, XK_l,
                                  XK_r, XK_d, XK_t, XK_slash};
     const KeySym ctrl_keys[] = {XK_h, XK_j, XK_k, XK_l};
@@ -4037,6 +4282,7 @@ class X11Backend final : public Backend {
             dock_monitor(event.xcrossing.window) < 0) focus(event.xcrossing.window);
         break;
       case ButtonPress:
+        if (hints_visible_) close_hints();
         if (side_panel_ != SidePanel::Closed && event.xbutton.window == side_panel_window_) {
           handle_side_panel_button(event.xbutton);
         } else if (slider_visible_ && event.xbutton.window == slider_window_) {
@@ -4103,7 +4349,8 @@ class X11Backend final : public Backend {
         }
         break;
       case KeyPress:
-        if (launcher_visible_) handle_launcher_key(event.xkey);
+        if (hints_visible_) handle_hint_key(event.xkey);
+        else if (launcher_visible_) handle_launcher_key(event.xkey);
         else handle_key(event.xkey);
         break;
       case PropertyNotify:
@@ -4160,6 +4407,7 @@ class X11Backend final : public Backend {
     if (key == XK_o) toggle_project_picker(true);
     if (key == XK_p) toggle_launcher();
     if (key == XK_w) open_window_switcher();
+    if (key == XK_f) toggle_hints();
     if (key == XK_b) toggle_bar();
     if (key == XK_d) adjust_nmaster(-1);
     if (key == XK_h || key == XK_j || key == XK_k || key == XK_l) focus_direction(key);
@@ -4308,6 +4556,14 @@ class X11Backend final : public Backend {
   std::unordered_map<FcChar32, XftFont*> fallback_fonts_;
   std::vector<BarHit> task_hits_;
   int bar_task_list_x_ = 960;
+  bool hints_visible_ = false;
+  std::string hint_query_;
+  std::vector<Hint> hints_;
+  std::vector<Window> hint_windows_;
+  XftFont* hint_font_ = nullptr;
+  XftColor hint_background_{};
+  XftColor hint_foreground_{};
+  XftColor hint_matched_{};
   Cursor cursor_ = None;
   std::array<Workspace, kWorkspaceCount> workspaces_;
   std::vector<Project> projects_;
