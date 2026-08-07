@@ -1998,11 +1998,12 @@ class X11Backend final : public Backend {
         {"Super+v", "Split pane vertically"},
         {"Super+s", "Split pane horizontally"},
         {"Super+Tab", "Next tab"},
+        {"Super+Shift+Tab", "Previous tab"},
         {"Super+Space / Super+a", "Cycle layout"},
         {"Super+Ctrl+Space", "Cycle layout (reverse, Lua-bound)"},
         {"Super+z", "Zoom focused window to master"},
         {"Super+m", "Toggle maximize"},
-        {"Super+d", "Decrease master count"},
+        {"Super+d", "Decrease master count (or delete/merge current pane in manual mode)"},
         {"Super+Shift+d", "Increase master count"},
         {"Super+b", "Toggle bar"},
         {"Super+minus", "Toggle scratchpad"},
@@ -3420,7 +3421,7 @@ class X11Backend final : public Backend {
                                  XK_a, XK_z, XK_m, XK_r, XK_minus, XK_comma, XK_period, XK_1, XK_2, XK_3,
                                  XK_4, XK_5, XK_6, XK_7, XK_8, XK_9, XK_w, XK_b, XK_d, XK_f};
     const KeySym shift_keys[] = {XK_q, XK_space, XK_c, XK_minus, XK_comma, XK_period, XK_h, XK_j, XK_k, XK_l,
-                                 XK_r, XK_d, XK_t, XK_slash};
+                                 XK_r, XK_d, XK_t, XK_slash, XK_Tab};
     const KeySym ctrl_keys[] = {XK_h, XK_j, XK_k, XK_l};
     for (const unsigned int ignored : ignored_modifiers) {
       for (const KeySym key : plain_keys) {
@@ -3897,10 +3898,13 @@ class X11Backend final : public Backend {
     }
   }
 
-  void next_tab() {
+  void next_tab(int direction = 1) {
     Node* leaf = workspace().selected_leaf;
     if (!leaf || leaf->tabs.size() < 2) return;
-    leaf->active_tab = (leaf->active_tab + 1) % leaf->tabs.size();
+    const long count = static_cast<long>(leaf->tabs.size());
+    long index = (static_cast<long>(leaf->active_tab) + direction) % count;
+    if (index < 0) index += count;
+    leaf->active_tab = static_cast<std::size_t>(index);
     focus(leaf->tabs[leaf->active_tab]);
     arrange();
   }
@@ -3931,6 +3935,29 @@ class X11Backend final : public Backend {
     // target.focused would keep pointing at it, out of sync with
     // selected_leaf, until something is opened here).
     select_pane(new_leaf_ptr);
+  }
+
+  // Deletes the selected pane, folding its clients in as extra tabs of the
+  // sibling pane (or, if that sibling is itself a split, its first leaf).
+  void merge_pane() {
+    Workspace& target = workspace();
+    Node* leaf = target.selected_leaf;
+    if (!leaf || !leaf->parent) return;
+    Node* parent = leaf->parent;
+    Node* sibling = nullptr;
+    for (auto& child : parent->children) {
+      if (child.get() != leaf) { sibling = child.get(); break; }
+    }
+    if (!sibling) return;
+    Node* absorbing = sibling->is_leaf() ? sibling : first_leaf(sibling);
+    if (!absorbing) return;
+    absorbing->tabs.insert(absorbing->tabs.end(), leaf->tabs.begin(), leaf->tabs.end());
+    absorbing->active_tab = absorbing->tabs.empty() ? 0 : absorbing->tabs.size() - 1;
+    leaf->tabs.clear();
+    remove_empty_leaf(target, leaf);
+    target.selected_leaf = absorbing;
+    if (!absorbing->tabs.empty()) focus(absorbing->tabs[absorbing->active_tab]);
+    arrange();
   }
 
   // Resize across the nearest split boundary that has the requested axis.
@@ -4895,6 +4922,7 @@ class X11Backend final : public Backend {
       if (key == XK_period) send_to_monitor(workspace().focused,
                                             (current_monitor_ + 1) % monitors_.size());
       if (key == XK_h || key == XK_j || key == XK_k || key == XK_l) resize_pane(key);
+      if (key == XK_Tab) next_tab(-1);
       if (key == XK_r) restart();
       if (key == XK_d) adjust_nmaster(1);
       if (key == XK_t) open_theme_panel();
@@ -4916,7 +4944,7 @@ class X11Backend final : public Backend {
     if (key == XK_w) open_window_switcher();
     if (key == XK_f) toggle_hints();
     if (key == XK_b) toggle_bar();
-    if (key == XK_d) adjust_nmaster(-1);
+    if (key == XK_d) { if (workspace().mode == LayoutMode::Manual) merge_pane(); else adjust_nmaster(-1); }
     if (key == XK_h || key == XK_j || key == XK_k || key == XK_l) {
       if (workspace().mode == LayoutMode::Manual) select_pane_direction(key);
       else focus_direction(key);
