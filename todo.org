@@ -139,9 +139,16 @@ had already landed by the time of this rewrite:
 
 ** Known gaps (not ported -- scoped out, not forgotten)
 - *Wallpaper picker* (mwm's Mod4+Shift+w, PickerModeWallpaper,
-  mwm.cpp:1096/2247): mep-wm has no wallpaper-setting feature at all
-  (no feh/hsetroot integration). Would be new functionality, not just a
-  picker UI, so scoped out of this parity pass.
+  mwm.cpp:1096/2247): mep-wm now sets a random wallpaper via `feh --bg-fill`
+  on startup and whenever the active theme's light/dark bucket changes
+  (theme_is_light()/refresh_wallpaper() in src/x11_backend.cpp, picking from
+  config_.wallpaper_dir_light/dark -- default assets/{light,dark}_comic_
+  wallpapers, overridable via MEPWM_WALLPAPER_LIGHT_DIR/_DARK_DIR or
+  mwm.set_wallpapers(light_dir, dark_dir)). What's still missing vs mwm is
+  the interactive picker UI (fuzzy-jump to a specific wallpaper by name);
+  mwm also pipes its pick through `wal -i` (pywal) to regenerate its whole
+  color theme from the image, which mep-wm deliberately does not do -- it
+  only changes the background image, not the bar palette.
 - *SSH host picker* (mwm's Mod4+e, PickerModeSSH, mwm.cpp:1097/2249):
   fuzzy-jump into a Host from ~/.ssh/config. Same shared launcher infra as
   the window switcher would make this cheap to add later; just not done

@@ -115,6 +115,20 @@ and each window belongs to one monitor. `Super+,` and `Super+.` focus the
 previous or next monitor; add Shift to send the focused window there. Dropping
 a moved or resized floating window on another monitor also transfers it.
 
+## Wallpaper
+
+MEPWM sets a random wallpaper (via `feh --bg-fill`) on startup and again
+whenever the active theme's background crosses the light/dark threshold —
+click, scroll, or select a different entry on the bottom-bar theme widget
+(or its panel). Images are picked from `assets/light_comic_wallpapers` or
+`assets/dark_comic_wallpapers` (relative to the working directory `mepwm`
+was launched from) depending on the resulting theme; override those
+directories with the `MEPWM_WALLPAPER_LIGHT_DIR`/`MEPWM_WALLPAPER_DARK_DIR`
+environment variables or `mwm.set_wallpapers(light_dir, dark_dir)` in
+`config.lua`. Cycling between two themes on the same side of that threshold
+(e.g. the built-in "dark" and "nord") leaves the current wallpaper alone.
+Requires `feh` on `PATH`.
+
 ## Mouse controls
 
 The X11 backend provides an arrow cursor in the nested display. Click a client

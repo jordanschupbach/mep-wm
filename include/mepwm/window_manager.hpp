@@ -17,6 +17,8 @@ struct Config {
   float mfact = 0.55f;
   unsigned int nmaster = 1;
   std::string agent_command = "claude";
+  std::string wallpaper_dir_light = "assets/light_comic_wallpapers";
+  std::string wallpaper_dir_dark = "assets/dark_comic_wallpapers";
 };
 
 class WindowManager {

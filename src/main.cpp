@@ -20,6 +20,8 @@ int main(int argc, char** argv) {
   mepwm::BackendKind backend = mepwm::BackendKind::X11;
   mepwm::Config config;
   if (const char* terminal = std::getenv("MEPWM_TERMINAL")) config.terminal = terminal;
+  if (const char* light_dir = std::getenv("MEPWM_WALLPAPER_LIGHT_DIR")) config.wallpaper_dir_light = light_dir;
+  if (const char* dark_dir = std::getenv("MEPWM_WALLPAPER_DARK_DIR")) config.wallpaper_dir_dark = dark_dir;
 
   for (int index = 1; index < argc; ++index) {
     const std::string argument = argv[index];

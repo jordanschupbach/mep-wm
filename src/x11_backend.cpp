@@ -27,7 +27,9 @@
 #include <iterator>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <poll.h>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -362,6 +364,8 @@ class X11Backend final : public Backend {
     startup.checkpoint("initialize notification D-Bus");
     initialize_lua();
     startup.checkpoint("initialize Lua");
+    refresh_wallpaper();
+    startup.checkpoint("set initial wallpaper");
     initialize_projects();
     create_ipc();
     startup.checkpoint("create IPC socket");
@@ -1013,6 +1017,17 @@ class X11Backend final : public Backend {
     return 0;
   }
 
+  // mwm.set_wallpapers(light_dir, dark_dir): directories scanned for a
+  // random image (feh --bg-fill) on startup and whenever the active theme's
+  // background luminance crosses the light/dark threshold (see
+  // theme_is_light()/refresh_wallpaper()).
+  static int lua_set_wallpapers(lua_State* state) {
+    X11Backend* backend = lua_backend(state);
+    backend->config_.wallpaper_dir_light = luaL_checkstring(state, 1);
+    backend->config_.wallpaper_dir_dark = luaL_checkstring(state, 2);
+    return 0;
+  }
+
   // Adapted from mwm's mwm.theme({topbar={normal=,selected=},...}) to
   // mep-wm's simpler palette-cycling bar (fg/bg/selected, no separate
   // light/dark tables): mwm.theme({name=, fg=, bg=, selected=}) adds a new
@@ -1081,6 +1096,7 @@ class X11Backend final : public Backend {
     lua_pushcfunction(lua_, lua_switch_project); lua_setfield(lua_, -2, "switch_project");
     lua_pushcfunction(lua_, lua_agent_command); lua_setfield(lua_, -2, "agent_command");
     lua_pushcfunction(lua_, lua_theme); lua_setfield(lua_, -2, "theme");
+    lua_pushcfunction(lua_, lua_set_wallpapers); lua_setfield(lua_, -2, "set_wallpapers");
     lua_setglobal(lua_, "mwm");
     const char* home = std::getenv("HOME");
     if (home) {
@@ -1777,7 +1793,7 @@ class X11Backend final : public Backend {
         {"volume", volume_icon},
         {"mic", mic_percent_ < 0 ? "" : (mic_muted_ ? kIconMicrophoneMuted : kIconMicrophone)},
         {"media", media_title_.empty() ? "" : std::string(kIconMedia) + " " + media_title_},
-        {"theme", theme_index_ == 1 ? kIconThemeLight : kIconThemeDark},
+        {"theme", theme_is_light() ? kIconThemeLight : kIconThemeDark},
         {"git", git_status_.empty() ? "" : std::string(kIconGit) + " " + git_status_},
         {"cpu", cpu_percent_ < 0 ? std::string(kIconCpu) + " ..." : std::string(kIconCpu) + " " + std::to_string(cpu_percent_) + "%"},
         {"memory", mem_percent_ < 0 ? std::string(kIconMemory) + " n/a" : std::string(kIconMemory) + " " + std::to_string(mem_percent_) + "%"},
@@ -2346,6 +2362,7 @@ class X11Backend final : public Backend {
     XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), palette[1].c_str(), &bar_background_);
     XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), palette[2].c_str(), &bar_selected_);
     draw_bar(); draw_docks();
+    refresh_wallpaper();
   }
 
   void cycle_theme(int direction) {
@@ -2358,6 +2375,87 @@ class X11Backend final : public Backend {
     theme_palettes_ = {{{"#f8f8f2", "#202124", "#5294e2"}}, {{"#202124", "#f4f4f4", "#3971ed"}}, {{"#d8dee9", "#2e3440", "#88c0d0"}}};
     theme_names_ = {"dark", "blue", "nord"};
     if (theme_index_ >= static_cast<int>(theme_palettes_.size())) theme_index_ = 0;
+  }
+
+  static bool color_is_light(const std::string& hex) {
+    if (hex.size() != 7 || hex[0] != '#') return false;
+    int r = 0, g = 0, b = 0;
+    try {
+      r = std::stoi(hex.substr(1, 2), nullptr, 16);
+      g = std::stoi(hex.substr(3, 2), nullptr, 16);
+      b = std::stoi(hex.substr(5, 2), nullptr, 16);
+    } catch (const std::exception&) {
+      return false;
+    }
+    return (0.299 * r + 0.587 * g + 0.114 * b) > 140.0;
+  }
+
+  // Derived from the active palette's background (palette[1], see
+  // apply_current_theme()) rather than a hardcoded theme index, so
+  // Lua-registered themes (mwm.theme()) pick the right wallpaper set too.
+  bool theme_is_light() const {
+    if (theme_palettes_.empty()) return false;
+    const std::size_t index = static_cast<std::size_t>(
+        std::clamp(theme_index_, 0, static_cast<int>(theme_palettes_.size()) - 1));
+    return color_is_light(theme_palettes_[index][1]);
+  }
+
+  // No caching: this only runs on theme switches (rare -- a keypress or a
+  // reload), so re-reading a small directory each time is cheap and avoids
+  // having to invalidate a cache when mwm.set_wallpapers() changes the dirs.
+  std::vector<std::string> scan_wallpaper_dir(const std::string& raw_dir) const {
+    std::vector<std::string> result;
+    if (raw_dir.empty()) return result;
+    std::filesystem::path dir(raw_dir);
+    if (raw_dir == "~" || raw_dir.rfind("~/", 0) == 0) {
+      if (const char* home = std::getenv("HOME"); home && *home)
+        dir = std::filesystem::path(home) / raw_dir.substr(raw_dir == "~" ? 1 : 2);
+    }
+    DIR* directory = opendir(dir.c_str());
+    if (!directory) return result;
+    while (dirent* entry = readdir(directory)) {
+      const std::string name(entry->d_name);
+      const std::size_t dot = name.find_last_of('.');
+      if (dot == std::string::npos) continue;
+      std::string extension = name.substr(dot + 1);
+      std::transform(extension.begin(), extension.end(), extension.begin(),
+                      [](unsigned char c) { return std::tolower(c); });
+      if (extension != "png" && extension != "jpg" && extension != "jpeg" &&
+          extension != "bmp" && extension != "gif" && extension != "webp") continue;
+      result.push_back((dir / name).string());
+    }
+    closedir(directory);
+    std::sort(result.begin(), result.end());
+    return result;
+  }
+
+  void set_random_wallpaper(bool light) {
+    const std::vector<std::string> wallpapers =
+        scan_wallpaper_dir(light ? config_.wallpaper_dir_light : config_.wallpaper_dir_dark);
+    if (wallpapers.empty()) return;
+    std::uniform_int_distribution<std::size_t> distribution(0, wallpapers.size() - 1);
+    const std::string& path = wallpapers[distribution(wallpaper_rng_)];
+    const pid_t child = fork();
+    if (child < 0) {
+      std::cerr << "mepwm: could not set wallpaper: " << std::strerror(errno) << '\n';
+      return;
+    }
+    if (child == 0) {
+      setsid();
+      execlp("feh", "feh", "--bg-fill", path.c_str(), static_cast<char*>(nullptr));
+      _exit(127);
+    }
+    signal(SIGCHLD, SIG_IGN);
+  }
+
+  // Only rerolls the wallpaper when the light/dark bucket actually changes,
+  // so cycling between two dark themes (or a plain config reload) leaves
+  // the current wallpaper alone.
+  void refresh_wallpaper() {
+    const bool light = theme_is_light();
+    if (wallpaper_is_light_.has_value() && *wallpaper_is_light_ == light) return;
+    wallpaper_is_light_ = light;
+    set_random_wallpaper(light);
   }
 
   void cycle_keyboard_layout() {
@@ -4582,6 +4680,8 @@ class X11Backend final : public Backend {
   std::vector<std::array<std::string, 3>> theme_palettes_ = {
       {{"#f8f8f2", "#202124", "#5294e2"}}, {{"#202124", "#f4f4f4", "#3971ed"}}, {{"#d8dee9", "#2e3440", "#88c0d0"}}};
   std::vector<std::string> theme_names_ = {"dark", "blue", "nord"};
+  std::optional<bool> wallpaper_is_light_;
+  std::mt19937 wallpaper_rng_{std::random_device{}()};
   std::vector<AgentStatus> agents_;
   int agent_needs_input_ = 0;
   GC bar_gc_ = nullptr;
