@@ -4793,7 +4793,13 @@ class X11Backend final : public Backend {
     signal(SIGCHLD, SIG_IGN);
   }
 
-  void spawn_terminal() const { spawn_command(config_.terminal); }
+  // Opens in the active project's directory so Super+Return (and the dock's
+  // terminal icon) land where the user is working rather than wherever mepwm
+  // itself started.
+  void spawn_terminal() const {
+    if (active_project_index_ < projects_.size()) spawn_terminal_in(projects_[active_project_index_].path);
+    else spawn_command(config_.terminal);
+  }
 
   // Independent of config_.terminal (which is a full launch expression, not
   // just a binary), so the agent command is run in its own terminal rather
