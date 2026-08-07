@@ -338,7 +338,7 @@ class X11Backend final : public Backend {
     another_window_manager = 0;
     XSetErrorHandler(on_x_error);
     XSelectInput(display_, root_, SubstructureRedirectMask | SubstructureNotifyMask |
-                                      StructureNotifyMask);
+                                      StructureNotifyMask | ButtonPressMask);
     XSync(display_, False);
     if (another_window_manager) {
       throw std::runtime_error("another window manager is already running on this display");
@@ -4326,7 +4326,20 @@ class X11Backend final : public Backend {
             dock_monitor(event.xcrossing.window) < 0) focus(event.xcrossing.window);
         break;
       case ButtonPress:
+        // Any click outside a popup's own window closes that popup first, then
+        // falls through to normal click routing below so the click still does
+        // whatever it would otherwise do (focus a client, hit a dock icon, ...).
+        // Dock clicks are exempt: handle_dock_button/handle_bottom_widget already
+        // toggle/switch popups correctly based on the pre-click state, so
+        // force-closing here first would make re-clicking a widget always
+        // reopen it instead of closing it.
         if (hints_visible_) close_hints();
+        if (dock_monitor(event.xbutton.window) < 0) {
+          if (side_panel_ != SidePanel::Closed && event.xbutton.window != side_panel_window_) close_side_panel();
+          if (launcher_visible_ && event.xbutton.window != launcher_window_) close_launcher();
+          if (slider_visible_ && event.xbutton.window != slider_window_) close_slider_popup();
+        }
+
         if (side_panel_ != SidePanel::Closed && event.xbutton.window == side_panel_window_) {
           handle_side_panel_button(event.xbutton);
         } else if (slider_visible_ && event.xbutton.window == slider_window_) {
@@ -4334,9 +4347,6 @@ class X11Backend final : public Backend {
             slider_dragging_ = true;
             handle_slider_position(event.xbutton.x);
           }
-        } else if (slider_visible_) {
-          close_slider_popup();
-          handle_button(event.xbutton);
         } else if (event.xbutton.window == launcher_window_) {
           if (event.xbutton.button == Button4) move_launcher_selection(-1);
           else if (event.xbutton.button == Button5) move_launcher_selection(1);
