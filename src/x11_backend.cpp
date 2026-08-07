@@ -1982,6 +1982,7 @@ class X11Backend final : public Backend {
         {"Super+p", "Application picker"},
         {"Super+w", "Window switcher"},
         {"Super+f", "Element hints (click anything by typing its label)"},
+        {"Super+t", "Toggle todo list sidebar"},
         {"Super+i", "Recent projects picker"},
         {"Super+o", "Active projects picker"},
         {"Super+h/j/k/l", "Focus direction (selects empty panes too in manual layout)"},
@@ -3492,7 +3493,7 @@ class X11Backend final : public Backend {
     const unsigned int ignored_modifiers[] = {0, LockMask, Mod2Mask, LockMask | Mod2Mask};
     const KeySym plain_keys[] = {XK_Return, XK_q, XK_h, XK_i, XK_j, XK_k, XK_l, XK_o, XK_p, XK_v, XK_s, XK_Tab, XK_space,
                                  XK_a, XK_z, XK_m, XK_r, XK_minus, XK_comma, XK_period, XK_1, XK_2, XK_3,
-                                 XK_4, XK_5, XK_6, XK_7, XK_8, XK_9, XK_w, XK_b, XK_d, XK_f};
+                                 XK_4, XK_5, XK_6, XK_7, XK_8, XK_9, XK_w, XK_b, XK_d, XK_f, XK_t};
     const KeySym shift_keys[] = {XK_q, XK_space, XK_c, XK_minus, XK_comma, XK_period, XK_h, XK_j, XK_k, XK_l,
                                  XK_r, XK_d, XK_t, XK_slash, XK_Tab};
     const KeySym ctrl_keys[] = {XK_h, XK_j, XK_k, XK_l};
@@ -5018,6 +5019,7 @@ class X11Backend final : public Backend {
     if (key == XK_p) toggle_launcher();
     if (key == XK_w) open_window_switcher();
     if (key == XK_f) toggle_hints();
+    if (key == XK_t) toggle_side_panel(SidePanel::Todos);
     if (key == XK_b) toggle_bar();
     if (key == XK_d) { if (workspace().mode == LayoutMode::Manual) merge_pane(); else adjust_nmaster(-1); }
     if (key == XK_h || key == XK_j || key == XK_k || key == XK_l) {
