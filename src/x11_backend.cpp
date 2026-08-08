@@ -412,7 +412,10 @@ class X11Backend final : public Backend {
     startup.checkpoint("initialize notification D-Bus");
     initialize_lua();
     startup.checkpoint("initialize Lua");
-    refresh_wallpaper();
+    // Also picks the initial wallpaper (see refresh_wallpaper()) and sets
+    // the border colors, so config.lua's mwm.theme()/theme index choice is
+    // reflected from the first frame rather than only after a later cycle.
+    apply_current_theme();
     startup.checkpoint("set initial wallpaper");
     initialize_projects();
     create_ipc();
@@ -631,6 +634,18 @@ class X11Backend final : public Backend {
     auto leaf = std::make_unique<Node>();
     leaf->parent = parent;
     return leaf;
+  }
+
+  // Forces a chrome window to be fully opaque under compositors (picom,
+  // etc.) that apply default translucency to override-redirect or unfocused
+  // windows -- the bars/docks/side panel already paint an opaque background
+  // themselves, so any compositor-applied alpha on top would let the
+  // wallpaper show through them.
+  void force_opaque(Window window) {
+    static constexpr unsigned long kOpaque = 0xffffffffu;
+    const Atom opacity_atom = XInternAtom(display_, "_NET_WM_WINDOW_OPACITY", False);
+    XChangeProperty(display_, window, opacity_atom, XA_CARDINAL, 32, PropModeReplace,
+                    reinterpret_cast<const unsigned char*>(&kOpaque), 1);
   }
 
   unsigned long alloc_color(const std::string& spec) {
@@ -1450,6 +1465,9 @@ class X11Backend final : public Backend {
       XDefineCursor(display_, dock.left, cursor_);
       XDefineCursor(display_, dock.bottom, cursor_);
       XDefineCursor(display_, dock.right, cursor_);
+      force_opaque(dock.left);
+      force_opaque(dock.bottom);
+      force_opaque(dock.right);
       docks_.push_back(dock);
     }
     for (std::size_t index = 0; index < monitors_.size(); ++index) {
@@ -1464,6 +1482,9 @@ class X11Backend final : public Backend {
                         kDockWidth, side_height);
       XMoveResizeWindow(display_, dock.bottom, target.x, target.y + target.height - kBarHeight,
                         std::max(1, target.width), kBarHeight);
+      // A resize while the border bars are toggled off (mod+b) must not
+      // resurrect them -- see toggle_bar().
+      if (!bars_visible_) continue;
       XMapRaised(display_, dock.left);
       XMapRaised(display_, dock.bottom);
       XMapRaised(display_, dock.right);
@@ -2418,14 +2439,21 @@ class X11Backend final : public Backend {
     // Every row is drawn as a rounded card (bar_card_, or bar_selected_ when
     // highlighted) so all five side panels share one look, rather than only
     // the selected row standing out against a flat background.
-    auto row = [&](const std::string& text, bool selected = false) {
+    // swatch_pixel, when non-zero, draws a small filled circle at the row's
+    // right edge -- used by the theme panel so each entry previews its
+    // accent color instead of relying on name alone to tell ~15 themes apart.
+    auto row = [&](const std::string& text, bool selected = false, unsigned long swatch_pixel = 0) {
       if (y + kBarHeight > kBarHeight && y < content_bottom && !text.empty()) {
         XSetForeground(display_, bar_gc_, (selected ? bar_selected_ : bar_card_).pixel);
         fill_rounded_rect(side_panel_window_, 8, y, width - 16, kBarHeight, kSidePanelCardRadius);
       }
       if (y + kBarHeight > kBarHeight && y < content_bottom)
         draw_dock_text(side_panel_window_, 16, y + (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2,
-                       ellipsize(text, width - 32), selected ? bar_background_ : bar_foreground_);
+                       ellipsize(text, width - (swatch_pixel ? 64 : 32)), selected ? bar_background_ : bar_foreground_);
+      if (swatch_pixel && y + kBarHeight > kBarHeight && y < content_bottom) {
+        XSetForeground(display_, bar_gc_, swatch_pixel);
+        XFillArc(display_, side_panel_window_, bar_gc_, width - 16 - 8 - 16, y + (kBarHeight - 16) / 2, 16, 16, 0, 360 * 64);
+      }
       side_panel_rows_.push_back(y);
       y += kBarHeight + kSidePanelRowGap;
     };
@@ -2477,6 +2505,11 @@ class X11Backend final : public Backend {
         row("-- from config.lua --");
         for (const LuaKeybind& binding : lua_keybinds_)
           row(binding.spec + "  " + (binding.description.empty() ? "(no description)" : binding.description));
+      }
+    } else if (info_action_ == InfoAction::Theme) {
+      for (std::size_t index = 0; index < theme_names_.size(); ++index) {
+        const bool active = static_cast<int>(index) == theme_index_;
+        row((active ? "* " : "  ") + theme_names_[index], active, alloc_color(theme_palettes_[index][2]));
       }
     } else {
       std::istringstream lines(info_panel_body_);
@@ -2536,12 +2569,15 @@ class X11Backend final : public Backend {
       XSetWindowAttributes attributes{};
       attributes.override_redirect = True;
       attributes.background_pixel = bar_background_.pixel;
-      attributes.border_pixel = bar_selected_.pixel;
       attributes.event_mask = ExposureMask | ButtonPressMask;
-      side_panel_window_ = XCreateWindow(display_, root_, 0, 0, kSidePanelWidth, 200, 1, DefaultDepth(display_, screen_), CopyFromParent,
-                                         DefaultVisual(display_, screen_), CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWEventMask,
+      // No window border -- it used to draw a colored outline flush against
+      // the top/bottom bars, which read as a mismatched seam right where
+      // the panel meets them.
+      side_panel_window_ = XCreateWindow(display_, root_, 0, 0, kSidePanelWidth, 200, 0, DefaultDepth(display_, screen_), CopyFromParent,
+                                         DefaultVisual(display_, screen_), CWOverrideRedirect | CWBackPixel | CWEventMask,
                                          &attributes);
       XDefineCursor(display_, side_panel_window_, cursor_);
+      force_opaque(side_panel_window_);
     }
     if (side_panel_ == SidePanel::Todos) leave_todo_panel();
     else if (side_panel_grabs_keyboard(side_panel_)) leave_side_panel_keyboard();
@@ -2778,12 +2814,10 @@ class X11Backend final : public Backend {
     open_action_panel(InfoAction::Keyboard, "Keyboard layout", body.empty() ? "No layouts configured" : body);
   }
 
-  void open_theme_panel() {
-    std::string body;
-    for (std::size_t index = 0; index < theme_names_.size(); ++index)
-      body += (index ? "\n" : "") + std::string(static_cast<int>(index) == theme_index_ ? "• " : "  ") + theme_names_[index];
-    open_action_panel(InfoAction::Theme, "Theme", body);
-  }
+  // The body text is unused for InfoAction::Theme -- draw_side_panel() has a
+  // dedicated branch that renders theme_names_/theme_palettes_ directly
+  // (with accent-color swatches) instead of the generic body-as-lines path.
+  void open_theme_panel() { open_action_panel(InfoAction::Theme, "Theme", "themes"); }
 
   void handle_side_panel_button(const XButtonEvent& event) {
     if (event.window != side_panel_window_) return;
@@ -2975,6 +3009,12 @@ class X11Backend final : public Backend {
     XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), palette[2].c_str(), &bar_selected_);
     XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_),
                       mix_hex(palette[1], palette[0], 0.10).c_str(), &bar_card_);
+    // Focused-window border tracks the theme's accent (matching the bar's
+    // selected/highlight color); the unfocused border is a subtle bg/fg
+    // blend so it stays visible without competing with window content.
+    border_focused_pixel_ = alloc_color(palette[2]);
+    border_normal_pixel_ = alloc_color(mix_hex(palette[1], palette[0], 0.35));
+    refresh_all_borders();
     draw_bar(); draw_docks();
     refresh_wallpaper();
   }
@@ -2985,9 +3025,40 @@ class X11Backend final : public Backend {
     apply_current_theme();
   }
 
+  // The built-in collection: half dark, half light, so the picker always
+  // offers a real choice on either side of the light/dark wallpaper split
+  // (see theme_is_light()/refresh_wallpaper()). Each entry is {fg, bg,
+  // accent} -- accent drives both the selected/highlight color and the
+  // focused-window border (see apply_current_theme()).
+  static std::vector<std::array<std::string, 3>> default_theme_palettes() {
+    return {
+        {{"#f8f8f2", "#202124", "#5294e2"}},  // dark
+        {{"#d8dee9", "#2e3440", "#88c0d0"}},  // nord
+        {{"#f8f8f2", "#282a36", "#bd93f9"}},  // dracula
+        {{"#ebdbb2", "#282828", "#fe8019"}},  // gruvbox-dark
+        {{"#c0caf5", "#1a1b26", "#7aa2f7"}},  // tokyo-night
+        {{"#cdd6f4", "#1e1e2e", "#cba6f7"}},  // catppuccin-mocha
+        {{"#abb2bf", "#282c34", "#61afef"}},  // one-dark
+        {{"#d3c6aa", "#2d353b", "#a7c080"}},  // everforest-dark
+        {{"#202124", "#f4f4f4", "#3971ed"}},  // light
+        {{"#586e75", "#fdf6e3", "#268bd2"}},  // solarized-light
+        {{"#3c3836", "#fbf1c7", "#d65d0e"}},  // gruvbox-light
+        {{"#4c4f69", "#eff1f5", "#8839ef"}},  // catppuccin-latte
+        {{"#575279", "#faf4ed", "#907aa9"}},  // rose-pine-dawn
+        {{"#5c6a72", "#f3ead3", "#8da101"}},  // everforest-light
+        {{"#2e3440", "#eceff4", "#5e81ac"}},  // nord-light
+    };
+  }
+
+  static std::vector<std::string> default_theme_names() {
+    return {"dark", "nord", "dracula", "gruvbox-dark", "tokyo-night", "catppuccin-mocha", "one-dark",
+            "everforest-dark", "light", "solarized-light", "gruvbox-light", "catppuccin-latte",
+            "rose-pine-dawn", "everforest-light", "nord-light"};
+  }
+
   void reset_theme_palettes() {
-    theme_palettes_ = {{{"#f8f8f2", "#202124", "#5294e2"}}, {{"#202124", "#f4f4f4", "#3971ed"}}, {{"#d8dee9", "#2e3440", "#88c0d0"}}};
-    theme_names_ = {"dark", "blue", "nord"};
+    theme_palettes_ = default_theme_palettes();
+    theme_names_ = default_theme_names();
     if (theme_index_ >= static_cast<int>(theme_palettes_.size())) theme_index_ = 0;
   }
 
@@ -3090,12 +3161,7 @@ class X11Backend final : public Backend {
     return result;
   }
 
-  void set_random_wallpaper(bool light) {
-    const std::vector<std::string> wallpapers =
-        scan_wallpaper_dir(light ? config_.wallpaper_dir_light : config_.wallpaper_dir_dark);
-    if (wallpapers.empty()) return;
-    std::uniform_int_distribution<std::size_t> distribution(0, wallpapers.size() - 1);
-    const std::string& path = wallpapers[distribution(wallpaper_rng_)];
+  void run_feh_bg_fill(const std::string& path) {
     const pid_t child = fork();
     if (child < 0) {
       std::cerr << "mepwm: could not set wallpaper: " << std::strerror(errno) << '\n';
@@ -3107,6 +3173,52 @@ class X11Backend final : public Backend {
       _exit(127);
     }
     signal(SIGCHLD, SIG_IGN);
+  }
+
+  // Crops+letterboxes `path` to the rectangle the border bars leave
+  // uncovered (kDockWidth/kBarHeight margins on every side), padded with
+  // the active theme's background color, so the image's framing matches
+  // what's actually visible instead of being scaled to the full screen and
+  // partially hidden under the bars. Falls back to the original path if
+  // ImageMagick's `convert` isn't on PATH or fails.
+  std::string prepare_wallpaper_file(const std::string& path) const {
+    const Monitor& primary = monitor(0);
+    const int full_w = std::max(1, primary.width);
+    const int full_h = std::max(1, primary.height);
+    const int inner_w = std::max(1, full_w - 2 * kDockWidth);
+    const int inner_h = std::max(1, full_h - 2 * kBarHeight);
+    const std::size_t index = theme_palettes_.empty() ? 0 : static_cast<std::size_t>(
+        std::clamp(theme_index_, 0, static_cast<int>(theme_palettes_.size()) - 1));
+    const std::string letterbox = theme_palettes_.empty() ? "#202124" : theme_palettes_[index][1];
+    const std::string temp_path = "/tmp/mepwm-wallpaper-" + std::to_string(getpid()) + ".png";
+    const std::string command = "convert " + shell_quote(path) +
+        " -resize " + std::to_string(inner_w) + "x" + std::to_string(inner_h) + "^" +
+        " -gravity center -extent " + std::to_string(inner_w) + "x" + std::to_string(inner_h) +
+        " -background " + shell_quote(letterbox) +
+        " -gravity center -extent " + std::to_string(full_w) + "x" + std::to_string(full_h) +
+        " " + shell_quote(temp_path) + " 2>/dev/null";
+    FILE* process = popen(command.c_str(), "r");
+    if (process) pclose(process);
+    return std::filesystem::exists(temp_path) ? temp_path : path;
+  }
+
+  // Re-applies the currently active wallpaper image -- called after a
+  // theme's light/dark bucket changes (see refresh_wallpaper()) and after
+  // mod+b toggles the border bars (see toggle_bar()), since the latter
+  // changes whether the image is letterboxed to the inner desktop rect or
+  // filled edge-to-edge.
+  void apply_wallpaper() {
+    if (current_wallpaper_path_.empty()) return;
+    run_feh_bg_fill(bars_visible_ ? prepare_wallpaper_file(current_wallpaper_path_) : current_wallpaper_path_);
+  }
+
+  void set_random_wallpaper(bool light) {
+    const std::vector<std::string> wallpapers =
+        scan_wallpaper_dir(light ? config_.wallpaper_dir_light : config_.wallpaper_dir_dark);
+    if (wallpapers.empty()) return;
+    std::uniform_int_distribution<std::size_t> distribution(0, wallpapers.size() - 1);
+    current_wallpaper_path_ = wallpapers[distribution(wallpaper_rng_)];
+    apply_wallpaper();
   }
 
   // Only rerolls the wallpaper when the light/dark bucket actually changes,
@@ -3248,7 +3360,7 @@ class X11Backend final : public Backend {
     };
     std::vector<Candidate> candidates;
 
-    if (bar_visible_ && bar_ != None) {
+    if (bars_visible_ && bar_ != None) {
       // Bar-relative x now equals screen x, since bar_ starts at x=0.
       candidates.push_back({4, 4, bar_, kDockWidth / 2, kBarHeight / 2});
       const int mode_x = kDockWidth;
@@ -3264,7 +3376,7 @@ class X11Backend final : public Backend {
       candidates.push_back({layout_x + 4, 4, bar_, layout_x + kDockWidth / 2, kBarHeight / 2});
     }
 
-    for (std::size_t index = 0; index < monitors_.size() && index < docks_.size(); ++index) {
+    for (std::size_t index = 0; bars_visible_ && index < monitors_.size() && index < docks_.size(); ++index) {
       const Monitor& target_monitor = monitors_[index];
       const DockWindows& dock = docks_[index];
       const int dock_y = target_monitor.y + kBarHeight;
@@ -3455,6 +3567,7 @@ class X11Backend final : public Backend {
     XChangeWindowAttributes(display_, bar_, CWOverrideRedirect, &attributes);
     XSelectInput(display_, bar_, ExposureMask | ButtonPressMask);
     XStoreName(display_, bar_, "mepwm-bar");
+    force_opaque(bar_);
     XDefineCursor(display_, bar_, cursor_);
     bar_gc_ = XCreateGC(display_, bar_, 0, nullptr);
     bar_font_ = XftFontOpenName(display_, screen_, "sans-16");
@@ -4494,6 +4607,15 @@ class X11Backend final : public Backend {
     XSetWindowBorder(display_, window, focused_state ? border_focused_pixel_ : border_normal_pixel_);
   }
 
+  // Re-stamps every mapped window's border pixel after a theme switch
+  // (border_normal_pixel_/border_focused_pixel_ just changed in
+  // apply_current_theme()) -- update_border() alone only fires on focus
+  // changes, so already-mapped windows would otherwise keep the old theme's
+  // border color until they were next focused or unfocused.
+  void refresh_all_borders() {
+    for (const auto& entry : window_state_) update_border(entry.first, entry.first == previously_focused_);
+  }
+
   void focus(Window window) {
     Workspace& target = workspace();
     if (window == None) {
@@ -4907,11 +5029,32 @@ class X11Backend final : public Backend {
     arrange();
   }
 
-  // Visual-only: unmaps the bar without reclaiming its screen space in the
-  // tiling math (kBarHeight is baked into dozens of geometry calculations).
+  // Toggles all of the border chrome together -- top bar, bottom bar, and
+  // both side docks -- rather than just the top bar. Visual-only: doesn't
+  // reclaim their screen space in the tiling math (kBarHeight/kDockWidth are
+  // baked into dozens of geometry calculations). Also re-fits the wallpaper
+  // (see apply_wallpaper()): letterboxed to the inner desktop rect while the
+  // bars are shown, edge-to-edge once they're hidden.
   void toggle_bar() {
-    bar_visible_ = !bar_visible_;
-    if (bar_visible_) { XMapRaised(display_, bar_); draw_bar(); } else { XUnmapWindow(display_, bar_); }
+    bars_visible_ = !bars_visible_;
+    if (bars_visible_) {
+      XMapRaised(display_, bar_);
+      for (const DockWindows& dock : docks_) {
+        XMapRaised(display_, dock.left);
+        XMapRaised(display_, dock.bottom);
+        XMapRaised(display_, dock.right);
+      }
+      draw_bar();
+      draw_docks();
+    } else {
+      XUnmapWindow(display_, bar_);
+      for (const DockWindows& dock : docks_) {
+        XUnmapWindow(display_, dock.left);
+        XUnmapWindow(display_, dock.bottom);
+        XUnmapWindow(display_, dock.right);
+      }
+    }
+    apply_wallpaper();
   }
 
   void adjust_nmaster(int delta) {
@@ -6037,11 +6180,11 @@ class X11Backend final : public Backend {
   std::string keyboard_layout_;
   std::vector<std::string> keyboard_layouts_;
   int theme_index_ = 0;
-  std::vector<std::array<std::string, 3>> theme_palettes_ = {
-      {{"#f8f8f2", "#202124", "#5294e2"}}, {{"#202124", "#f4f4f4", "#3971ed"}}, {{"#d8dee9", "#2e3440", "#88c0d0"}}};
-  std::vector<std::string> theme_names_ = {"dark", "blue", "nord"};
+  std::vector<std::array<std::string, 3>> theme_palettes_ = default_theme_palettes();
+  std::vector<std::string> theme_names_ = default_theme_names();
   std::optional<bool> wallpaper_is_light_;
   std::mt19937 wallpaper_rng_{std::random_device{}()};
+  std::string current_wallpaper_path_;
   std::vector<AgentStatus> agents_;
   int agent_needs_input_ = 0;
   GC bar_gc_ = nullptr;
@@ -6105,7 +6248,7 @@ class X11Backend final : public Backend {
   Window previously_focused_ = None;
   Window scratchpad_ = None;
   bool scratchpad_hidden_ = false;
-  bool bar_visible_ = true;
+  bool bars_visible_ = true;
   unsigned long border_normal_pixel_ = 0;
   unsigned long border_focused_pixel_ = 0;
   unsigned long todo_active_pixel_ = 0;

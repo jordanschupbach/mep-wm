@@ -76,6 +76,11 @@ every visible window — and typing a chip's label clicks that element exactly
 as a real click would. Backspace erases the last typed letter and Escape (or
 a real mouse click) cancels.
 
+`Super+b` toggles all of the border-bar chrome together -- the top bar,
+bottom bar, and both side docks -- rather than just the top bar. It's
+visual-only (their reserved screen space in the tiling math is unaffected),
+but it also re-fits the wallpaper: see [Wallpaper](#wallpaper).
+
 ## Projects
 
 Each project owns an independent set of nine workspaces. `Super+i` opens the
@@ -89,6 +94,11 @@ home directory is available as the default project.
 
 MEPWM provides a left application dock, a bottom system-widget dock, and a
 right dock for notifications, todos, agents, layouts, and keybinding help.
+All of these, plus the toggleable side panel (notifications/todos/agents/
+theme/etc.), are borderless and forced fully opaque via
+`_NET_WM_WINDOW_OPACITY` -- so a compositor's default translucency rules
+for override-redirect or unfocused windows can't let the wallpaper show
+through them.
 The bottom dock reports battery, brightness, volume, microphone, media, theme,
 Git branch, CPU, memory, disk, Wi-Fi, Bluetooth, keyboard layout, and clock state. Set
 `MEPWM_PROJECT_DIR` to a repository path to enable the Git branch indicator. Scroll
@@ -126,6 +136,22 @@ and each window belongs to one monitor. `Super+,` and `Super+.` focus the
 previous or next monitor; add Shift to send the focused window there. Dropping
 a moved or resized floating window on another monitor also transfers it.
 
+## Themes
+
+MEPWM ships 15 built-in themes, 8 dark and 7 light: `dark`, `nord`,
+`dracula`, `gruvbox-dark`, `tokyo-night`, `catppuccin-mocha`, `one-dark`,
+`everforest-dark`, `light`, `solarized-light`, `gruvbox-light`,
+`catppuccin-latte`, `rose-pine-dawn`, `everforest-light`, and `nord-light`.
+Left/scroll-click the bottom-bar theme widget to cycle through them, or
+middle-click it (or press `Super+Shift+t`) to open the theme picker panel,
+which lists every theme with an accent-color swatch and lets you click one
+directly. A theme is a `{fg, bg, accent}` triple that drives every color in
+the window manager: bar and sidebar text/background, card and highlight
+fills, and both the focused (accent-colored) and unfocused window border --
+switching themes recolors already-open windows immediately, not just new
+ones. Lua config can register additional themes (or override a built-in
+name) with `mwm.theme({name=, fg=, bg=, selected=})`.
+
 ## Wallpaper
 
 MEPWM sets a random wallpaper (via `feh --bg-fill`) on startup and again
@@ -144,6 +170,16 @@ environment variables or `mwm.set_wallpapers(light_dir, dark_dir)` in
 `config.lua`. Cycling between two themes on the same side of that threshold
 (e.g. the built-in "dark" and "nord") leaves the current wallpaper alone.
 Requires `feh` on `PATH`.
+
+While the border bars are visible, the chosen image is fit to the desktop
+rectangle they leave uncovered (not the full screen) and letterboxed with
+the active theme's background color, so its framing matches what's actually
+visible instead of being scaled full-screen and partly hidden under the
+bars; `Super+b` (see [X11 controls](#x11-controls)) re-fits it edge-to-edge
+the moment the bars are hidden, and back to the inset framing when they're
+shown again. The letterboxing step shells out to ImageMagick's `convert`;
+if it isn't on `PATH` (or fails), MEPWM falls back to filling the full
+screen with the unprocessed image.
 
 ## Mouse controls
 

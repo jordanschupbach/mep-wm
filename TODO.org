@@ -27,8 +27,15 @@ CLOCK: [2026-08-08 Sat 08:01]--[2026-08-08 Sat 08:07] =>  0:06
 :LOGBOOK:
 CLOCK: [2026-08-08 Sat 08:07]--[2026-08-08 Sat 08:19] =>  0:12
 :END:
-* TODO Add themes and theme picker
-* TODO Remove shading and border from sidebars
+* DONE Add themes and theme picker
+:LOGBOOK:
+CLOCK: [2026-08-08 Sat 08:46]--[2026-08-08 Sat 09:01] =>  0:15
+:END:
+* DONE Remove shading and border from sidebars
+:LOGBOOK:
+CLOCK: [2026-08-08 Sat 09:08]--[2026-08-08 Sat 09:21] =>  0:13
+:END:
+* TODO Fix behaviour of toggle border functionality (mod+b now toggles all bars and re-fits the wallpaper; still doesn't reclaim their screen space for tiling)
 * TODO fix popups for volume, brightness, etc.
 * TODO Add drop down to project widget to select active projects
 * TODO Fix placement and look of system tray (currently just nm-applet)
@@ -37,7 +44,6 @@ CLOCK: [2026-08-08 Sat 08:07]--[2026-08-08 Sat 08:19] =>  0:12
 * TODO make pass on code quality and style
 * TODO Add projects sidebar
 * TODO Improve wifi widget
-* TODO Fix behaviour of toggle border functionality
 * TODO Add maximize binding (mod+m) to maximize current window
 * TODO Add pin binding (mod+shift+p) to maximize current window
 * TODO Add floating binding (mod+shift+f) to toggle floating for current window
@@ -49,3 +55,4 @@ CLOCK: [2026-08-08 Sat 08:07]--[2026-08-08 Sat 08:19] =>  0:12
 * TODO Add messaging sidebar
 * TODO Add ai sidebar
 * TODO make available as flake
+* TODO Add speech to text functionality with toggle button and ai button
