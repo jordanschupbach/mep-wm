@@ -1633,7 +1633,9 @@ class X11Backend final : public Backend {
         entry_path += '/';
         entry_path += name;
         std::ifstream file(entry_path);
-        const std::string json((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        std::ostringstream json_stream;
+        json_stream << file.rdbuf();
+        const std::string json = json_stream.str();
         AgentStatus agent;
         agent.kind = field(json, "agent");
         agent.status = field(json, "status");
@@ -1671,7 +1673,9 @@ class X11Backend final : public Backend {
 
   static pid_t parent_pid(pid_t pid) {
     std::ifstream file("/proc/" + std::to_string(pid) + "/stat");
-    std::string contents((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    std::ostringstream contents_stream;
+    contents_stream << file.rdbuf();
+    std::string contents = contents_stream.str();
     const std::size_t close = contents.rfind(')');
     if (close == std::string::npos) return 0;
     std::istringstream fields(contents.substr(close + 1));
@@ -5334,7 +5338,9 @@ class X11Backend final : public Backend {
   // threading argv through WindowManager/Config just for this.
   static void restart() {
     std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
-    const std::string data((std::istreambuf_iterator<char>(cmdline)), std::istreambuf_iterator<char>());
+    std::ostringstream data_stream;
+    data_stream << cmdline.rdbuf();
+    const std::string data = data_stream.str();
     std::vector<std::string> parts;
     for (std::size_t start = 0; start < data.size();) {
       std::size_t nul = data.find('\0', start);
