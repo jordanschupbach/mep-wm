@@ -28,7 +28,7 @@ pkgs.stdenv.mkDerivation {
     runHook preInstall
     mkdir -p $out/bin $out/share/mep-wm
     cp mepwm $out/bin/
-    cp -r assets $out/share/mep-wm/assets
+    cp -r $src/assets $out/share/mep-wm/assets
     runHook postInstall
   '';
 
