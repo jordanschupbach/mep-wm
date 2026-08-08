@@ -22,7 +22,7 @@ int main(int argc, char** argv) {
     std::cerr << "socket path is too long\n";
     return 2;
   }
-  std::strcpy(address.sun_path, path.c_str());
+  std::snprintf(address.sun_path, sizeof(address.sun_path), "%s", path.c_str());
   const int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (socket_fd < 0 || connect(socket_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
     std::perror("mep-wm-cli");
@@ -32,7 +32,7 @@ int main(int argc, char** argv) {
   if (write(socket_fd, source.data(), source.size()) < 0) return 1;
   shutdown(socket_fd, SHUT_WR);
   char buffer[4096];
-  ssize_t count;
+  ssize_t count = 0;
   while ((count = read(socket_fd, buffer, sizeof(buffer))) > 0) std::cout.write(buffer, count);
   close(socket_fd);
   return 0;

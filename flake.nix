@@ -39,7 +39,9 @@
             pkgs.xkeyboard_config
             pkgs.xdotool
             pkgs.xterm
-          ]; 
+            pkgs.clang-tools
+            pkgs.cppcheck
+          ];
         };
       }
     );

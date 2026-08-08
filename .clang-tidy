@@ -1,0 +1,153 @@
+---
+# Curated rather than "enable everything": mep-wm is a low-level X11/Xlib/
+# D-Bus/Lua-C-API window manager, so several modernize-*/readability-* checks
+# mostly flag idiomatic C-API interop (raw pointers, C-style structs, short
+# geometry variable names) or fight the codebase's deliberately dense style
+# (single-line `if (cond) action();` guard clauses, aligned multi-line
+# ternary chains for threshold->icon lookups) rather than catch real bugs.
+# bugprone-*, clang-analyzer-*, performance-*, and portability-* are enabled
+# wholesale since a clean run showed they catch real issues here; readability-*
+# and modernize-* are enabled too, but with the specific checks below --
+# each verified false-positive/style-fight-only for this codebase -- turned
+# back off:
+#   easily-swappable-parameters: fires on any two adjacent same-typed params
+#     (int x, int y / int width, int height, ...), which geometry code is
+#     full of by nature.
+#   narrowing-conversions: mostly XClientMessageEvent.data.l[n] assignments,
+#     where Window/Atom (Xlib's unsigned long) going into the event struct's
+#     `long` fields is the protocol's own shape, not a bug.
+#   implicit-widening-of-multiplication-result: fires on small compile-time
+#     literal math (25 * 60, 1024 * 1024) that can never overflow.
+#   performance-enum-size: suggests shrinking enum class base types to
+#     uint8_t; none of these enums are stored at scale, so it's not a real
+#     saving, and int matches what they exchange with the Lua/EWMH side.
+#   portability-avoid-pragma-once: mep-wm only ever targets GCC/Clang on
+#     Linux (see flake.nix); portability to compilers without #pragma once
+#     isn't a real constraint here.
+#   security.insecureAPI.DeprecatedOrUnsafeBufferHandling: pushes C11 Annex K
+#     '_s' functions (fprintf_s and friends) as the fix, but glibc -- the
+#     only libc mep-wm builds against -- doesn't implement Annex K at all,
+#     so there is no fix to apply.
+#   readability-braces-around-statements: would force every one of the ~600
+#     single-line `if (cond) action();` guard clauses onto three lines each;
+#     that density is this codebase's house style, not an oversight.
+#   readability-magic-numbers / readability-identifier-length: routine in
+#     pixel-geometry code (padding, offsets, x/y/w/h) -- naming every 8 or 16
+#     or renaming every x/y would add ceremony, not clarity.
+#   readability-implicit-bool-conversion: flags idiomatic `if (ptr)` /
+#     `if (count)`, which is standard, not a defect.
+#   readability-math-missing-parentheses: fires on well-known, already
+#     line-broken formulas (the luminance weighting in relative_luminance,
+#     `y + (kBarHeight - 16) / 2`); the suggested parens are noise, not
+#     disambiguation.
+#   readability-avoid-nested-conditional-operator: this codebase's threshold
+#     ladders (battery/volume icon selection) are deliberately written as
+#     vertically-aligned `cond ? a : cond ? b : c` chains, which read as a
+#     lookup table; collapsing them into if/else chains is a net readability
+#     loss for that specific idiom.
+#   readability-isolate-declaration: a handful of `std::string a, b, c;`
+#     locals; splitting them is pure churn for no clarity gain.
+#   readability-function-cognitive-complexity: real signal, but fixing it
+#     means restructuring core event-dispatch functions -- an architectural
+#     change out of scope for a style/lint pass, not a mechanical fix.
+#   readability-named-parameter: fires on the X error handlers' intentionally
+#     unnamed unused parameters (Display*, XErrorEvent*) -- naming them would
+#     immediately trip -Wunused-parameter under this project's -Werror build.
+#   readability-simplify-boolean-expr: its two hits both suggest De Morgan's
+#     on a `!(A && B) && !(A && C)` "is this an exempted click region" guard;
+#     the negated-conjunction form reads as "not in the exempted region",
+#     which is clearer than the expanded disjunction.
+#   modernize-use-trailing-return-type: would rewrite essentially every
+#     function signature in the file for a pure style preference the rest of
+#     the codebase doesn't use.
+#   modernize-avoid-c-arrays: fires mostly on `constexpr const char kIcon[] =
+#     "..."` string-literal constants and fixed C buffers handed to POSIX/X11
+#     APIs (readlink, strftime); std::array buys nothing there.
+#
+# cppcoreguidelines-* is enabled the same way: its "Bounds safety" and "Type
+# safety" profile checks (pro-bounds-*, pro-type-reinterpret-cast,
+# pro-type-vararg, pro-type-union-access, pro-type-const-cast) assume either
+# GSL types (gsl::span, gsl::at, gsl::not_null) this project doesn't depend
+# on, or that C-API interop can be avoided outright -- neither holds for a
+# window manager built on raw Xlib buffers, XEvent (a C union), sockaddr_un,
+# and varargs POSIX calls (execl, snprintf). The rest of the group (the
+# init-variables, rule-of-five, and real narrowing-conversion findings) was
+# reviewed and fixed rather than suppressed -- see backend.hpp/X11Backend's
+# explicit copy/move deletions and the zero-initialized out-params throughout
+# x11_backend.cpp.
+#   avoid-magic-numbers: same reasoning as readability-magic-numbers above.
+#   pro-bounds-array-to-pointer-decay / pro-bounds-pointer-arithmetic /
+#     pro-bounds-constant-array-index: fire on every `buffer[i]` / `array +
+#     offset` against a raw pointer returned by Xlib (XQueryTree's window
+#     list, XGetWindowProperty's property data, Xinerama's screen array) --
+#     the guideline's own enforcement mechanism for this (gsl::span/gsl::at)
+#     isn't part of this project's dependency set.
+#   avoid-c-arrays: same reasoning as modernize-avoid-c-arrays above.
+#   pro-type-reinterpret-cast: the cast between mismatched pointer types
+#     these POSIX/X11 APIs require (sockaddr* <-> sockaddr_un*, unsigned
+#     char* property buffers, FcChar8* for UTF-8 text) -- the APIs' own
+#     shape, not a type-punning bug.
+#   pro-type-vararg: fires on execl/snprintf and Xlib's own variadic-style
+#     property APIs; there's no non-vararg POSIX alternative in use here.
+#   pro-type-union-access: XEvent (and the XClientMessageEvent.data.l[]
+#     inside it) is a C union -- that's the entire X11 event-dispatch
+#     mechanism, not something mep-wm can route around.
+#   pro-type-const-cast: all 4 hits are the same idiom,
+#     `const_cast<XKeyEvent*>(&event)` to call XLookupString, which takes a
+#     non-const event pointer purely because Xlib predates const-correctness
+#     -- it doesn't write through it. The event handlers correctly take
+#     `const XKeyEvent&`; the cast is the bridge, not a const-correctness bug.
+#   narrowing-conversions: same XClientMessageEvent.data.l[]-shape reasoning
+#     as bugprone-narrowing-conversions above (this is cppcoreguidelines' own
+#     copy of that check).
+# avoid-non-const-global-variables is deliberately left enabled (not in the
+# list below) -- the codebase has no global variables left to except. The one
+# that used to trip it (an X-error-handler flag; Xlib's error handler is a
+# plain C callback with no user-data slot, so *some* storage outside the call
+# stack was unavoidable) is now a function-local static reached only through
+# another_window_manager_flag(), which keeps this check meaningful as a
+# regression guard against a new one being added.
+Checks: >
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  modernize-*,
+  cppcoreguidelines-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -performance-enum-size,
+  -portability-avoid-pragma-once,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -readability-braces-around-statements,
+  -readability-magic-numbers,
+  -readability-identifier-length,
+  -readability-implicit-bool-conversion,
+  -readability-math-missing-parentheses,
+  -readability-avoid-nested-conditional-operator,
+  -readability-isolate-declaration,
+  -readability-function-cognitive-complexity,
+  -readability-named-parameter,
+  -readability-simplify-boolean-expr,
+  -modernize-use-trailing-return-type,
+  -modernize-avoid-c-arrays,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -cppcoreguidelines-avoid-c-arrays,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -cppcoreguidelines-pro-type-vararg,
+  -cppcoreguidelines-pro-type-union-access,
+  -cppcoreguidelines-pro-type-const-cast,
+  -cppcoreguidelines-narrowing-conversions
+WarningsAsErrors: ''
+# Anchored on the project directory name rather than a bare '(src|include)/'
+# -- the bare form also matches dependency headers like .../wayland-.../
+# include/wayland-util.h under /nix/store, pulling their macro-heavy
+# (and not ours to fix) warnings into every run.
+HeaderFilterRegex: 'mep-wm/(src|include)/'
+FormatStyle: none

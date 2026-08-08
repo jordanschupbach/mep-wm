@@ -129,7 +129,17 @@ constexpr const char kIconNixOs[] = "\uf313";
 constexpr const char kIconPower[] = "\uf011";
 constexpr const char kIconRestart[] = "\uf021";
 constexpr const char kIconLogout[] = "\uf08b";
-int another_window_manager = 0;
+
+// Xlib's error handler is a plain C function pointer with no user-data slot,
+// so the only way for on_x_error() to report a BadAccess back to the code
+// that triggered it is through storage outside the call stack. A
+// function-local static (Meyer's-singleton style) gives that storage a
+// single, controlled access point instead of a freely-mutable file-scope
+// variable -- no code outside this pair of functions can reach it directly.
+bool& another_window_manager_flag() {
+  static bool flag = false;
+  return flag;
+}
 
 class StartupTimer {
  public:
@@ -156,10 +166,10 @@ enum class Orientation { Vertical, Horizontal };
 enum class LayoutMode { Manual, MasterStack, Monocle };
 enum class SliderKind { Backlight, Volume, Microphone };
 enum class SidePanel { Closed, Notifications, Todos, Agents, Help, Info };
-enum class LauncherMode { Applications, Projects, ActiveProjects, Windows };
+enum class LauncherMode { Applications, Projects, ActiveProjects, Windows, Themes };
 // Note: cannot use "None" as a member name here — X11/X.h (pulled in via
 // Xlib.h) #defines None to 0L, which breaks enum class member declarations.
-enum class InfoAction { NoneAction, Wifi, Bluetooth, Media, Git, Keyboard, Theme };
+enum class InfoAction { NoneAction, Wifi, Bluetooth, Media, Git, Keyboard };
 enum class PomodoroPhase { Idle, Work, Break };
 
 // A leaf's last-arranged screen rect on a given monitor pass. Recorded even
@@ -322,7 +332,7 @@ struct LauncherApp {
 };
 
 int on_x_error(Display*, XErrorEvent* error) {
-  if (error->error_code == BadAccess) another_window_manager = 1;
+  if (error->error_code == BadAccess) another_window_manager_flag() = true;
   return 0;
 }
 
@@ -337,6 +347,16 @@ int on_x_io_error(Display*) { _exit(0); }
 
 class X11Backend final : public Backend {
  public:
+  X11Backend() = default;
+  // Owns a live X display connection plus a pile of raw Xlib/Xft/D-Bus/Lua
+  // handles (see the manual cleanup below), so a copy would double-free or
+  // double-close every one of them; disabled rather than left to the
+  // implicitly-generated (shallow-copying) versions.
+  X11Backend(const X11Backend&) = delete;
+  X11Backend& operator=(const X11Backend&) = delete;
+  X11Backend(X11Backend&&) = delete;
+  X11Backend& operator=(X11Backend&&) = delete;
+
   ~X11Backend() override {
     destroy_ipc();
     if (notification_dbus_) dbus_connection_close(notification_dbus_), dbus_connection_unref(notification_dbus_);
@@ -383,12 +403,12 @@ class X11Backend final : public Backend {
     XSetIOErrorHandler(on_x_io_error);
     cursor_ = XCreateFontCursor(display_, XC_left_ptr);
     XDefineCursor(display_, root_, cursor_);
-    another_window_manager = 0;
+    another_window_manager_flag() = false;
     XSetErrorHandler(on_x_error);
     XSelectInput(display_, root_, SubstructureRedirectMask | SubstructureNotifyMask |
                                       StructureNotifyMask | ButtonPressMask);
     XSync(display_, False);
-    if (another_window_manager) {
+    if (another_window_manager_flag()) {
       throw std::runtime_error("another window manager is already running on this display");
     }
     startup.checkpoint("claim window-manager ownership");
@@ -519,16 +539,13 @@ class X11Backend final : public Backend {
     if (!projects_.empty()) save_projects();
   }
 
+  static bool workspace_has_clients(const Workspace& value) { return value.root || !value.floating.empty(); }
+
   bool project_has_clients(std::size_t index) const {
-    if (index == active_project_index_) {
-      for (const Workspace& value : workspaces_)
-        if (value.root || !value.floating.empty()) return true;
-      return false;
-    }
+    if (index == active_project_index_) return std::any_of(workspaces_.begin(), workspaces_.end(), workspace_has_clients);
     if (index >= projects_.size()) return false;
-    for (const Workspace& value : projects_[index].workspaces)
-      if (value.root || !value.floating.empty()) return true;
-    return false;
+    const auto& workspaces = projects_[index].workspaces;
+    return std::any_of(workspaces.begin(), workspaces.end(), workspace_has_clients);
   }
 
   void switch_project(std::size_t index) {
@@ -553,7 +570,7 @@ class X11Backend final : public Backend {
 
   const Monitor& monitor(std::size_t index) const { return monitors_[std::min(index, monitors_.size() - 1)]; }
 
-  bool contains(const Monitor& candidate, int x, int y) const {
+  static bool contains(const Monitor& candidate, int x, int y) {
     return x >= candidate.x && y >= candidate.y && x < candidate.x + candidate.width &&
            y < candidate.y + candidate.height;
   }
@@ -642,7 +659,7 @@ class X11Backend final : public Backend {
   // themselves, so any compositor-applied alpha on top would let the
   // wallpaper show through them.
   void force_opaque(Window window) {
-    static constexpr unsigned long kOpaque = 0xffffffffu;
+    static constexpr unsigned long kOpaque = 0xffffffffU;
     const Atom opacity_atom = XInternAtom(display_, "_NET_WM_WINDOW_OPACITY", False);
     XChangeProperty(display_, window, opacity_atom, XA_CARDINAL, 32, PropModeReplace,
                     reinterpret_cast<const unsigned char*>(&kOpaque), 1);
@@ -726,14 +743,14 @@ class X11Backend final : public Backend {
       const char* summary = "";
       const char* body = "";
       dbus_uint32_t replaces_id = 0;
-      if (dbus_message_iter_get_arg_type(&iterator) == DBUS_TYPE_STRING) dbus_message_iter_get_basic(&iterator, &app);
+      if (dbus_message_iter_get_arg_type(&iterator) == DBUS_TYPE_STRING) dbus_message_iter_get_basic(&iterator, static_cast<void*>(&app));
       dbus_message_iter_next(&iterator);
       if (dbus_message_iter_get_arg_type(&iterator) == DBUS_TYPE_UINT32) dbus_message_iter_get_basic(&iterator, &replaces_id);
       dbus_message_iter_next(&iterator);  // icon
       dbus_message_iter_next(&iterator);
-      if (dbus_message_iter_get_arg_type(&iterator) == DBUS_TYPE_STRING) dbus_message_iter_get_basic(&iterator, &summary);
+      if (dbus_message_iter_get_arg_type(&iterator) == DBUS_TYPE_STRING) dbus_message_iter_get_basic(&iterator, static_cast<void*>(&summary));
       dbus_message_iter_next(&iterator);
-      if (dbus_message_iter_get_arg_type(&iterator) == DBUS_TYPE_STRING) dbus_message_iter_get_basic(&iterator, &body);
+      if (dbus_message_iter_get_arg_type(&iterator) == DBUS_TYPE_STRING) dbus_message_iter_get_basic(&iterator, static_cast<void*>(&body));
       dbus_message_iter_next(&iterator);  // actions
       dbus_message_iter_next(&iterator);  // hints
       dbus_int32_t timeout_ms = -1;
@@ -776,7 +793,7 @@ class X11Backend final : public Backend {
       dbus_message_iter_init_append(reply, &outer);
       dbus_message_iter_open_container(&outer, DBUS_TYPE_ARRAY, "s", &array);
       const char* capabilities[] = {"body"};
-      for (const char* capability : capabilities) dbus_message_iter_append_basic(&array, DBUS_TYPE_STRING, &capability);
+      for (const char* capability : capabilities) dbus_message_iter_append_basic(&array, DBUS_TYPE_STRING, static_cast<const void*>(&capability));
       dbus_message_iter_close_container(&outer, &array);
       dbus_connection_send(notification_dbus_, reply, nullptr);
       dbus_message_unref(reply);
@@ -849,7 +866,7 @@ class X11Backend final : public Backend {
 
   static int lua_set_mfact(lua_State* state) {
     X11Backend* backend = lua_backend(state);
-    backend->config_.mfact = std::clamp(static_cast<float>(luaL_checknumber(state, 1)), 0.05f, 0.95f);
+    backend->config_.mfact = std::clamp(static_cast<float>(luaL_checknumber(state, 1)), 0.05F, 0.95F);
     backend->arrange();
     return 0;
   }
@@ -981,7 +998,7 @@ class X11Backend final : public Backend {
     X11Backend* backend = lua_backend(state);
     std::string name = luaL_checkstring(state, 1);
     for (char& letter : name) letter = static_cast<char>(std::tolower(static_cast<unsigned char>(letter)));
-    LayoutMode mode;
+    LayoutMode mode = LayoutMode::Manual;
     if (name == "tile" || name == "master" || name == "masterstack" || name == "master-stack") mode = LayoutMode::MasterStack;
     else if (name == "monocle") mode = LayoutMode::Monocle;
     else if (name == "manual" || name == "floating") mode = LayoutMode::Manual;
@@ -1060,7 +1077,7 @@ class X11Backend final : public Backend {
       lua_pop(state, 1);
     };
     string_field("name", &name);
-    string_field("fg", &palette[0]);
+    string_field("fg", palette.data());
     string_field("bg", &palette[1]);
     string_field("selected", &palette[2]);
     const auto it = std::find(backend->theme_names_.begin(), backend->theme_names_.end(), name);
@@ -1151,7 +1168,7 @@ class X11Backend final : public Backend {
     if (ipc_fd_ < 0) return;
     sockaddr_un address{};
     address.sun_family = AF_UNIX;
-    std::strcpy(address.sun_path, ipc_path_.c_str());
+    std::snprintf(address.sun_path, sizeof(address.sun_path), "%s", ipc_path_.c_str());
     unlink(ipc_path_.c_str());
     if (bind(ipc_fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 || listen(ipc_fd_, 8) != 0) {
       close(ipc_fd_); ipc_fd_ = -1; unlink(ipc_path_.c_str());
@@ -1168,17 +1185,28 @@ class X11Backend final : public Backend {
     if (client < 0) return;
     std::string source;
     char buffer[4096];
-    ssize_t count;
+    ssize_t count = 0;
     while ((count = read(client, buffer, sizeof(buffer))) > 0) source.append(buffer, count);
-    if (source.size() > 1024 * 1024) { write(client, "ERR request too large\n", 22); close(client); return; }
+    // Best-effort responses to a local IPC client: if the write fails (the
+    // client already hung up, say) there's nothing to recover -- the reply
+    // is simply lost, same as if the client had closed a second earlier.
+    if (source.size() > 1024 * 1024) {
+      if (write(client, "ERR request too large\n", 22) < 0) { /* client gone */ }
+      close(client);
+      return;
+    }
     if (luaL_loadbuffer(lua_, source.data(), source.size(), "mep-wm-cli") != LUA_OK || lua_pcall(lua_, 0, LUA_MULTRET, 0) != LUA_OK) {
       const std::string error = std::string("ERR ") + lua_tostring(lua_, -1) + "\n";
-      write(client, error.data(), error.size()); lua_pop(lua_, 1); close(client); return;
+      if (write(client, error.data(), error.size()) < 0) { /* client gone */ }
+      lua_pop(lua_, 1);
+      close(client);
+      return;
     }
     const int results = lua_gettop(lua_);
     for (int index = 1; index <= results; ++index) {
-      size_t length; const char* value = luaL_tolstring(lua_, index, &length);
-      write(client, value, length); write(client, "\n", 1); lua_pop(lua_, 1);
+      size_t length = 0; const char* value = luaL_tolstring(lua_, index, &length);
+      if (write(client, value, length) < 0 || write(client, "\n", 1) < 0) { /* client gone */ }
+      lua_pop(lua_, 1);
     }
     lua_settop(lua_, 0);
     close(client);
@@ -1268,8 +1296,8 @@ class X11Backend final : public Backend {
   }
 
   bool is_dialog_window_type(Window window) const {
-    Atom actual_type;
-    int actual_format;
+    Atom actual_type = None;
+    int actual_format = 0;
     unsigned long count = 0, remaining = 0;
     unsigned char* data = nullptr;
     bool result = false;
@@ -1372,8 +1400,8 @@ class X11Backend final : public Backend {
   }
 
   void update_tray_icon_state(TrayIcon& icon) {
-    Atom actual_type;
-    int format;
+    Atom actual_type = None;
+    int format = 0;
     unsigned long count = 0, remaining = 0;
     unsigned char* data = nullptr;
     if (XGetWindowProperty(display_, icon.window, xembed_info_atom_, 0, 2, False, xembed_info_atom_,
@@ -1408,8 +1436,10 @@ class X11Backend final : public Backend {
       XMapRaised(display_, icon.window);
       x += icon.width + kTraySpacing;
     }
-    XMoveResizeWindow(display_, tray_, DisplayWidth(display_, screen_) - kDockWidth - width, 0, width, kBarHeight);
-    XMapRaised(display_, tray_);
+    XMoveResizeWindow(display_, tray_, tray_widget_x_, 0, width, kBarHeight);
+    // Follows the bar's own visibility (mod+b) instead of always staying
+    // mapped -- it's chrome like the bar/docks, not an independent window.
+    if (bars_visible_) XMapRaised(display_, tray_);
   }
 
   void dock_tray_icon(Window window) {
@@ -1495,7 +1525,7 @@ class X11Backend final : public Backend {
     XftDraw* draw = XftDrawCreate(display_, window, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_));
     int cursor = x;
     for (std::size_t offset = 0; draw && offset < value.size();) {
-      FcChar32 codepoint;
+      FcChar32 codepoint = 0;
       const std::size_t bytes = utf8_codepoint(value, offset, &codepoint);
       XftFont* font = XftCharExists(display_, bar_font_, codepoint) ? bar_font_ : fallback_font(codepoint);
       XftDrawStringUtf8(draw, &color, font, cursor, baseline,
@@ -1599,7 +1629,10 @@ class X11Backend final : public Backend {
       while (dirent* entry = readdir(directory)) {
         const std::string name(entry->d_name);
         if (name.size() < 6 || name.substr(name.size() - 5) != ".json" || agents_.size() >= 64) continue;
-        std::ifstream file(status_dir + "/" + name);
+        std::string entry_path = status_dir;
+        entry_path += '/';
+        entry_path += name;
+        std::ifstream file(entry_path);
         const std::string json((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
         AgentStatus agent;
         agent.kind = field(json, "agent");
@@ -1608,7 +1641,7 @@ class X11Backend final : public Backend {
         agent.label = field(json, "label");
         if (agent.kind.empty() || agent.status.empty() || agent.cwd.empty()) continue;
         agent.from_file = true;
-        agent.file_path = status_dir + "/" + name;
+        agent.file_path = std::move(entry_path);
         agent.needs_input = agent.status == "needs_input";
         if (agent.needs_input) ++agent_needs_input_;
         agents_.push_back(std::move(agent));
@@ -1629,7 +1662,8 @@ class X11Backend final : public Backend {
         cwd[length] = '\0';
         auto existing = std::find_if(agents_.begin(), agents_.end(), [&](const AgentStatus& a) { return a.kind == kind && a.cwd == cwd; });
         if (existing != agents_.end()) { existing->pid = static_cast<pid_t>(std::atoi(name.c_str())); continue; }
-        agents_.push_back({static_cast<pid_t>(std::atoi(name.c_str())), kind, "running", "running", cwd});
+        agents_.push_back({static_cast<pid_t>(std::atoi(name.c_str())), kind, "running", "running", cwd,
+                          /*file_path=*/"", /*from_file=*/false, /*needs_input=*/false});
       }
       closedir(directory);
     }
@@ -1783,7 +1817,7 @@ class X11Backend final : public Backend {
       }
     }
     XkbStateRec keyboard_state{};
-    if (XkbGetState(display_, XkbUseCoreKbd, &keyboard_state) == Success && keyboard_state.group >= 0 &&
+    if (XkbGetState(display_, XkbUseCoreKbd, &keyboard_state) == Success &&
         static_cast<std::size_t>(keyboard_state.group) < keyboard_layouts_.size())
       keyboard_layout_ = keyboard_layouts_[keyboard_state.group];
     const std::string volume = capture_command("amixer get Master 2>/dev/null");
@@ -1994,7 +2028,7 @@ class X11Backend final : public Backend {
     if (slider_window_ != None) XUnmapWindow(display_, slider_window_);
   }
 
-  void open_slider_popup(SliderKind kind) {
+  void open_slider_popup(SliderKind kind, int anchor_x = -1) {
     slider_kind_ = kind;
     refresh_widgets();
     if (slider_window_ == None) {
@@ -2009,8 +2043,10 @@ class X11Backend final : public Backend {
       XDefineCursor(display_, slider_window_, cursor_);
     }
     const Monitor& target = monitor(current_monitor_);
-    XMoveResizeWindow(display_, slider_window_, target.x + (target.width - 240) / 2,
-                      target.y + target.height - 2 * kBarHeight - 72, 240, 64);
+    const int min_x = target.x + kDockWidth;
+    const int max_x = target.x + target.width - kDockWidth - 240;
+    const int x = anchor_x >= 0 ? std::clamp(anchor_x - 120, min_x, max_x) : target.x + (target.width - 240) / 2;
+    XMoveResizeWindow(display_, slider_window_, x, target.y + target.height - 2 * kBarHeight - 72, 240, 64);
     slider_visible_ = true;
     XMapRaised(display_, slider_window_);
     draw_slider_popup();
@@ -2379,10 +2415,10 @@ class X11Backend final : public Backend {
     return side_panel_close_x() - 16 - text_width("clear");
   }
 
-  int side_panel_close_x() const { return kSidePanelWidth - kSidePanelCloseMargin - kSidePanelCloseSize; }
-  int side_panel_close_y() const { return (kBarHeight - kSidePanelCloseSize) / 2; }
+  static int side_panel_close_x() { return kSidePanelWidth - kSidePanelCloseMargin - kSidePanelCloseSize; }
+  static int side_panel_close_y() { return (kBarHeight - kSidePanelCloseSize) / 2; }
 
-  bool side_panel_close_hit(int x, int y) const {
+  static bool side_panel_close_hit(int x, int y) {
     const int x1 = side_panel_close_x();
     const int y1 = side_panel_close_y();
     return x >= x1 && x < x1 + kSidePanelCloseSize && y >= y1 && y < y1 + kSidePanelCloseSize;
@@ -2392,7 +2428,7 @@ class X11Backend final : public Backend {
   // the keyboard while open (Escape closes, ? toggles a contextual help
   // layer) and reserve a footer row for that "? Toggle help" hint. Help is
   // already nothing but keybindings, so it's excluded from both.
-  bool side_panel_grabs_keyboard(SidePanel panel) const {
+  static bool side_panel_grabs_keyboard(SidePanel panel) {
     return panel == SidePanel::Notifications || panel == SidePanel::Todos ||
            panel == SidePanel::Agents || panel == SidePanel::Info;
   }
@@ -2407,7 +2443,7 @@ class X11Backend final : public Backend {
     return std::max(1, monitor(side_panel_monitor_).height - 3 * kBarHeight - side_panel_footer_height());
   }
 
-  bool side_panel_footer_hit(int x, int y, int panel_height) const {
+  bool side_panel_footer_hit(int y, int panel_height) const {
     const int top = panel_height - side_panel_footer_height();
     return side_panel_footer_height() > 0 && y >= top && y < panel_height;
   }
@@ -2437,8 +2473,13 @@ class X11Backend final : public Backend {
     constexpr int width = kSidePanelWidth;
     const Monitor& target = monitor(side_panel_monitor_);
     const int height = std::max(1, target.height - 2 * kBarHeight);
-    XMoveResizeWindow(display_, side_panel_window_, target.x + target.width - kDockWidth - width,
-                      target.y + kBarHeight, width, height);
+    // Anchored triggers (a bottom-bar widget click) center the panel above
+    // the widget; everything else (keybindings, right-dock rows that already
+    // sit flush against this edge) keeps the original right-edge placement.
+    const int min_x = target.x + kDockWidth;
+    const int max_x = target.x + target.width - kDockWidth - width;
+    const int panel_x = side_panel_anchor_x_ >= 0 ? std::clamp(side_panel_anchor_x_ - width / 2, min_x, max_x) : max_x;
+    XMoveResizeWindow(display_, side_panel_window_, panel_x, target.y + kBarHeight, width, height);
     XSetForeground(display_, bar_gc_, bar_background_.pixel);
     XFillRectangle(display_, side_panel_window_, bar_gc_, 0, 0, width, height);
     std::string title;
@@ -2470,21 +2511,14 @@ class X11Backend final : public Backend {
     // Every row is drawn as a rounded card (bar_card_, or bar_selected_ when
     // highlighted) so all five side panels share one look, rather than only
     // the selected row standing out against a flat background.
-    // swatch_pixel, when non-zero, draws a small filled circle at the row's
-    // right edge -- used by the theme panel so each entry previews its
-    // accent color instead of relying on name alone to tell ~15 themes apart.
-    auto row = [&](const std::string& text, bool selected = false, unsigned long swatch_pixel = 0) {
-      if (y + kBarHeight > kBarHeight && y < content_bottom && !text.empty()) {
+    auto row = [&](const std::string& text, bool selected = false) {
+      if (y > 0 && y < content_bottom && !text.empty()) {
         XSetForeground(display_, bar_gc_, (selected ? bar_selected_ : bar_card_).pixel);
         fill_rounded_rect(side_panel_window_, 8, y, width - 16, kBarHeight, kSidePanelCardRadius);
       }
-      if (y + kBarHeight > kBarHeight && y < content_bottom)
+      if (y > 0 && y < content_bottom)
         draw_dock_text(side_panel_window_, 16, y + (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2,
-                       ellipsize(text, width - (swatch_pixel ? 64 : 32)), selected ? bar_background_ : bar_foreground_);
-      if (swatch_pixel && y + kBarHeight > kBarHeight && y < content_bottom) {
-        XSetForeground(display_, bar_gc_, swatch_pixel);
-        XFillArc(display_, side_panel_window_, bar_gc_, width - 16 - 8 - 16, y + (kBarHeight - 16) / 2, 16, 16, 0, 360 * 64);
-      }
+                       ellipsize(text, width - 32), selected ? bar_background_ : bar_foreground_);
       side_panel_rows_.push_back(y);
       y += kBarHeight + kSidePanelRowGap;
     };
@@ -2527,20 +2561,26 @@ class X11Backend final : public Backend {
         todo_row(todo_row_text(todos_[index]), !todo_input_active_ && static_cast<int>(index) == todo_selected_);
     } else if (side_panel_ == SidePanel::Agents) {
       if (agents_.empty()) row("No coding agents are running");
-      for (const AgentStatus& agent : agents_)
-        row(agent.kind + " " + agent.status + ": " + (agent.label.empty() ? agent.cwd : agent.label), agent.needs_input);
+      for (const AgentStatus& agent : agents_) {
+        std::string line = agent.kind;
+        line += ' ';
+        line += agent.status;
+        line += ": ";
+        line += agent.label.empty() ? agent.cwd : agent.label;
+        row(line, agent.needs_input);
+      }
     } else if (side_panel_ == SidePanel::Help) {
-      for (const auto& [spec, description] : compiled_keybind_help()) row(spec + "  " + description);
+      for (const auto& [spec, description] : compiled_keybind_help()) {
+        std::string line = spec;
+        line += "  ";
+        line += description;
+        row(line);
+      }
       if (!lua_keybinds_.empty()) {
         row("");
         row("-- from config.lua --");
         for (const LuaKeybind& binding : lua_keybinds_)
           row(binding.spec + "  " + (binding.description.empty() ? "(no description)" : binding.description));
-      }
-    } else if (info_action_ == InfoAction::Theme) {
-      for (std::size_t index = 0; index < theme_names_.size(); ++index) {
-        const bool active = static_cast<int>(index) == theme_index_;
-        row((active ? "* " : "  ") + theme_names_[index], active, alloc_color(theme_palettes_[index][2]));
       }
     } else {
       std::istringstream lines(info_panel_body_);
@@ -2594,8 +2634,9 @@ class X11Backend final : public Backend {
     draw_docks();
   }
 
-  void toggle_side_panel(SidePanel panel) {
+  void toggle_side_panel(SidePanel panel, int anchor_x = -1) {
     if (side_panel_ == panel) { close_side_panel(); return; }
+    side_panel_anchor_x_ = anchor_x;
     if (side_panel_window_ == None) {
       XSetWindowAttributes attributes{};
       attributes.override_redirect = True;
@@ -2647,7 +2688,7 @@ class X11Backend final : public Backend {
   // seconds under a minute, just minutes under an hour, hours+minutes above
   // that -- never more than two units at once.
   static std::string format_elapsed(std::time_t seconds) {
-    if (seconds < 0) seconds = 0;
+    seconds = std::max<std::time_t>(seconds, 0);
     if (seconds < 60) return std::to_string(seconds) + "s";
     const long total_minutes = seconds / 60;
     if (total_minutes < 60) return std::to_string(total_minutes) + "m";
@@ -2658,7 +2699,7 @@ class X11Backend final : public Backend {
     return buffer;
   }
 
-  std::string todo_row_text(const TodoItem& todo) const {
+  static std::string todo_row_text(const TodoItem& todo) {
     if (!todo.active) return "[ ] " + todo.text;
     return "[*] " + todo.text + "  (" + format_elapsed(std::time(nullptr) - todo.clock_start) + ")";
   }
@@ -2763,23 +2804,25 @@ class X11Backend final : public Backend {
     }
   }
 
-  void open_info_panel(const std::string& title, const std::string& body) {
+  void open_info_panel(const std::string& title, const std::string& body, int anchor_x = -1) {
     info_panel_title_ = title;
     info_panel_body_ = body;
     info_action_ = InfoAction::NoneAction;
+    side_panel_anchor_x_ = anchor_x;
     if (side_panel_ == SidePanel::Info) draw_side_panel();
-    else toggle_side_panel(SidePanel::Info);
+    else toggle_side_panel(SidePanel::Info, anchor_x);
   }
 
-  void open_action_panel(InfoAction action, const std::string& title, const std::string& body) {
+  void open_action_panel(InfoAction action, const std::string& title, const std::string& body, int anchor_x = -1) {
     info_action_ = action;
     info_panel_title_ = title;
     info_panel_body_ = body;
+    side_panel_anchor_x_ = anchor_x;
     if (side_panel_ == SidePanel::Info) draw_side_panel();
-    else toggle_side_panel(SidePanel::Info);
+    else toggle_side_panel(SidePanel::Info, anchor_x);
   }
 
-  void spawn_argv(std::vector<std::string> arguments) const {
+  static void spawn_argv(std::vector<std::string> arguments) {
     if (arguments.empty()) return;
     const pid_t child = fork();
     if (child < 0) return;
@@ -2795,7 +2838,7 @@ class X11Backend final : public Backend {
     signal(SIGCHLD, SIG_IGN);
   }
 
-  void open_wifi_panel() {
+  void open_wifi_panel(int anchor_x = -1) {
     wifi_networks_.clear();
     const std::string output = capture_command("nmcli -t -f ACTIVE,SSID,SECURITY dev wifi list --rescan no 2>/dev/null");
     std::istringstream lines(output);
@@ -2811,10 +2854,10 @@ class X11Backend final : public Backend {
     for (const WifiNetwork& network : wifi_networks_)
       body += "\n" + std::string(network.secured ? "[lock] " : "") + network.ssid + (network.active ? " (connected)" : "");
     if (wifi_networks_.empty()) body += "\nNo networks found";
-    open_action_panel(InfoAction::Wifi, "Wi-Fi", body);
+    open_action_panel(InfoAction::Wifi, "Wi-Fi", body, anchor_x);
   }
 
-  void open_bluetooth_panel() {
+  void open_bluetooth_panel(int anchor_x = -1) {
     bluetooth_devices_.clear();
     const std::string connected = capture_command("bluetoothctl devices Connected 2>/dev/null");
     const std::string output = capture_command("bluetoothctl paired-devices 2>/dev/null");
@@ -2830,39 +2873,34 @@ class X11Backend final : public Backend {
     for (const BluetoothDevice& device : bluetooth_devices_)
       body += "\n" + device.name + (device.connected ? " (connected)" : "");
     if (bluetooth_devices_.empty()) body += "\nNo paired devices";
-    open_action_panel(InfoAction::Bluetooth, "Bluetooth", body);
+    open_action_panel(InfoAction::Bluetooth, "Bluetooth", body, anchor_x);
   }
 
-  void open_media_panel() {
+  void open_media_panel(int anchor_x = -1) {
     open_action_panel(InfoAction::Media, "Media", media_title_.empty() ? "No active player" :
-                      media_title_ + "\nPrevious   Play/Pause   Next");
+                      media_title_ + "\nPrevious   Play/Pause   Next", anchor_x);
   }
 
-  void open_keyboard_panel() {
+  void open_keyboard_panel(int anchor_x = -1) {
     std::string body;
     for (std::size_t index = 0; index < keyboard_layouts_.size(); ++index)
       body += (index ? "\n" : "") + std::string(index < keyboard_layouts_.size() && keyboard_layouts_[index] == keyboard_layout_ ? "• " : "  ") + keyboard_layouts_[index];
-    open_action_panel(InfoAction::Keyboard, "Keyboard layout", body.empty() ? "No layouts configured" : body);
+    open_action_panel(InfoAction::Keyboard, "Keyboard layout", body.empty() ? "No layouts configured" : body, anchor_x);
   }
-
-  // The body text is unused for InfoAction::Theme -- draw_side_panel() has a
-  // dedicated branch that renders theme_names_/theme_palettes_ directly
-  // (with accent-color swatches) instead of the generic body-as-lines path.
-  void open_theme_panel() { open_action_panel(InfoAction::Theme, "Theme", "themes"); }
 
   void handle_side_panel_button(const XButtonEvent& event) {
     if (event.window != side_panel_window_) return;
     const int panel_height = std::max(1, monitor(side_panel_monitor_).height - 2 * kBarHeight);
     if (event.button == Button3) { close_side_panel(); return; }
     if (event.button == Button1 && side_panel_close_hit(event.x, event.y)) { close_side_panel(); return; }
-    if (event.button == Button1 && side_panel_footer_hit(event.x, event.y, panel_height)) {
+    if (event.button == Button1 && side_panel_footer_hit(event.y, panel_height)) {
       side_panel_help_visible_ = !side_panel_help_visible_;
       draw_side_panel();
       return;
     }
     if (event.button == Button4 || event.button == Button5) {
       const int delta = event.button == Button4 ? -3 * (kBarHeight + kSidePanelRowGap) : 3 * (kBarHeight + kSidePanelRowGap);
-      int max_scroll;
+      int max_scroll = 0;
       if (side_panel_ == SidePanel::Todos && !side_panel_help_visible_) {
         max_scroll = std::max(0, todo_content_height() - side_panel_visible_height());
       } else {
@@ -2886,7 +2924,7 @@ class X11Backend final : public Backend {
       refresh_agents(); draw_side_panel(); draw_docks(); return;
     }
     if (side_panel_help_visible_) return;
-    const int row = static_cast<int>((event.y - kBarHeight - 6 + side_panel_scroll_offset_) / (kBarHeight + kSidePanelRowGap));
+    const int row = (event.y - kBarHeight - 6 + side_panel_scroll_offset_) / (kBarHeight + kSidePanelRowGap);
     if (row < 0) return;
     if (side_panel_ == SidePanel::Info && event.button == Button1) {
       if (info_action_ == InfoAction::Wifi) {
@@ -2905,24 +2943,29 @@ class X11Backend final : public Backend {
       } else if (info_action_ == InfoAction::Keyboard && static_cast<std::size_t>(row) < keyboard_layouts_.size()) {
         XkbLockGroup(display_, XkbUseCoreKbd, row);
         widgets_refreshed_ = 0;
-      } else if (info_action_ == InfoAction::Theme && row >= 0 && static_cast<std::size_t>(row) < theme_palettes_.size()) {
-        const int direction = row - theme_index_;
-        if (direction) cycle_theme(direction);
       } else if (info_action_ == InfoAction::Git) {
         const char* project = std::getenv("MEPWM_PROJECT_DIR");
         if (project && *project) {
           const pid_t child = fork();
-          if (child == 0) { setsid(); chdir(project); execl("/bin/sh", "sh", "-c", config_.terminal.c_str(), static_cast<char*>(nullptr)); _exit(127); }
+          if (child == 0) {
+            setsid();
+            // Best-effort: if the project directory disappeared, still open
+            // the terminal (just in whatever the fork inherited as cwd)
+            // rather than not opening one at all.
+            if (chdir(project) != 0) { /* fall through in inherited cwd */ }
+            execl("/bin/sh", "sh", "-c", config_.terminal.c_str(), static_cast<char*>(nullptr));
+            _exit(127);
+          }
         }
       }
       widgets_refreshed_ = 0;
       return;
     }
     if (side_panel_ == SidePanel::Notifications && static_cast<std::size_t>(row / 2) < notifications_.size()) {
-      const std::size_t notification_index = static_cast<std::size_t>(row / 2);
+      const auto notification_index = static_cast<std::size_t>(row / 2);
       if (event.button == Button2) {
         const unsigned int id = notifications_[notification_index].id;
-        notifications_.erase(notifications_.begin() + notification_index);
+        notifications_.erase(notifications_.begin() + static_cast<std::ptrdiff_t>(notification_index));
         emit_notification_closed(id, 2);
       } else {
         notifications_[notification_index].unread = false;
@@ -2940,7 +2983,7 @@ class X11Backend final : public Backend {
           unsigned char* value = nullptr;
           if (XGetWindowProperty(display_, entry.first, net_wm_pid_atom_, 0, 1, False, XA_CARDINAL,
                                  &type, &format, &count, &after, &value) == Success && value) {
-            const pid_t window_pid = static_cast<pid_t>(*reinterpret_cast<unsigned long*>(value));
+            const auto window_pid = static_cast<pid_t>(*reinterpret_cast<unsigned long*>(value));
             XFree(value);
             if (window_pid == agent_pid) { focus(entry.first); close_side_panel(); return; }
           }
@@ -3046,6 +3089,14 @@ class X11Backend final : public Backend {
     border_focused_pixel_ = alloc_color(palette[2]);
     border_normal_pixel_ = alloc_color(mix_hex(palette[1], palette[0], 0.35));
     refresh_all_borders();
+    // The tray window itself (not just its icons) paints the gap between
+    // icons, so it needs to follow the theme too -- otherwise it stays the
+    // hardcoded black it's bootstrapped with in create_tray() (before the
+    // first theme is applied) and reads as a stray black patch in the bar.
+    if (tray_ != None) {
+      XSetWindowBackground(display_, tray_, bar_background_.pixel);
+      XClearWindow(display_, tray_);
+    }
     draw_bar(); draw_docks();
     refresh_wallpaper();
   }
@@ -3124,7 +3175,7 @@ class X11Backend final : public Backend {
       const int b = std::clamp(static_cast<int>(std::lround(ab + (bb - ab) * t)), 0, 255);
       char buffer[8];
       std::snprintf(buffer, sizeof(buffer), "#%02x%02x%02x", r, g, b);
-      return std::string(buffer);
+      return {buffer};
     } catch (const std::exception&) {
       return hex_a;
     }
@@ -3164,7 +3215,7 @@ class X11Backend final : public Backend {
   // No caching: this only runs on theme switches (rare -- a keypress or a
   // reload), so re-reading a small directory each time is cheap and avoids
   // having to invalidate a cache when mwm.set_wallpapers() changes the dirs.
-  std::vector<std::string> scan_wallpaper_dir(const std::string& raw_dir) const {
+  static std::vector<std::string> scan_wallpaper_dir(const std::string& raw_dir) {
     std::vector<std::string> result;
     if (raw_dir.empty()) return result;
     std::filesystem::path dir(raw_dir);
@@ -3192,7 +3243,7 @@ class X11Backend final : public Backend {
     return result;
   }
 
-  void run_feh_bg_fill(const std::string& path) {
+  static void run_feh_bg_fill(const std::string& path) {
     const pid_t child = fork();
     if (child < 0) {
       std::cerr << "mepwm: could not set wallpaper: " << std::strerror(errno) << '\n';
@@ -3275,40 +3326,43 @@ class X11Backend final : public Backend {
       return event.x >= item.left && event.x < item.right;
     });
     if (hit == bottom_widget_hits_.end()) return;
+    // Screen-space x of the clicked widget's center, so whatever popup it
+    // opens (side panel or slider) lands above it instead of at a fixed spot.
+    const int anchor_x = monitor(current_monitor_).x + (hit->left + hit->right) / 2;
     if (hit->id == "todo-active" && event.button == Button1) {
-      toggle_side_panel(SidePanel::Todos);
+      toggle_side_panel(SidePanel::Todos, anchor_x);
     } else if (hit->id == "backlight") {
-      if (event.button == Button1) slider_visible_ && slider_kind_ == SliderKind::Backlight ? close_slider_popup() : open_slider_popup(SliderKind::Backlight);
+      if (event.button == Button1) slider_visible_ && slider_kind_ == SliderKind::Backlight ? close_slider_popup() : open_slider_popup(SliderKind::Backlight, anchor_x);
       if (event.button == Button4) adjust_backlight(5);
       if (event.button == Button3 || event.button == Button5) adjust_backlight(-5);
     } else if (hit->id == "volume") {
-      if (event.button == Button1) slider_visible_ && slider_kind_ == SliderKind::Volume ? close_slider_popup() : open_slider_popup(SliderKind::Volume);
+      if (event.button == Button1) slider_visible_ && slider_kind_ == SliderKind::Volume ? close_slider_popup() : open_slider_popup(SliderKind::Volume, anchor_x);
       if (event.button == Button2) spawn_command("amixer -q set Master toggle");
       if (event.button == Button4) spawn_command("amixer -q set Master 5%+ unmute");
       if (event.button == Button3 || event.button == Button5) spawn_command("amixer -q set Master 5%- unmute");
       widgets_refreshed_ = 0;
     } else if (hit->id == "mic") {
-      if (event.button == Button1) slider_visible_ && slider_kind_ == SliderKind::Microphone ? close_slider_popup() : open_slider_popup(SliderKind::Microphone);
+      if (event.button == Button1) slider_visible_ && slider_kind_ == SliderKind::Microphone ? close_slider_popup() : open_slider_popup(SliderKind::Microphone, anchor_x);
       if (event.button == Button2) spawn_command("amixer -q set Capture toggle");
       if (event.button == Button4) spawn_command("amixer -q set Capture 5%+ unmute");
       if (event.button == Button3 || event.button == Button5) spawn_command("amixer -q set Capture 5%- unmute");
       widgets_refreshed_ = 0;
     } else if (hit->id == "media") {
-      if (event.button == Button1) open_media_panel();
+      if (event.button == Button1) open_media_panel(anchor_x);
       if (event.button == Button2) spawn_command("playerctl play-pause");
       if (event.button == Button4) spawn_command("playerctl next");
       if (event.button == Button5) spawn_command("playerctl previous");
       widgets_refreshed_ = 0;
     } else if (hit->id == "wifi" && event.button == Button1) {
-      open_wifi_panel();
+      open_wifi_panel(anchor_x);
     } else if (hit->id == "bluetooth" && event.button == Button1) {
-      open_bluetooth_panel();
+      open_bluetooth_panel(anchor_x);
     } else if (hit->id == "theme") {
       if (event.button == Button1 || event.button == Button4) cycle_theme(1);
       if (event.button == Button3 || event.button == Button5) cycle_theme(-1);
-      if (event.button == Button2) open_theme_panel();
+      if (event.button == Button2) toggle_theme_picker();
     } else if (hit->id == "keyboard") {
-      if (event.button == Button1) open_keyboard_panel();
+      if (event.button == Button1) open_keyboard_panel(anchor_x);
       if (event.button == Button4) cycle_keyboard_layout();
       if (event.button == Button5 && keyboard_layouts_.size() > 1) {
         XkbStateRec state{};
@@ -3317,11 +3371,11 @@ class X11Backend final : public Backend {
         widgets_refreshed_ = 0;
       }
     } else if (event.button == Button1) {
-      if (hit->id == "git") open_action_panel(InfoAction::Git, "Git", git_status_.empty() ? "No repository selected" : git_status_ + "\nClick to open terminal here");
-      if (hit->id == "battery") open_info_panel("Battery", battery_percent_ < 0 ? "No battery detected" : std::to_string(battery_percent_) + "%");
-      if (hit->id == "cpu") open_info_panel("CPU", cpu_percent_ < 0 ? "Collecting samples" : std::to_string(cpu_percent_) + "% in use");
-      if (hit->id == "memory") open_info_panel("Memory", std::to_string(mem_percent_) + "% in use");
-      if (hit->id == "disk") open_info_panel("Disk", std::to_string(disk_percent_) + "% in use");
+      if (hit->id == "git") open_action_panel(InfoAction::Git, "Git", git_status_.empty() ? "No repository selected" : git_status_ + "\nClick to open terminal here", anchor_x);
+      if (hit->id == "battery") open_info_panel("Battery", battery_percent_ < 0 ? "No battery detected" : std::to_string(battery_percent_) + "%", anchor_x);
+      if (hit->id == "cpu") open_info_panel("CPU", cpu_percent_ < 0 ? "Collecting samples" : std::to_string(cpu_percent_) + "% in use", anchor_x);
+      if (hit->id == "memory") open_info_panel("Memory", std::to_string(mem_percent_) + "% in use", anchor_x);
+      if (hit->id == "disk") open_info_panel("Disk", std::to_string(disk_percent_) + "% in use", anchor_x);
     }
   }
 
@@ -3343,6 +3397,7 @@ class X11Backend final : public Backend {
           case 5: spawn_command("code"); break;
           case 6: spawn_command("if command -v nix >/dev/null 2>&1; then exec nix run 'git:jordanschupbach/emc' --refresh; else exec emacs; fi"); break;
           case 7: spawn_command("${TERMINAL:-xterm} -e nvim"); break;
+          default: break;  // click landed past the last icon -- no-op
         }
       }
     } else if (event.window == dock.bottom) {
@@ -3370,7 +3425,11 @@ class X11Backend final : public Backend {
   static std::string hint_label(std::size_t index, std::size_t total) {
     static constexpr char kCharset[] = "asdfghjklqwertyuiopzxcvbnm";
     constexpr std::size_t kBase = 26;
-    if (total <= kBase) return std::string(1, kCharset[index]);
+    // Deliberately not braced-init ({1, kCharset[index]}): std::string's
+    // initializer_list<char> constructor would win overload resolution over
+    // the (count, ch) one there, producing a 2-char string ('\x01' + the
+    // letter) instead of the single repeated character this needs.
+    if (total <= kBase) return std::string(1, kCharset[index]);  // NOLINT(modernize-return-braced-init-list)
     const std::size_t first = std::min(index / kBase, kBase - 1);
     return std::string(1, kCharset[first]) + kCharset[index % kBase];
   }
@@ -3638,7 +3697,7 @@ class X11Backend final : public Backend {
     FcCharSetDestroy(charset);
     FcConfigSubstitute(nullptr, pattern, FcMatchPattern);
     FcDefaultSubstitute(pattern);
-    FcResult result;
+    FcResult result{};
     FcPattern* matched = XftFontMatch(display_, screen_, pattern, &result);
     FcPatternDestroy(pattern);
     XftFont* font = matched ? XftFontOpenPattern(display_, matched) : nullptr;
@@ -3648,14 +3707,14 @@ class X11Backend final : public Backend {
   }
 
   static std::size_t utf8_codepoint(const std::string& text, std::size_t offset, FcChar32* codepoint) {
-    const unsigned char first = static_cast<unsigned char>(text[offset]);
+    const auto first = static_cast<unsigned char>(text[offset]);
     if (first < 0x80) { *codepoint = first; return 1; }
     const int bytes = (first & 0xe0) == 0xc0 ? 2 : (first & 0xf0) == 0xe0 ? 3 :
                       (first & 0xf8) == 0xf0 ? 4 : 1;
     if (offset + static_cast<std::size_t>(bytes) > text.size()) { *codepoint = 0xfffd; return 1; }
-    FcChar32 value = first & ((1u << (7 - bytes)) - 1);
+    FcChar32 value = first & ((1U << (7 - bytes)) - 1);
     for (int index = 1; index < bytes; ++index) {
-      const unsigned char next = static_cast<unsigned char>(text[offset + index]);
+      const auto next = static_cast<unsigned char>(text[offset + index]);
       if ((next & 0xc0) != 0x80) { *codepoint = 0xfffd; return 1; }
       value = (value << 6) | (next & 0x3f);
     }
@@ -3666,7 +3725,7 @@ class X11Backend final : public Backend {
   int text_width(const std::string& value) {
     int width = 0;
     for (std::size_t offset = 0; offset < value.size();) {
-      FcChar32 codepoint;
+      FcChar32 codepoint = 0;
       const std::size_t bytes = utf8_codepoint(value, offset, &codepoint);
       XGlyphInfo extent{};
       XftTextExtentsUtf8(display_, XftCharExists(display_, bar_font_, codepoint) ? bar_font_ : fallback_font(codepoint),
@@ -3684,7 +3743,7 @@ class X11Backend final : public Backend {
     int width = 0;
     std::size_t offset = 0;
     while (offset < text.size()) {
-      FcChar32 codepoint;
+      FcChar32 codepoint = 0;
       const std::size_t bytes = utf8_codepoint(text, offset, &codepoint);
       XGlyphInfo extent{};
       XftTextExtentsUtf8(display_, XftCharExists(display_, bar_font_, codepoint) ? bar_font_ : fallback_font(codepoint),
@@ -3741,7 +3800,8 @@ class X11Backend final : public Backend {
       std::string& last = lines.back();
       const int ellipsis_width = text_width("…");
       const std::size_t keep = fit_prefix_bytes(last, std::max(0, max_width - ellipsis_width));
-      last = last.substr(0, keep) + "…";
+      last.resize(keep);
+      last += "…";
     }
     return lines;
   }
@@ -3749,7 +3809,7 @@ class X11Backend final : public Backend {
   void draw_text(int x, const std::string& value, const XftColor& color) {
     int cursor = x;
     for (std::size_t offset = 0; offset < value.size();) {
-      FcChar32 codepoint;
+      FcChar32 codepoint = 0;
       const std::size_t bytes = utf8_codepoint(value, offset, &codepoint);
       XftFont* font = XftCharExists(display_, bar_font_, codepoint) ? bar_font_ : fallback_font(codepoint);
       XftDrawStringUtf8(bar_xft_draw_, &color, font, cursor,
@@ -3889,7 +3949,7 @@ class X11Backend final : public Backend {
 
     const std::string clock_widget = std::string(kIconClock) + " " + clock_text_;
     const int clock_width = text_width(clock_widget) + 32;
-    const int clock_x = width - kDockWidth - clock_width - tray_pixel_width();
+    const int clock_x = width - kDockWidth - clock_width;
     text(clock_x, clock_widget, bar_foreground_);
 
     // Pomodoro widget: sits just left of the clock, at the front of the
@@ -3912,13 +3972,23 @@ class X11Backend final : public Backend {
     }
     text(pomodoro_widget_x + 12, pomodoro_widget_text, pomodoro_phase_ == PomodoroPhase::Idle ? bar_foreground_ : bar_background_);
 
+    // Tray sits at the front (left edge) of the right-side widget cluster,
+    // just left of the pomodoro widget, instead of wedged between the clock
+    // and the power-menu corner -- update_tray() reads this whenever it
+    // redraws independently of the bar (an icon docking/undocking).
+    tray_widget_x_ = pomodoro_widget_x - 16 - tray_pixel_width();
+
     task_hits_.clear();
     std::vector<Window> windows;
     collect_windows(workspace().root.get(), windows);
     windows.insert(windows.end(), workspace().floating.begin(), workspace().floating.end());
     bar_task_list_x_ = layout_widget_end_x_ + 32;
     int x = bar_task_list_x_;
-    const int end = std::max(x, pomodoro_widget_start_x_);
+    // The tray now sits just left of the pomodoro widget (see tray_widget_x_
+    // above), so when it's occupying space the task list has to stop there
+    // instead of at the pomodoro widget, or a long window title would run
+    // straight under the tray icons.
+    const int end = std::max(x, tray_pixel_width() > 0 ? tray_widget_x_ - 16 : pomodoro_widget_start_x_);
     for (Window window : windows) {
       char* title = nullptr;
       std::string label = XFetchName(display_, window, &title) && title ? title : "untitled";
@@ -4000,7 +4070,10 @@ class X11Backend final : public Backend {
         const std::string id(entry->d_name);
         if (id.size() <= 8 || id.compare(id.size() - 8, 8, ".desktop") != 0 || seen.count(id)) continue;
 
-        std::ifstream file(application_dir + "/" + id);
+        std::string desktop_file_path = application_dir;
+        desktop_file_path += '/';
+        desktop_file_path += id;
+        std::ifstream file(desktop_file_path);
         if (!file) continue;
         std::string name;
         std::string exec;
@@ -4054,10 +4127,10 @@ class X11Backend final : public Backend {
     int consecutive = 0;
     std::size_t last_match = std::string::npos;
     for (const unsigned char wanted : query) {
-      const unsigned char lower_wanted = static_cast<unsigned char>(std::tolower(wanted));
+      const auto lower_wanted = static_cast<unsigned char>(std::tolower(wanted));
       bool found = false;
       for (; candidate_index < candidate.size(); ++candidate_index) {
-        const unsigned char character = static_cast<unsigned char>(candidate[candidate_index]);
+        const auto character = static_cast<unsigned char>(candidate[candidate_index]);
         if (static_cast<unsigned char>(std::tolower(character)) != lower_wanted) continue;
         found = true;
         if (last_match != std::string::npos && candidate_index == last_match + 1) score += 5 + ++consecutive;
@@ -4090,7 +4163,7 @@ class X11Backend final : public Backend {
       char* raw_title = nullptr;
       std::string title = "untitled";
       if (XFetchName(display_, window, &raw_title) && raw_title) { title = raw_title; XFree(raw_title); }
-      window_candidates_.push_back({window, title});
+      window_candidates_.emplace_back(window, title);
     }
   }
 
@@ -4113,12 +4186,30 @@ class X11Backend final : public Backend {
       launcher_scroll_ = 0;
       return;
     }
+    if (launcher_mode_ == LauncherMode::Themes) {
+      std::vector<std::pair<int, std::size_t>> matches;
+      for (std::size_t index = 0; index < theme_names_.size(); ++index) {
+        const int score = fuzzy_score(launcher_query_, theme_names_[index]);
+        if (score >= 0) matches.emplace_back(score, index);
+      }
+      if (!launcher_query_.empty()) {
+        std::sort(matches.begin(), matches.end(), [&](const auto& left, const auto& right) {
+          return left.first != right.first ? left.first > right.first
+                                           : theme_names_[left.second] < theme_names_[right.second];
+        });
+      }
+      theme_matches_.clear();
+      for (const auto& match : matches) theme_matches_.push_back(match.second);
+      launcher_selection_ = 0;
+      launcher_scroll_ = 0;
+      return;
+    }
     if (launcher_mode_ != LauncherMode::Applications) {
       std::vector<std::pair<int, std::size_t>> matches;
       for (std::size_t index = 0; index < projects_.size(); ++index) {
         if (launcher_mode_ == LauncherMode::ActiveProjects && !project_has_clients(index)) continue;
         const int score = fuzzy_score(launcher_query_, projects_[index].path);
-        if (score >= 0) matches.push_back({score, index});
+        if (score >= 0) matches.emplace_back(score, index);
       }
       if (!launcher_query_.empty()) {
         std::sort(matches.begin(), matches.end(), [&](const auto& left, const auto& right) {
@@ -4152,7 +4243,7 @@ class X11Backend final : public Backend {
   void draw_launcher_text(int x, int baseline, const std::string& value, const XftColor& color) {
     int cursor = x;
     for (std::size_t offset = 0; offset < value.size();) {
-      FcChar32 codepoint;
+      FcChar32 codepoint = 0;
       const std::size_t bytes = utf8_codepoint(value, offset, &codepoint);
       XftFont* font = XftCharExists(display_, bar_font_, codepoint) ? bar_font_ : fallback_font(codepoint);
       XftDrawStringUtf8(launcher_xft_draw_, &color, font, cursor, baseline,
@@ -4168,7 +4259,7 @@ class X11Backend final : public Backend {
   void draw_launcher() {
     if (launcher_window_ == None) return;
     const std::size_t match_count = launcher_match_count();
-    const int shown = std::min<int>(kLauncherMaxRows, match_count - launcher_scroll_);
+    const int shown = std::min<int>(kLauncherMaxRows, static_cast<int>(match_count - launcher_scroll_));
     const int height = kBarHeight * (std::max(1, shown) + 1);
     const Monitor& target_monitor = monitor(current_monitor_);
     const int width = std::max(1, std::min(kLauncherWidth, target_monitor.width - 20));
@@ -4184,6 +4275,7 @@ class X11Backend final : public Backend {
     XFillRectangle(display_, launcher_pixmap_, bar_gc_, 0, 0, width, height);
     const char* title = launcher_mode_ == LauncherMode::Applications ? "Run: "
                       : launcher_mode_ == LauncherMode::Windows ? "Window: "
+                      : launcher_mode_ == LauncherMode::Themes ? "Theme: "
                       : launcher_mode_ == LauncherMode::Projects ? "Projects: " : "Active projects: ";
     draw_launcher_text(10, (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2,
                        std::string(title) + launcher_query_, bar_foreground_);
@@ -4193,23 +4285,39 @@ class X11Backend final : public Backend {
                              ? (launcher_apps_.empty() ? "No applications found" : "No matching applications")
                          : launcher_mode_ == LauncherMode::Windows
                              ? (window_candidates_.empty() ? "No open windows" : "No matching windows")
+                         : launcher_mode_ == LauncherMode::Themes
+                             ? "No matching themes"
                              : "No matching projects", bar_foreground_);
     }
+    // Theme rows get an accent-color swatch at the right edge so ~15 themes
+    // stay distinguishable at a glance rather than by name alone (matching
+    // what the old theme sidebar drew).
     for (int row = 0; row < shown; ++row) {
       const int y_offset = (row + 1) * kBarHeight;
-      if (launcher_scroll_ + static_cast<std::size_t>(row) == launcher_selection_) {
+      const bool selected = launcher_scroll_ + static_cast<std::size_t>(row) == launcher_selection_;
+      if (selected) {
         XSetForeground(display_, bar_gc_, bar_selected_.pixel);
         XFillRectangle(display_, launcher_pixmap_, bar_gc_, 0, y_offset, width, kBarHeight);
       }
-      const std::string label = launcher_mode_ == LauncherMode::Applications
-                                    ? launcher_apps_[launcher_matches_[launcher_scroll_ + row]].name
-                                : launcher_mode_ == LauncherMode::Windows
-                                    ? window_candidates_[window_matches_[launcher_scroll_ + row]].second
-                                    : project_label(projects_[project_matches_[launcher_scroll_ + row]].path);
+      std::string label;
+      unsigned long swatch_pixel = 0;
+      if (launcher_mode_ == LauncherMode::Applications) {
+        label = launcher_apps_[launcher_matches_[launcher_scroll_ + row]].name;
+      } else if (launcher_mode_ == LauncherMode::Windows) {
+        label = window_candidates_[window_matches_[launcher_scroll_ + row]].second;
+      } else if (launcher_mode_ == LauncherMode::Themes) {
+        const std::size_t theme = theme_matches_[launcher_scroll_ + row];
+        label = (static_cast<int>(theme) == theme_index_ ? "* " : "  ") + theme_names_[theme];
+        swatch_pixel = alloc_color(theme_palettes_[theme][2]);
+      } else {
+        label = project_label(projects_[project_matches_[launcher_scroll_ + row]].path);
+      }
       draw_launcher_text(10, y_offset + (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2, label,
-                         launcher_scroll_ + static_cast<std::size_t>(row) == launcher_selection_
-                             ? bar_background_
-                             : bar_foreground_);
+                         selected ? bar_background_ : bar_foreground_);
+      if (swatch_pixel) {
+        XSetForeground(display_, bar_gc_, swatch_pixel);
+        XFillArc(display_, launcher_pixmap_, bar_gc_, width - 16 - 8 - 16, y_offset + (kBarHeight - 16) / 2, 16, 16, 0, 360 * 64);
+      }
     }
     XCopyArea(display_, launcher_pixmap_, launcher_window_, bar_gc_, 0, 0, width, height, 0, 0);
     XFlush(display_);
@@ -4260,15 +4368,92 @@ class X11Backend final : public Backend {
     }
   }
 
+  void close_project_dropdown() {
+    project_dropdown_visible_ = false;
+    if (project_dropdown_window_ != None) XUnmapWindow(display_, project_dropdown_window_);
+  }
+
+  void draw_project_dropdown() {
+    if (!project_dropdown_visible_ || project_dropdown_window_ == None) return;
+    int width = 120;
+    for (std::size_t project : project_dropdown_entries_)
+      width = std::max(width, text_width(project_label(projects_[project].path)) + 24);
+    const int height = static_cast<int>(project_dropdown_entries_.size()) * kBarHeight;
+    // Centers under the project label exactly like draw_bar() draws it, so
+    // the dropdown opens directly below the widget that triggered it.
+    const int label_center = kDockWidth + 24 + text_width(project_label(projects_[active_project_index_].path)) / 2;
+    const int min_x = kDockWidth;
+    const int max_x = std::max(min_x, DisplayWidth(display_, screen_) - kDockWidth - width);
+    const int x = std::clamp(label_center - width / 2, min_x, max_x);
+    XMoveResizeWindow(display_, project_dropdown_window_, x, kBarHeight, width, height);
+    XSetForeground(display_, bar_gc_, bar_background_.pixel);
+    XFillRectangle(display_, project_dropdown_window_, bar_gc_, 0, 0, width, height);
+    for (std::size_t row = 0; row < project_dropdown_entries_.size(); ++row) {
+      const std::size_t project = project_dropdown_entries_[row];
+      const int y = static_cast<int>(row) * kBarHeight;
+      const bool current = project == active_project_index_;
+      if (current) {
+        XSetForeground(display_, bar_gc_, bar_selected_.pixel);
+        XFillRectangle(display_, project_dropdown_window_, bar_gc_, 0, y, width, kBarHeight);
+      }
+      draw_dock_text(project_dropdown_window_, 12, y + (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2,
+                     project_label(projects_[project].path), current ? bar_background_ : bar_foreground_);
+    }
+    XFlush(display_);
+  }
+
+  // Lists the active project (always, so the current selection is visible)
+  // plus every other project that currently has clients -- projects with
+  // nothing running in them clutter a "what's active" dropdown without
+  // adding anything the full picker (Super+i / Super+o) doesn't already do.
+  void toggle_project_dropdown() {
+    if (project_dropdown_visible_) { close_project_dropdown(); return; }
+    if (projects_.empty()) return;
+    project_dropdown_entries_.clear();
+    project_dropdown_entries_.push_back(active_project_index_);
+    for (std::size_t index = 0; index < projects_.size(); ++index)
+      if (index != active_project_index_ && project_has_clients(index)) project_dropdown_entries_.push_back(index);
+    if (project_dropdown_window_ == None) {
+      XSetWindowAttributes attributes{};
+      attributes.override_redirect = True;
+      attributes.background_pixel = bar_background_.pixel;
+      attributes.border_pixel = bar_selected_.pixel;
+      attributes.event_mask = ExposureMask | ButtonPressMask;
+      project_dropdown_window_ = XCreateWindow(display_, root_, 0, 0, 200, kBarHeight, 1, DefaultDepth(display_, screen_),
+                                               CopyFromParent, DefaultVisual(display_, screen_),
+                                               CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWEventMask, &attributes);
+      XDefineCursor(display_, project_dropdown_window_, cursor_);
+    }
+    project_dropdown_visible_ = true;
+    XMapRaised(display_, project_dropdown_window_);
+    draw_project_dropdown();
+  }
+
+  void handle_project_dropdown_button(const XButtonEvent& event) {
+    if (event.button != Button1) return;
+    const auto row = static_cast<std::size_t>(event.y / kBarHeight);
+    if (row >= project_dropdown_entries_.size()) return;
+    const std::size_t project = project_dropdown_entries_[row];
+    close_project_dropdown();
+    switch_project(project);
+  }
+
   void open_window_switcher() {
     if (launcher_visible_ && launcher_mode_ == LauncherMode::Windows) { close_launcher(); return; }
     if (launcher_visible_) close_launcher();
     open_launcher(LauncherMode::Windows);
   }
 
+  void toggle_theme_picker() {
+    if (launcher_visible_ && launcher_mode_ == LauncherMode::Themes) { close_launcher(); return; }
+    if (launcher_visible_) close_launcher();
+    open_launcher(LauncherMode::Themes);
+  }
+
   std::size_t launcher_match_count() const {
     return launcher_mode_ == LauncherMode::Applications ? launcher_matches_.size()
          : launcher_mode_ == LauncherMode::Windows ? window_matches_.size()
+         : launcher_mode_ == LauncherMode::Themes ? theme_matches_.size()
                                                     : project_matches_.size();
   }
 
@@ -4276,7 +4461,7 @@ class X11Backend final : public Backend {
     if (launcher_match_count() == 0) return;
     const int count = static_cast<int>(launcher_match_count());
     launcher_selection_ = static_cast<std::size_t>((static_cast<int>(launcher_selection_) + delta + count) % count);
-    if (launcher_selection_ < launcher_scroll_) launcher_scroll_ = launcher_selection_;
+    launcher_scroll_ = std::min(launcher_selection_, launcher_scroll_);
     if (launcher_selection_ >= launcher_scroll_ + kLauncherMaxRows)
       launcher_scroll_ = launcher_selection_ - kLauncherMaxRows + 1;
   }
@@ -4291,6 +4476,13 @@ class X11Backend final : public Backend {
       if (index != current_workspace_) switch_workspace(index);
       focus(window);
       arrange();
+      return;
+    }
+    if (launcher_mode_ == LauncherMode::Themes) {
+      if (theme_matches_.empty()) return;
+      theme_index_ = static_cast<int>(theme_matches_[launcher_selection_]);
+      close_launcher();
+      apply_current_theme();
       return;
     }
     if (launcher_mode_ != LauncherMode::Applications) {
@@ -4386,8 +4578,8 @@ class X11Backend final : public Backend {
   }
 
   void adopt_existing_windows() {
-    Window ignored_root;
-    Window ignored_parent;
+    Window ignored_root = None;
+    Window ignored_parent = None;
     Window* windows = nullptr;
     unsigned int count = 0;
     if (!XQueryTree(display_, root_, &ignored_root, &ignored_parent, &windows, &count)) return;
@@ -4440,7 +4632,7 @@ class X11Backend final : public Backend {
     target.stack_order.push_back(window);
   }
 
-  void insert_floating(Workspace& target, Window window) { target.floating.push_back(window); }
+  static void insert_floating(Workspace& target, Window window) { target.floating.push_back(window); }
 
   // prune_empty controls whether a leaf that's left with no tabs is
   // automatically deleted/merged away. Callers that remove a window because
@@ -4549,7 +4741,7 @@ class X11Backend final : public Backend {
     return -1;
   }
 
-  Window pick_fallback_focus(const Workspace& target) const {
+  static Window pick_fallback_focus(const Workspace& target) {
     if (target.selected_leaf && !target.selected_leaf->tabs.empty()) {
       return target.selected_leaf->tabs[target.selected_leaf->active_tab];
     }
@@ -4591,6 +4783,11 @@ class X11Backend final : public Backend {
     children.erase(position);
     if (children.size() == 1) {
       std::unique_ptr<Node>* parent_slot = slot_for(target.root, parent);
+      // parent is always reachable from target.root here (leaf, and so its
+      // parent, came from this same tree) -- the null check is defensive
+      // only, so a future refactor that breaks the invariant fails safely
+      // instead of dereferencing a null slot.
+      if (!parent_slot) return;
       std::unique_ptr<Node> survivor = std::move(children.front());
       survivor->parent = parent->parent;
       *parent_slot = std::move(survivor);
@@ -4647,6 +4844,28 @@ class X11Backend final : public Backend {
     for (const auto& entry : window_state_) update_border(entry.first, entry.first == previously_focused_);
   }
 
+  // Keeps the bars, docks, and any open popup (side panel, slider, power
+  // menu, launcher) above regular windows. Override-redirect windows only
+  // stack correctly at the moment they're mapped -- XRaiseWindow'd once and
+  // then left alone, a later-focused or later-mapped floating window slides
+  // right over them since nothing re-asserts their place in the stack. Called
+  // after every restack (arrange(), focus()) so a popup that's open when a
+  // floating window gets raised doesn't vanish behind it.
+  void raise_ui_chrome() {
+    XRaiseWindow(display_, bar_);
+    if (bars_visible_ && tray_ != None) XRaiseWindow(display_, tray_);
+    for (const DockWindows& dock : docks_) {
+      XRaiseWindow(display_, dock.left);
+      XRaiseWindow(display_, dock.right);
+      XRaiseWindow(display_, dock.bottom);
+    }
+    if (side_panel_ != SidePanel::Closed && side_panel_window_ != None) XRaiseWindow(display_, side_panel_window_);
+    if (slider_visible_ && slider_window_ != None) XRaiseWindow(display_, slider_window_);
+    if (power_menu_visible_ && power_menu_window_ != None) XRaiseWindow(display_, power_menu_window_);
+    if (launcher_visible_ && launcher_window_ != None) XRaiseWindow(display_, launcher_window_);
+    if (project_dropdown_visible_ && project_dropdown_window_ != None) XRaiseWindow(display_, project_dropdown_window_);
+  }
+
   void focus(Window window) {
     Workspace& target = workspace();
     if (window == None) {
@@ -4676,7 +4895,7 @@ class X11Backend final : public Backend {
     update_border(window, true);
     XSetInputFocus(display_, window, RevertToPointerRoot, CurrentTime);
     XRaiseWindow(display_, window);
-    XRaiseWindow(display_, bar_);
+    raise_ui_chrome();
     set_active_window(window);
   }
 
@@ -5074,6 +5293,7 @@ class X11Backend final : public Backend {
         XMapRaised(display_, dock.bottom);
         XMapRaised(display_, dock.right);
       }
+      update_tray();
     } else {
       XUnmapWindow(display_, bar_);
       for (const DockWindows& dock : docks_) {
@@ -5081,6 +5301,7 @@ class X11Backend final : public Backend {
         XUnmapWindow(display_, dock.bottom);
         XUnmapWindow(display_, dock.right);
       }
+      if (tray_ != None) XUnmapWindow(display_, tray_);
     }
     arrange();
     apply_wallpaper();
@@ -5092,7 +5313,7 @@ class X11Backend final : public Backend {
   }
 
   void adjust_mfact(double delta) {
-    config_.mfact = std::clamp(config_.mfact + static_cast<float>(delta), 0.05f, 0.95f);
+    config_.mfact = std::clamp(config_.mfact + static_cast<float>(delta), 0.05F, 0.95F);
     arrange();
   }
 
@@ -5111,7 +5332,7 @@ class X11Backend final : public Backend {
   // Re-execs the running binary with its original argv, read back from
   // /proc/self/cmdline rather than plumbed through Backend::run -- avoids
   // threading argv through WindowManager/Config just for this.
-  void restart() {
+  static void restart() {
     std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
     const std::string data((std::istreambuf_iterator<char>(cmdline)), std::istreambuf_iterator<char>());
     std::vector<std::string> parts;
@@ -5123,6 +5344,7 @@ class X11Backend final : public Backend {
     }
     if (parts.empty()) { std::cerr << "mepwm: restart failed: could not read /proc/self/cmdline\n"; return; }
     std::vector<char*> argv;
+    argv.reserve(parts.size() + 1);
     for (std::string& part : parts) argv.push_back(part.data());
     argv.push_back(nullptr);
     execv("/proc/self/exe", argv.data());
@@ -5377,7 +5599,7 @@ class X11Backend final : public Backend {
     }
   }
 
-  const Rect* leaf_rect(const Node* leaf, std::size_t monitor_index) const {
+  static const Rect* leaf_rect(const Node* leaf, std::size_t monitor_index) {
     if (!leaf) return nullptr;
     const auto it = leaf->rect_by_monitor.find(monitor_index);
     return it != leaf->rect_by_monitor.end() ? &it->second : nullptr;
@@ -5496,7 +5718,7 @@ class X11Backend final : public Backend {
     arrange_floating(target);
     sync_pane_tab_bars();
     update_empty_pane_highlight();
-    XRaiseWindow(display_, bar_);
+    raise_ui_chrome();
     draw_bar();
     draw_docks();
     update_tray();
@@ -5518,7 +5740,9 @@ class X11Backend final : public Backend {
 
   void draw_empty_pane_highlight() {
     if (empty_pane_highlight_ == None) return;
-    Window root_return; int x, y; unsigned int width, height, border, depth;
+    Window root_return = None;
+    int x = 0, y = 0;
+    unsigned int width = 0, height = 0, border = 0, depth = 0;
     if (!XGetGeometry(display_, empty_pane_highlight_, &root_return, &x, &y, &width, &height, &border, &depth))
       return;
     XSetForeground(display_, bar_gc_, bar_background_.pixel);
@@ -5605,7 +5829,7 @@ class X11Backend final : public Backend {
     }
     for (Node* leaf : wanted) {
       auto existing = pane_tab_bars_.find(leaf);
-      Window window;
+      Window window = None;
       if (existing == pane_tab_bars_.end()) {
         XSetWindowAttributes attributes{};
         attributes.override_redirect = True;
@@ -5643,7 +5867,7 @@ class X11Backend final : public Backend {
     arrange();
   }
 
-  void spawn_command(const std::string& command) const {
+  static void spawn_command(const std::string& command) {
     const pid_t child = fork();
     if (child < 0) {
       std::cerr << "mepwm: could not start command: " << std::strerror(errno) << '\n';
@@ -5668,7 +5892,7 @@ class X11Backend final : public Backend {
   // Independent of config_.terminal (which is a full launch expression, not
   // just a binary), so the agent command is run in its own terminal rather
   // than trying to splice it into an arbitrary user-configured launcher.
-  void spawn_terminal_running(const std::string& directory, const std::string& command) const {
+  static void spawn_terminal_running(const std::string& directory, const std::string& command) {
     const pid_t child = fork();
     if (child < 0) {
       std::cerr << "mepwm: could not start agent: " << std::strerror(errno) << '\n';
@@ -5690,7 +5914,7 @@ class X11Backend final : public Backend {
   // Opens `path` in $EDITOR (falling back to vi) inside a new terminal, the
   // same kitty-or-xterm wrapper spawn_terminal_running uses for the agent
   // command, so editing TODO.org behaves like any other terminal-launched tool.
-  void spawn_editor(const std::string& path) const {
+  static void spawn_editor(const std::string& path) {
     spawn_terminal_running(std::filesystem::path(path).parent_path().string(),
                             "${EDITOR:-vi} " + shell_quote(path));
   }
@@ -5910,18 +6134,20 @@ class X11Backend final : public Backend {
         // Any click outside a popup's own window closes that popup first, then
         // falls through to normal click routing below so the click still does
         // whatever it would otherwise do (focus a client, hit a dock icon, ...).
-        // Dock clicks (and the bar's own power-menu corner) are exempt:
-        // handle_dock_button/handle_button already toggle/switch popups
-        // correctly based on the pre-click state, so force-closing here
-        // first would make re-clicking a widget always reopen it instead of
-        // closing it.
+        // Dock clicks (and the bar's own power-menu corner and project-label
+        // cell) are exempt: handle_dock_button/handle_button already
+        // toggle/switch popups correctly based on the pre-click state, so
+        // force-closing here first would make re-clicking a widget always
+        // reopen it instead of closing it.
         if (hints_visible_) close_hints();
         if (dock_monitor(event.xbutton.window) < 0 &&
-            !(event.xbutton.window == bar_ && event.xbutton.x >= DisplayWidth(display_, screen_) - kDockWidth)) {
+            !(event.xbutton.window == bar_ && event.xbutton.x >= DisplayWidth(display_, screen_) - kDockWidth) &&
+            !(event.xbutton.window == bar_ && event.xbutton.x >= kDockWidth && event.xbutton.x < workspace_start_x_)) {
           if (side_panel_ != SidePanel::Closed && event.xbutton.window != side_panel_window_) close_side_panel();
           if (launcher_visible_ && event.xbutton.window != launcher_window_) close_launcher();
           if (slider_visible_ && event.xbutton.window != slider_window_) close_slider_popup();
           if (power_menu_visible_ && event.xbutton.window != power_menu_window_) close_power_menu();
+          if (project_dropdown_visible_ && event.xbutton.window != project_dropdown_window_) close_project_dropdown();
         }
 
         if (side_panel_ != SidePanel::Closed && event.xbutton.window == side_panel_window_) {
@@ -5933,11 +6159,13 @@ class X11Backend final : public Backend {
           }
         } else if (power_menu_visible_ && event.xbutton.window == power_menu_window_) {
           handle_power_menu_button(event.xbutton);
+        } else if (project_dropdown_visible_ && event.xbutton.window == project_dropdown_window_) {
+          handle_project_dropdown_button(event.xbutton);
         } else if (event.xbutton.window == launcher_window_) {
           if (event.xbutton.button == Button4) move_launcher_selection(-1);
           else if (event.xbutton.button == Button5) move_launcher_selection(1);
           else if (event.xbutton.button == Button1 && event.xbutton.y >= kBarHeight) {
-            const std::size_t row = static_cast<std::size_t>(event.xbutton.y / kBarHeight - 1);
+            const auto row = static_cast<std::size_t>(event.xbutton.y / kBarHeight - 1);
             if (row < launcher_match_count() - launcher_scroll_ && row < kLauncherMaxRows) {
               launcher_selection_ = launcher_scroll_ + row;
               launch_selected_app();
@@ -6049,7 +6277,7 @@ class X11Backend final : public Backend {
       if (key == XK_Tab) next_tab(-1);
       if (key == XK_r) restart();
       if (key == XK_d) adjust_nmaster(1);
-      if (key == XK_t) open_theme_panel();
+      if (key == XK_t) toggle_theme_picker();
       if (key == XK_slash) toggle_side_panel(SidePanel::Help);
       if (key >= XK_1 && key <= XK_9) send_to_workspace(workspace().focused, static_cast<int>(key - XK_1));
       return;
@@ -6114,7 +6342,10 @@ class X11Backend final : public Backend {
         if (event.button == Button1) { power_menu_visible_ ? close_power_menu() : open_power_menu(); }
         return;
       }
-      if (event.x < workspace_start_x_) return;
+      if (event.x < workspace_start_x_) {
+        if (event.button == Button1) toggle_project_dropdown();
+        return;
+      }
       const int workspace_index = (event.x - workspace_start_x_) / 84;
       if (workspace_index >= 0 && workspace_index < kWorkspaceCount) {
         switch_workspace(workspace_index);
@@ -6188,7 +6419,7 @@ class X11Backend final : public Backend {
   bool slider_visible_ = false;
   bool slider_dragging_ = false;
   SliderKind slider_kind_ = SliderKind::Backlight;
-  std::chrono::steady_clock::time_point slider_last_commit_{};
+  std::chrono::steady_clock::time_point slider_last_commit_;
   Window power_menu_window_ = None;
   bool power_menu_visible_ = false;
   int power_menu_diameter_ = 64;
@@ -6196,6 +6427,11 @@ class X11Backend final : public Backend {
   Window empty_pane_highlight_ = None;
   std::unordered_map<Node*, Window> pane_tab_bars_;
   Window side_panel_window_ = None;
+  // Screen-space x of the widget that most recently opened the panel, so it
+  // pops up above whatever was clicked instead of always at the dock edge.
+  // -1 means "no specific trigger" (opened via keybinding or a dock row that
+  // already lives at the panel's default edge) -- falls back to that edge.
+  int side_panel_anchor_x_ = -1;
   SidePanel side_panel_ = SidePanel::Closed;
   std::size_t side_panel_monitor_ = 0;
   std::vector<int> side_panel_rows_;
@@ -6243,6 +6479,7 @@ class X11Backend final : public Backend {
   std::vector<std::size_t> project_matches_;
   std::vector<std::pair<Window, std::string>> window_candidates_;
   std::vector<std::size_t> window_matches_;
+  std::vector<std::size_t> theme_matches_;
   std::size_t launcher_selection_ = 0;
   std::size_t launcher_scroll_ = 0;
   XftFont* bar_font_ = nullptr;
@@ -6269,6 +6506,11 @@ class X11Backend final : public Backend {
   std::time_t pomodoro_remaining_ = 0;
   int pomodoro_widget_start_x_ = 0;
   int pomodoro_widget_end_x_ = 0;
+  // Screen x for the tray window, at the front (left edge) of the pomodoro/
+  // clock cluster. Recomputed by draw_bar() and consumed by update_tray(),
+  // since tray icons can dock/undock (and so need repositioning) independent
+  // of the bar's own redraw cycle.
+  int tray_widget_x_ = 0;
   bool hints_visible_ = false;
   std::string hint_query_;
   std::vector<Hint> hints_;
@@ -6281,6 +6523,12 @@ class X11Backend final : public Backend {
   std::array<Workspace, kWorkspaceCount> workspaces_;
   std::vector<Project> projects_;
   std::size_t active_project_index_ = 0;
+  Window project_dropdown_window_ = None;
+  bool project_dropdown_visible_ = false;
+  // Snapshot of which project indices are listed, taken when the dropdown
+  // opens -- rows are hit-tested against this rather than re-filtering
+  // projects_ live, so a click always lands on the row it was drawn for.
+  std::vector<std::size_t> project_dropdown_entries_;
   int current_workspace_ = 0;
   std::vector<Monitor> monitors_;
   std::size_t current_monitor_ = 0;

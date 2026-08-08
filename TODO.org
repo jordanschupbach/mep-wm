@@ -1,3 +1,29 @@
+* DONE Make sure no global variables are used in the codebase
+* DONE Fix theme picker to be a picker (like project picker and program picker) instead of a sidebar.
+* TODO Add wallpaper picker (like project picker and program picker).
+* TODO Improve wifi widget
+* TODO Add pin binding (mod+shift+p) to maximize current window
+* TODO Add floating binding (mod+shift+f) to toggle floating for current window
+* TODO Add resizing behaviour for floating windows (mod+shift+h,j,k,l keys)
+* TODO Add moving behaviour for floating windows (mod+alt+h,j,k,l keys)
+* TODO Make apps dockable to program launcher
+* TODO Add projects sidebar
+* TODO Add email sidebar
+* TODO Add git sidebar
+* TODO Add messaging sidebar
+* TODO Add ai sidebar
+* TODO make available as flake
+* TODO make available to other package managers (nix, apt, pacman, etc.)
+* TODO Add speech to text functionality with toggle button and ai button
+* TODO Add pm sidebar
+* TODO Add windows backend to support windows 10 and 11
+* TODO Add macos backend to support macos 13 and 14
+* TODO Add api docs
+* TODO Add cli docs
+* DONE turn on all the warnings (as errors) in the build process and fix
+* DONE make pass on code quality and style
+* DONE Make sure the codebase adheres to guidelines from c++ core guidelines
+* DONE Add maximize binding (mod+m) to maximize current window
 * DONE move clients to other buffers with mod+shift+1,2,3,...
 * DONE make sidebars look nicer (with rounded corners, shadows, etc.)
 :LOGBOOK:
@@ -35,24 +61,15 @@ CLOCK: [2026-08-08 Sat 08:46]--[2026-08-08 Sat 09:01] =>  0:15
 :LOGBOOK:
 CLOCK: [2026-08-08 Sat 09:08]--[2026-08-08 Sat 09:21] =>  0:13
 :END:
-* TODO Fix behaviour of toggle border functionality (mod+b now toggles all bars and re-fits the wallpaper; still doesn't reclaim their screen space for tiling)
-* TODO fix popups for volume, brightness, etc.
-* TODO Add drop down to project widget to select active projects
-* TODO Fix placement and look of system tray (currently just nm-applet)
-* TODO add static analysis tools to flake/build process
-* TODO turn on all the warnings (as errors) in the build process and fix
-* TODO make pass on code quality and style
-* TODO Add projects sidebar
-* TODO Improve wifi widget
-* TODO Add maximize binding (mod+m) to maximize current window
-* TODO Add pin binding (mod+shift+p) to maximize current window
-* TODO Add floating binding (mod+shift+f) to toggle floating for current window
-* TODO Add resizing behaviour for floating windows (mod+shift+h,j,k,l keys)
-* TODO Add moving behaviour for floating windows (mod+alt+h,j,k,l keys)
-* TODO Make apps dockable to program launcher
-* TODO Add email sidebar
-* TODO Add git sidebar
-* TODO Add messaging sidebar
-* TODO Add ai sidebar
-* TODO make available as flake
-* TODO Add speech to text functionality with toggle button and ai button
+* DONE Fix behaviour of toggle border functionality (mod+b now toggles all bars and re-fits the wallpaper; still doesn't reclaim their screen space for tiling)
+* DONE fix popups for volume, brightness, etc.
+* DONE fix behaviour of slidebar widgets to appear on top of all windows (currently they are hidden by floating windows) and make them appear directly above the widget that triggered them (currently they appear in the center of the screen)
+:LOGBOOK:
+CLOCK: [2026-08-08 Sat 10:45]--[2026-08-08 Sat 11:05] =>  0:20
+:END:
+* DONE Add drop down to project widget to select active projects
+:LOGBOOK:
+CLOCK: [2026-08-08 Sat 11:10]--[2026-08-08 Sat 11:21] =>  0:11
+:END:
+* DONE Fix placement and look of system tray (currently just nm-applet)
+* DONE add static analysis tools to flake/build process

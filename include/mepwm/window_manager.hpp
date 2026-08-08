@@ -14,7 +14,7 @@ struct Config {
   std::string border_color_normal = "#444444";
   std::string border_color_focused = "#5294e2";
   unsigned int snap = 32;
-  float mfact = 0.55f;
+  float mfact = 0.55F;
   unsigned int nmaster = 1;
   std::string agent_command = "claude";
   std::string wallpaper_dir_light = "assets/light_comic_wallpapers";

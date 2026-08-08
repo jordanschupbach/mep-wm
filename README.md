@@ -95,7 +95,7 @@ home directory is available as the default project.
 MEPWM provides a left application dock, a bottom system-widget dock, and a
 right dock for notifications, todos, agents, layouts, and keybinding help.
 All of these, plus the toggleable side panel (notifications/todos/agents/
-theme/etc.), are borderless and forced fully opaque via
+etc.), are borderless and forced fully opaque via
 `_NET_WM_WINDOW_OPACITY` -- so a compositor's default translucency rules
 for override-redirect or unfocused windows can't let the wallpaper show
 through them.
@@ -116,8 +116,8 @@ All panels scroll with the mouse wheel. Their header `clear` actions dismiss
 notifications, completed todos, or file-backed agent statuses; middle-click an
 individual notification or file-backed agent to dismiss it.
 Wi-Fi and Bluetooth open actionable device panels; their first row toggles the
-radio and device rows connect or disconnect. Media, Git, keyboard-layout, and
-theme panels likewise expose their original widget actions.
+radio and device rows connect or disconnect. Media, Git, and keyboard-layout
+panels likewise expose their original widget actions.
 The Notifications, Todos, Agents, and Info (Wi-Fi/Bluetooth/media/etc.) panels
 grab the keyboard while open, so `Escape` closes them and `?` toggles a
 contextual help layer over that panel's own content -- a "? Toggle help" hint
@@ -143,9 +143,11 @@ MEPWM ships 15 built-in themes, 8 dark and 7 light: `dark`, `nord`,
 `everforest-dark`, `light`, `solarized-light`, `gruvbox-light`,
 `catppuccin-latte`, `rose-pine-dawn`, `everforest-light`, and `nord-light`.
 Left/scroll-click the bottom-bar theme widget to cycle through them, or
-middle-click it (or press `Super+Shift+t`) to open the theme picker panel,
-which lists every theme with an accent-color swatch and lets you click one
-directly. A theme is a `{fg, bg, accent}` triple that drives every color in
+middle-click it (or press `Super+Shift+t`) to open the theme picker -- a
+fuzzy-searchable popup, the same kind used for the application and project
+pickers, listing every theme with an accent-color swatch and letting you
+type to filter or press Enter/click to select one directly. A theme is a
+`{fg, bg, accent}` triple that drives every color in
 the window manager: bar and sidebar text/background, card and highlight
 fills, and both the focused (accent-colored) and unfocused window border --
 switching themes recolors already-open windows immediately, not just new
