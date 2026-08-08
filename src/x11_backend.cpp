@@ -4329,17 +4329,42 @@ class X11Backend final : public Backend {
 
   void close_launcher() {
     if (!launcher_visible_) return;
+    // An unconfirmed theme preview (picker closed via Escape, or by
+    // toggling/switching away without pressing Enter) reverts to whatever
+    // was active before the picker opened.
+    if (theme_preview_saved_index_ >= 0 && theme_index_ != theme_preview_saved_index_) {
+      theme_index_ = theme_preview_saved_index_;
+      apply_current_theme();
+    }
+    theme_preview_saved_index_ = -1;
     launcher_visible_ = false;
     XUngrabKeyboard(display_, CurrentTime);
     XUnmapWindow(display_, launcher_window_);
+  }
+
+  // Applies the theme under the highlighted row so the picker previews
+  // live as the selection changes; committed on Enter, reverted on cancel
+  // (see launch_selected_app() and close_launcher()).
+  void preview_launcher_theme() {
+    if (launcher_mode_ != LauncherMode::Themes || theme_matches_.empty()) return;
+    theme_index_ = static_cast<int>(theme_matches_[launcher_selection_]);
+    apply_current_theme();
   }
 
   void open_launcher(LauncherMode mode = LauncherMode::Applications) {
     launcher_mode_ = mode;
     if (mode == LauncherMode::Applications) scan_launcher_apps();
     if (mode == LauncherMode::Windows) scan_windows();
+    if (mode == LauncherMode::Themes) theme_preview_saved_index_ = theme_index_;
     launcher_query_.clear();
     filter_launcher_apps();
+    if (mode == LauncherMode::Themes) {
+      // Start with the currently-applied theme highlighted rather than
+      // whatever filter_launcher_apps() defaults to, so opening the picker
+      // doesn't itself change anything until the user navigates.
+      const auto match = std::find(theme_matches_.begin(), theme_matches_.end(), static_cast<std::size_t>(theme_index_));
+      if (match != theme_matches_.end()) launcher_selection_ = static_cast<std::size_t>(match - theme_matches_.begin());
+    }
     if (launcher_window_ == None) {
       XSetWindowAttributes attributes{};
       attributes.override_redirect = True;
@@ -4485,6 +4510,7 @@ class X11Backend final : public Backend {
     if (launcher_mode_ == LauncherMode::Themes) {
       if (theme_matches_.empty()) return;
       theme_index_ = static_cast<int>(theme_matches_[launcher_selection_]);
+      theme_preview_saved_index_ = -1;  // confirmed: nothing left to revert
       close_launcher();
       apply_current_theme();
       return;
@@ -4534,16 +4560,26 @@ class X11Backend final : public Backend {
     if (key == XK_BackSpace) {
       if (!launcher_query_.empty()) launcher_query_.pop_back();
       filter_launcher_apps();
+      preview_launcher_theme();
       draw_launcher();
       return;
     }
-    if (key == XK_Up || (state == ControlMask && key == XK_p)) { move_launcher_selection(-1); draw_launcher(); return; }
+    if (key == XK_Up || (state == ControlMask && key == XK_p)) {
+      move_launcher_selection(-1);
+      preview_launcher_theme();
+      draw_launcher();
+      return;
+    }
     if (key == XK_Down || key == XK_Tab || (state == ControlMask && key == XK_n)) {
-      move_launcher_selection(1); draw_launcher(); return;
+      move_launcher_selection(1);
+      preview_launcher_theme();
+      draw_launcher();
+      return;
     }
     if (state == ControlMask && key == XK_u) {
       launcher_query_.clear();
       filter_launcher_apps();
+      preview_launcher_theme();
       draw_launcher();
       return;
     }
@@ -4552,6 +4588,7 @@ class X11Backend final : public Backend {
     }
     if (length > 0) {
       filter_launcher_apps();
+      preview_launcher_theme();
       draw_launcher();
     }
   }
@@ -6463,6 +6500,11 @@ class X11Backend final : public Backend {
   std::string keyboard_layout_;
   std::vector<std::string> keyboard_layouts_;
   int theme_index_ = 0;
+  // >= 0 while the theme picker is open with an as-yet-unconfirmed preview
+  // in progress; holds the theme to restore if the picker is closed without
+  // pressing Enter. Reset to -1 on confirm (see launch_selected_app()) and
+  // on close (see close_launcher()).
+  int theme_preview_saved_index_ = -1;
   std::vector<std::array<std::string, 3>> theme_palettes_ = default_theme_palettes();
   std::vector<std::string> theme_names_ = default_theme_names();
   std::optional<bool> wallpaper_is_light_;
