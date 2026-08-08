@@ -58,6 +58,12 @@ constexpr double kMinSplitWeight = 0.05;
 constexpr int kTraySpacing = 4;
 constexpr int kLauncherWidth = 640;
 constexpr int kLauncherMaxRows = 8;
+constexpr int kLeftDockCount = 8;
+// Vertical offset that centers the fixed-size stack of left-dock launcher
+// icons within a dock that's taller than the icons themselves.
+int left_dock_top_offset(int side_height) {
+  return std::max(0, (side_height - kLeftDockCount * kDockWidth) / 2);
+}
 constexpr long kSystemTrayRequestDock = 0;
 constexpr long kXEmbedEmbeddedNotify = 0;
 constexpr long kXEmbedMapped = 1 << 0;
@@ -2639,7 +2645,7 @@ class X11Backend final : public Backend {
   }
 
   void draw_docks() {
-    static const std::array<const char*, 8> left_labels = {
+    static const std::array<const char*, kLeftDockCount> left_labels = {
         kIconFirefox, kIconTerminal, kIconInkscape, kIconGimp,
         kIconLibreOffice, kIconVsCode, kIconEmacs, kIconNeovim,
     };
@@ -2658,8 +2664,10 @@ class X11Backend final : public Backend {
       XFillRectangle(display_, dock.left_buffer, bar_gc_, 0, 0, kDockWidth, side_height);
       XFillRectangle(display_, dock.right_buffer, bar_gc_, 0, 0, kDockWidth, side_height);
       XFillRectangle(display_, dock.bottom_buffer, bar_gc_, 0, 0, bottom_width, kBarHeight);
+      const int left_offset = left_dock_top_offset(side_height);
       for (std::size_t row = 0; row < left_labels.size(); ++row)
-        draw_dock_cell(dock.left_buffer, static_cast<int>(row) * kDockWidth, kDockWidth, kDockWidth, left_labels[row]);
+        draw_dock_cell(dock.left_buffer, left_offset + static_cast<int>(row) * kDockWidth, kDockWidth, kDockWidth,
+                       left_labels[row]);
       const int unread = static_cast<int>(std::count_if(notifications_.begin(), notifications_.end(), [](const Notification& item) {
         return item.unread;
       }));
@@ -2877,15 +2885,19 @@ class X11Backend final : public Backend {
     current_monitor_ = static_cast<std::size_t>(index);
     const DockWindows& dock = docks_[current_monitor_];
     if (event.window == dock.left && event.button == Button1) {
-      switch (event.y / kDockWidth) {
-        case 0: spawn_command("firefox"); break;
-        case 1: spawn_terminal(); break;
-        case 2: spawn_command("inkscape"); break;
-        case 3: spawn_command("gimp"); break;
-        case 4: spawn_command("libreoffice"); break;
-        case 5: spawn_command("code"); break;
-        case 6: spawn_command("if command -v nix >/dev/null 2>&1; then exec nix run 'git:jordanschupbach/emc' --refresh; else exec emacs; fi"); break;
-        case 7: spawn_command("${TERMINAL:-xterm} -e nvim"); break;
+      const int side_height = std::max(1, monitors_[current_monitor_].height - 2 * kBarHeight);
+      const int relative_y = event.y - left_dock_top_offset(side_height);
+      if (relative_y >= 0) {
+        switch (relative_y / kDockWidth) {
+          case 0: spawn_command("firefox"); break;
+          case 1: spawn_terminal(); break;
+          case 2: spawn_command("inkscape"); break;
+          case 3: spawn_command("gimp"); break;
+          case 4: spawn_command("libreoffice"); break;
+          case 5: spawn_command("code"); break;
+          case 6: spawn_command("if command -v nix >/dev/null 2>&1; then exec nix run 'git:jordanschupbach/emc' --refresh; else exec emacs; fi"); break;
+          case 7: spawn_command("${TERMINAL:-xterm} -e nvim"); break;
+        }
       }
     } else if (event.window == dock.bottom) {
       // The info icon lives in the bottom bar's right-hand corner now.
@@ -2953,9 +2965,11 @@ class X11Backend final : public Backend {
       const Monitor& target_monitor = monitors_[index];
       const DockWindows& dock = docks_[index];
       const int dock_y = target_monitor.y + kBarHeight;
-      for (int row = 0; row < 8; ++row) {
-        candidates.push_back({target_monitor.x + 4, dock_y + row * kDockWidth + 4, dock.left, kDockWidth / 2,
-                              row * kDockWidth + kDockWidth / 2});
+      const int side_height = std::max(1, target_monitor.height - 2 * kBarHeight);
+      const int left_offset = left_dock_top_offset(side_height);
+      for (int row = 0; row < kLeftDockCount; ++row) {
+        candidates.push_back({target_monitor.x + 4, dock_y + left_offset + row * kDockWidth + 4, dock.left,
+                              kDockWidth / 2, left_offset + row * kDockWidth + kDockWidth / 2});
       }
       const int dock_right_x = target_monitor.x + target_monitor.width - kDockWidth;
       for (int row = 0; row < 3; ++row) {
