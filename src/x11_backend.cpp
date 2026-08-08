@@ -103,6 +103,9 @@ constexpr const char kIconLayoutTile[] = "\uf00a";
 constexpr const char kIconLayoutMonocle[] = "\uf2d0";
 constexpr const char kIconLayoutOther[] = "\uf009";
 constexpr const char kIconNixOs[] = "\uf313";
+constexpr const char kIconPower[] = "\uf011";
+constexpr const char kIconRestart[] = "\uf021";
+constexpr const char kIconLogout[] = "\uf08b";
 int another_window_manager = 0;
 
 class StartupTimer {
@@ -1427,8 +1430,8 @@ class X11Backend final : public Backend {
       const DockWindows& dock = docks_[index];
       const int side_height = std::max(1, target.height - 2 * kBarHeight);
       // The vertical docks now sit between the top and bottom bars (which
-      // own the corners: launcher/layout up top, os/info down below), and
-      // the bottom dock spans the full monitor width to match the top bar.
+      // own the corners: launcher up top, os/info down below), and the
+      // bottom dock spans the full monitor width to match the top bar.
       XMoveResizeWindow(display_, dock.left, target.x, target.y + kBarHeight, kDockWidth, side_height);
       XMoveResizeWindow(display_, dock.right, target.x + target.width - kDockWidth, target.y + kBarHeight,
                         kDockWidth, side_height);
@@ -1929,6 +1932,94 @@ class X11Backend final : public Backend {
     draw_docks();
   }
 
+  struct PowerButton {
+    const char* icon;
+    const char* label;
+  };
+  static const std::array<PowerButton, 3>& power_buttons() {
+    static const std::array<PowerButton, 3> buttons = {{
+        {kIconLogout, "Logout"},
+        {kIconRestart, "Restart"},
+        {kIconPower, "Shutdown"},
+    }};
+    return buttons;
+  }
+
+  // Column width (and so the popup's overall size) is measured from the
+  // label text rather than hard-coded, since the configured bar font can
+  // render much wider than a guessed pixel budget depending on display DPI.
+  int power_menu_column_width() {
+    int widest = 0;
+    for (const PowerButton& button : power_buttons()) widest = std::max(widest, text_width(button.label));
+    return std::max(widest + 32, power_menu_diameter_ + 24);
+  }
+
+  // Logout/restart/shutdown, offered as three round buttons -- Shutdown gets
+  // the same red used for an inactive todo clock, as a mild danger cue.
+  void draw_power_menu() {
+    if (!power_menu_visible_) return;
+    const int column = power_menu_column_width();
+    const int width = column * 3;
+    XSetForeground(display_, bar_gc_, bar_background_.pixel);
+    XFillRectangle(display_, power_menu_window_, bar_gc_, 0, 0, width, power_menu_height_);
+
+    const int center_y = power_menu_diameter_ / 2 + 20;
+    std::size_t index = 0;
+    for (const PowerButton& button : power_buttons()) {
+      const unsigned long ring = button.label == std::string("Shutdown") ? todo_inactive_pixel_ : border_normal_pixel_;
+      const int center_x = column * static_cast<int>(index) + column / 2;
+      const int left = center_x - power_menu_diameter_ / 2;
+      const int top = center_y - power_menu_diameter_ / 2;
+      XSetForeground(display_, bar_gc_, ring);
+      XFillArc(display_, power_menu_window_, bar_gc_, left, top, power_menu_diameter_, power_menu_diameter_, 0, 360 * 64);
+      XSetForeground(display_, bar_gc_, bar_background_.pixel);
+      XFillArc(display_, power_menu_window_, bar_gc_, left + 3, top + 3, power_menu_diameter_ - 6,
+               power_menu_diameter_ - 6, 0, 360 * 64);
+      draw_dock_text(power_menu_window_, center_x - text_width(button.icon) / 2,
+                     center_y + (bar_font_->ascent - bar_font_->descent) / 2, button.icon, bar_foreground_);
+      draw_dock_text(power_menu_window_, center_x - text_width(button.label) / 2,
+                     power_menu_height_ - bar_font_->descent - 10, button.label, bar_foreground_);
+      ++index;
+    }
+    XFlush(display_);
+  }
+
+  void close_power_menu() {
+    power_menu_visible_ = false;
+    if (power_menu_window_ != None) XUnmapWindow(display_, power_menu_window_);
+  }
+
+  void open_power_menu() {
+    if (power_menu_window_ == None) {
+      XSetWindowAttributes attributes{};
+      attributes.override_redirect = True;
+      attributes.background_pixel = bar_background_.pixel;
+      attributes.border_pixel = bar_selected_.pixel;
+      attributes.event_mask = ExposureMask | ButtonPressMask;
+      power_menu_window_ = XCreateWindow(display_, root_, 0, 0, 300, 150, 1, DefaultDepth(display_, screen_),
+                                         CopyFromParent, DefaultVisual(display_, screen_),
+                                         CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWEventMask, &attributes);
+      XDefineCursor(display_, power_menu_window_, cursor_);
+    }
+    power_menu_height_ = power_menu_diameter_ + 20 + bar_font_->ascent + bar_font_->descent + 22;
+    const int width = power_menu_column_width() * 3;
+    const Monitor& target = monitor(current_monitor_);
+    XMoveResizeWindow(display_, power_menu_window_, target.x + target.width - kDockWidth - width,
+                      target.y + kBarHeight, width, power_menu_height_);
+    power_menu_visible_ = true;
+    XMapRaised(display_, power_menu_window_);
+    draw_power_menu();
+  }
+
+  void handle_power_menu_button(const XButtonEvent& event) {
+    if (event.button != Button1) return;
+    const int index = std::clamp(event.x / power_menu_column_width(), 0, 2);
+    close_power_menu();
+    if (index == 0) running_ = false;
+    else if (index == 1) spawn_command("systemctl reboot");
+    else spawn_command("systemctl poweroff");
+  }
+
   // Todos are project-centric: sourced read-only from a TODO.org file in the
   // active project's directory rather than a manually-managed store, so the
   // sidebar always reflects whichever project is currently active.
@@ -2128,8 +2219,9 @@ class X11Backend final : public Backend {
         {"Super+i", "Recent projects picker"},
         {"Super+o", "Active projects picker"},
         {"Super+h/j/k/l", "Focus direction (selects empty panes too in manual layout)"},
-        {"Super+Ctrl+j/k", "Focus next/previous in stack order"},
-        {"Super+Ctrl+h/l", "Shrink/grow master area"},
+        {"Super+Ctrl+h/j/k/l", "Manual mode: move client into adjacent split"},
+        {"Super+Ctrl+j/k", "Other modes: focus next/previous in stack order"},
+        {"Super+Ctrl+h/l", "Other modes: shrink/grow master area"},
         {"Super+v", "Split pane vertically"},
         {"Super+s", "Split pane horizontally"},
         {"Super+Tab", "Next tab"},
@@ -2156,6 +2248,7 @@ class X11Backend final : public Backend {
         {"Super+Shift+q", "Quit"},
         {"Super+drag (left click)", "Move window"},
         {"Super+drag (right click)", "Resize window"},
+        {"Click power icon (top-right)", "Power menu: logout / restart / shutdown"},
     };
     return bindings;
   }
@@ -3158,18 +3251,16 @@ class X11Backend final : public Backend {
     // cells so the bar can span the full display width; everything else
     // that used to be bar-relative x=0 now starts after the launcher cell.
     draw_dock_cell_h(bar_pixmap_, 0, kDockWidth, kBarHeight, kIconLauncher);
-    const char* layout_icon = workspace().mode == LayoutMode::Manual ? kIconLayoutOther :
-                              workspace().mode == LayoutMode::MasterStack ? kIconLayoutTile : kIconLayoutMonocle;
-    draw_dock_cell_h(bar_pixmap_, width - kDockWidth, kDockWidth, kBarHeight, layout_icon);
+    // The layout-mode indicator used to live in this corner; it's now the
+    // combined icon+text widget just after the workspace numbers, freeing
+    // this corner up for the power menu toggle.
+    draw_dock_cell_h(bar_pixmap_, width - kDockWidth, kDockWidth, kBarHeight, kIconPower);
 
-    // Current project (and layout mode) sits right after the launcher cell,
-    // ahead of the workspace numbers, so it reads left-to-right as
-    // "launcher -> where am I -> which workspace".
-    const char* mode = workspace().mode == LayoutMode::Manual
-                           ? "manual"
-                           : workspace().mode == LayoutMode::MasterStack ? "master-stack" : "monocle";
-    const std::string project = projects_.empty() ? "default" : project_label(projects_[active_project_index_].path);
-    const std::string project_label_text = project + " · " + mode;
+    // Current project sits right after the launcher cell, ahead of the
+    // workspace numbers, so it reads left-to-right as "launcher -> where am
+    // I -> which workspace".
+    const std::string project_label_text =
+        projects_.empty() ? "default" : project_label(projects_[active_project_index_].path);
     text(kDockWidth + 24, project_label_text, bar_foreground_);
 
     const int content_x = kDockWidth + 24 + text_width(project_label_text) + 32;
@@ -3190,6 +3281,20 @@ class X11Backend final : public Backend {
       text(x + 24, std::to_string(index + 1), index == current_workspace_ ? bar_background_ : bar_foreground_);
     }
 
+    // Layout-mode widget: icon plus name, merged from the old top-right
+    // corner icon and the mode text that used to trail the project label,
+    // now placed right after the workspace numbers.
+    const char* layout_icon = workspace().mode == LayoutMode::Manual ? kIconLayoutOther :
+                              workspace().mode == LayoutMode::MasterStack ? kIconLayoutTile : kIconLayoutMonocle;
+    const char* mode = workspace().mode == LayoutMode::Manual
+                           ? "manual"
+                           : workspace().mode == LayoutMode::MasterStack ? "master-stack" : "monocle";
+    const std::string layout_widget_text = std::string(layout_icon) + " " + mode;
+    const int layout_widget_x = content_x + kWorkspaceCount * 84 + 24;
+    text(layout_widget_x, layout_widget_text, bar_foreground_);
+    layout_widget_start_x_ = content_x + kWorkspaceCount * 84;
+    layout_widget_end_x_ = layout_widget_x + text_width(layout_widget_text) + 24;
+
     const std::string clock_widget = std::string(kIconClock) + " " + clock_text_;
     const int clock_width = text_width(clock_widget) + 32;
     const int clock_x = width - kDockWidth - clock_width - tray_pixel_width();
@@ -3198,7 +3303,7 @@ class X11Backend final : public Backend {
     std::vector<Window> windows;
     collect_windows(workspace().root.get(), windows);
     windows.insert(windows.end(), workspace().floating.begin(), workspace().floating.end());
-    bar_task_list_x_ = content_x + 756 + 32;
+    bar_task_list_x_ = layout_widget_end_x_ + 32;
     int x = bar_task_list_x_;
     const int end = std::max(x, clock_x);
     for (Window window : windows) {
@@ -4129,6 +4234,71 @@ class X11Backend final : public Backend {
     }
   }
 
+  // Relocates the focused client out of its pane and into whichever
+  // existing pane sits adjacent in the given direction, using the same
+  // spatial search as select_pane_direction. Manual mode only, and a no-op
+  // if there's no pane in that direction (it never creates a new split).
+  void move_client_direction(KeySym key) {
+    Workspace& target = workspace();
+    if (target.mode != LayoutMode::Manual) return;
+    Node* source_leaf = target.selected_leaf;
+    if (!source_leaf || source_leaf->tabs.empty()) return;
+    const Window window = source_leaf->tabs[source_leaf->active_tab];
+
+    const Rect* source_rect = leaf_rect(source_leaf, current_monitor_);
+    if (!source_rect) return;
+    const int selected_x = source_rect->x + source_rect->w / 2;
+    const int selected_y = source_rect->y + source_rect->h / 2;
+
+    std::vector<Node*> leaves;
+    collect_leaves(target.root.get(), leaves);
+
+    bool found = false;
+    long best_score = 0;
+    Node* best_leaf = nullptr;
+    for (Node* leaf : leaves) {
+      if (leaf == source_leaf) continue;
+      const Rect* rect = leaf_rect(leaf, current_monitor_);
+      if (!rect) continue;
+      const int candidate_x = rect->x + rect->w / 2;
+      const int candidate_y = rect->y + rect->h / 2;
+      int primary = 0, secondary = 0;
+      if (key == XK_h) {
+        primary = selected_x - candidate_x;
+        secondary = std::abs(selected_y - candidate_y);
+      } else if (key == XK_j) {
+        primary = candidate_y - selected_y;
+        secondary = std::abs(selected_x - candidate_x);
+      } else if (key == XK_k) {
+        primary = selected_y - candidate_y;
+        secondary = std::abs(selected_x - candidate_x);
+      } else if (key == XK_l) {
+        primary = candidate_x - selected_x;
+        secondary = std::abs(selected_y - candidate_y);
+      } else {
+        return;
+      }
+      if (primary <= 0) continue;
+      // Prioritize alignment with the requested axis, then distance along it
+      // -- see the matching comment in focus_direction above.
+      const long score = static_cast<long>(secondary) * 10000L + primary;
+      if (!found || score < best_score) {
+        found = true;
+        best_score = score;
+        best_leaf = leaf;
+      }
+    }
+    if (!found || !best_leaf) return;
+
+    // remove_tiled drops the window from stack_order too; it's still tiled
+    // once it lands in best_leaf below, so put it back at the end.
+    remove_tiled(target, window);
+    target.stack_order.push_back(window);
+    best_leaf->tabs.push_back(window);
+    best_leaf->active_tab = best_leaf->tabs.size() - 1;
+    select_pane(best_leaf);
+  }
+
   void next_tab(int direction = 1) {
     Node* leaf = workspace().selected_leaf;
     if (!leaf || leaf->tabs.size() < 2) return;
@@ -5034,15 +5204,18 @@ class X11Backend final : public Backend {
         // Any click outside a popup's own window closes that popup first, then
         // falls through to normal click routing below so the click still does
         // whatever it would otherwise do (focus a client, hit a dock icon, ...).
-        // Dock clicks are exempt: handle_dock_button/handle_bottom_widget already
-        // toggle/switch popups correctly based on the pre-click state, so
-        // force-closing here first would make re-clicking a widget always
-        // reopen it instead of closing it.
+        // Dock clicks (and the bar's own power-menu corner) are exempt:
+        // handle_dock_button/handle_button already toggle/switch popups
+        // correctly based on the pre-click state, so force-closing here
+        // first would make re-clicking a widget always reopen it instead of
+        // closing it.
         if (hints_visible_) close_hints();
-        if (dock_monitor(event.xbutton.window) < 0) {
+        if (dock_monitor(event.xbutton.window) < 0 &&
+            !(event.xbutton.window == bar_ && event.xbutton.x >= DisplayWidth(display_, screen_) - kDockWidth)) {
           if (side_panel_ != SidePanel::Closed && event.xbutton.window != side_panel_window_) close_side_panel();
           if (launcher_visible_ && event.xbutton.window != launcher_window_) close_launcher();
           if (slider_visible_ && event.xbutton.window != slider_window_) close_slider_popup();
+          if (power_menu_visible_ && event.xbutton.window != power_menu_window_) close_power_menu();
         }
 
         if (side_panel_ != SidePanel::Closed && event.xbutton.window == side_panel_window_) {
@@ -5052,6 +5225,8 @@ class X11Backend final : public Backend {
             slider_dragging_ = true;
             handle_slider_position(event.xbutton.x);
           }
+        } else if (power_menu_visible_ && event.xbutton.window == power_menu_window_) {
+          handle_power_menu_button(event.xbutton);
         } else if (event.xbutton.window == launcher_window_) {
           if (event.xbutton.button == Button4) move_launcher_selection(-1);
           else if (event.xbutton.button == Button5) move_launcher_selection(1);
@@ -5085,6 +5260,7 @@ class X11Backend final : public Backend {
         if (event.xexpose.window == launcher_window_ && event.xexpose.count == 0) draw_launcher();
         if (event.xexpose.window == slider_window_ && event.xexpose.count == 0) draw_slider_popup();
         if (event.xexpose.window == side_panel_window_ && event.xexpose.count == 0) draw_side_panel();
+        if (event.xexpose.window == power_menu_window_ && event.xexpose.count == 0) draw_power_menu();
         if (event.xexpose.window == empty_pane_highlight_ && event.xexpose.count == 0) draw_empty_pane_highlight();
         if (event.xexpose.count == 0) {
           if (Node* leaf = pane_tab_bar_leaf_for(event.xexpose.window)) {
@@ -5165,6 +5341,10 @@ class X11Backend final : public Backend {
       return;
     }
     if (state == (Mod4Mask | ControlMask)) {
+      if (workspace().mode == LayoutMode::Manual) {
+        if (key == XK_h || key == XK_j || key == XK_k || key == XK_l) move_client_direction(key);
+        return;
+      }
       if (key == XK_h) adjust_mfact(-kResizeStep);
       if (key == XK_l) adjust_mfact(kResizeStep);
       if (key == XK_j) focus_stack(1);
@@ -5210,20 +5390,23 @@ class X11Backend final : public Backend {
       }
     }
     if (event.window == bar_) {
-      // Launcher and layout-mode toggle live in the outer kDockWidth corners
-      // now that the bar spans the full display width.
+      // The launcher and the power menu toggle live in the outer kDockWidth
+      // corners now that the bar spans the full display width.
       if (event.x < kDockWidth) {
         if (event.button == Button1) toggle_project_picker(false);
         return;
       }
       if (event.x >= DisplayWidth(display_, screen_) - kDockWidth) {
-        if (event.button == Button1) cycle_layout();
-        if (event.button == Button3) { cycle_layout(); cycle_layout(); }
+        if (event.button == Button1) { power_menu_visible_ ? close_power_menu() : open_power_menu(); }
         return;
       }
-      if (event.x < workspace_start_x_) {
-        // Clicking the current-project/layout-mode label cycles the layout,
-        // same as clicking the layout icon in the bar's right-hand corner.
+      if (event.x < workspace_start_x_) return;
+      const int workspace_index = (event.x - workspace_start_x_) / 84;
+      if (workspace_index >= 0 && workspace_index < kWorkspaceCount) {
+        switch_workspace(workspace_index);
+        return;
+      }
+      if (event.x >= layout_widget_start_x_ && event.x < layout_widget_end_x_) {
         if (event.button == Button1) cycle_layout();
         if (event.button == Button3) {
           workspace().mode = LayoutMode::Monocle;
@@ -5231,16 +5414,11 @@ class X11Backend final : public Backend {
         }
         return;
       }
-      const int workspace_index = (event.x - workspace_start_x_) / 84;
-      if (workspace_index >= 0 && workspace_index < kWorkspaceCount) {
-        switch_workspace(workspace_index);
-      } else {
-        for (const BarHit& hit : task_hits_) {
-          if (event.x >= hit.left && event.x < hit.right) {
-            focus(hit.window);
-            arrange();
-            break;
-          }
+      for (const BarHit& hit : task_hits_) {
+        if (event.x >= hit.left && event.x < hit.right) {
+          focus(hit.window);
+          arrange();
+          break;
         }
       }
       return;
@@ -5290,6 +5468,10 @@ class X11Backend final : public Backend {
   bool slider_visible_ = false;
   bool slider_dragging_ = false;
   SliderKind slider_kind_ = SliderKind::Backlight;
+  Window power_menu_window_ = None;
+  bool power_menu_visible_ = false;
+  int power_menu_diameter_ = 64;
+  int power_menu_height_ = 150;
   Window empty_pane_highlight_ = None;
   std::unordered_map<Node*, Window> pane_tab_bars_;
   Window side_panel_window_ = None;
@@ -5350,6 +5532,8 @@ class X11Backend final : public Backend {
   std::vector<BarHit> task_hits_;
   int bar_task_list_x_ = 960;
   int workspace_start_x_ = kDockWidth;
+  int layout_widget_start_x_ = kDockWidth;
+  int layout_widget_end_x_ = kDockWidth;
   bool hints_visible_ = false;
   std::string hint_query_;
   std::vector<Hint> hints_;
