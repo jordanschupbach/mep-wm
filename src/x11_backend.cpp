@@ -15,6 +15,7 @@
 #include <cerrno>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <ctime>
@@ -59,6 +60,12 @@ constexpr int kTraySpacing = 4;
 constexpr int kLauncherWidth = 640;
 constexpr int kLauncherMaxRows = 8;
 constexpr int kLeftDockCount = 8;
+// Side panels (notifications, todos, agents, help, info) share this layout so
+// they all read as one family of widget rather than four different designs.
+constexpr int kSidePanelWidth = 420;
+constexpr int kSidePanelCardRadius = 10;
+constexpr int kSidePanelCloseSize = 28;
+constexpr int kSidePanelCloseMargin = 10;
 // Vertical offset that centers the fixed-size stack of left-dock launcher
 // icons within a dock that's taller than the icons themselves.
 int left_dock_top_offset(int side_height) {
@@ -326,6 +333,7 @@ class X11Backend final : public Backend {
       XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &bar_foreground_);
       XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &bar_background_);
       XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &bar_selected_);
+      XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &bar_card_);
       XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &hint_background_);
       XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &hint_foreground_);
       XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &hint_matched_);
@@ -1467,6 +1475,28 @@ class X11Backend final : public Backend {
     if (draw) XftDrawDestroy(draw);
   }
 
+  // Fills a rectangle with its corners rounded to `radius`, approximated with
+  // straight fills plus quarter-circle arcs -- there's no anti-aliasing
+  // available here, so corners are stepped rather than smooth, matching the
+  // technique the power menu already uses for its circular buttons
+  // (XFillArc). Caller sets the foreground color first, same as
+  // XFillRectangle elsewhere in this file.
+  void fill_rounded_rect(Window window, int x, int y, int width, int height, int radius) {
+    radius = std::max(0, std::min({radius, width / 2, height / 2}));
+    if (radius == 0) {
+      XFillRectangle(display_, window, bar_gc_, x, y, width, height);
+      return;
+    }
+    const int diameter = radius * 2;
+    XFillRectangle(display_, window, bar_gc_, x + radius, y, width - diameter, height);
+    XFillRectangle(display_, window, bar_gc_, x, y + radius, radius, height - diameter);
+    XFillRectangle(display_, window, bar_gc_, x + width - radius, y + radius, radius, height - diameter);
+    XFillArc(display_, window, bar_gc_, x, y, diameter, diameter, 90 * 64, 90 * 64);
+    XFillArc(display_, window, bar_gc_, x + width - diameter, y, diameter, diameter, 0, 90 * 64);
+    XFillArc(display_, window, bar_gc_, x, y + height - diameter, diameter, diameter, 180 * 64, 90 * 64);
+    XFillArc(display_, window, bar_gc_, x + width - diameter, y + height - diameter, diameter, diameter, 270 * 64, 90 * 64);
+  }
+
   void draw_dock_cell(Window window, int y, int width, int height, const std::string& label, bool selected = false) {
     if (selected) {
       XSetForeground(display_, bar_gc_, bar_selected_.pixel);
@@ -2247,10 +2277,12 @@ class X11Backend final : public Backend {
         {"Super+comma / Super+period", "Focus previous/next monitor"},
         {"Super+Shift+comma / Super+Shift+period", "Send window to previous/next monitor"},
         {"Super+1..9", "Switch workspace"},
+        {"Super+Shift+1..9", "Send focused window to workspace"},
         {"Super+r", "Reload config"},
         {"Super+Shift+r", "Restart mepwm"},
         {"Super+Shift+t", "Theme picker"},
         {"Super+Shift+slash", "Toggle this help panel"},
+        {"?", "In Notifications/Todos/Agents/Info: toggle that panel's contextual help (Esc closes it)"},
         {"Super+Shift+q", "Quit"},
         {"Super+drag (left click)", "Move window"},
         {"Super+drag (right click)", "Resize window"},
@@ -2259,11 +2291,69 @@ class X11Backend final : public Backend {
     return bindings;
   }
 
+  // x where the header's "clear" label starts, left of the close button --
+  // shared by draw_side_panel and handle_side_panel_button so the click
+  // target always matches what's drawn.
+  int side_panel_clear_x() {
+    return side_panel_close_x() - 16 - text_width("clear");
+  }
+
+  int side_panel_close_x() const { return kSidePanelWidth - kSidePanelCloseMargin - kSidePanelCloseSize; }
+  int side_panel_close_y() const { return (kBarHeight - kSidePanelCloseSize) / 2; }
+
+  bool side_panel_close_hit(int x, int y) const {
+    const int x1 = side_panel_close_x();
+    const int y1 = side_panel_close_y();
+    return x >= x1 && x < x1 + kSidePanelCloseSize && y >= y1 && y < y1 + kSidePanelCloseSize;
+  }
+
+  // Notifications/Todos/Agents/Info are the "actionable" panels: they grab
+  // the keyboard while open (Escape closes, ? toggles a contextual help
+  // layer) and reserve a footer row for that "? Toggle help" hint. Help is
+  // already nothing but keybindings, so it's excluded from both.
+  bool side_panel_grabs_keyboard(SidePanel panel) const {
+    return panel == SidePanel::Notifications || panel == SidePanel::Todos ||
+           panel == SidePanel::Agents || panel == SidePanel::Info;
+  }
+
+  int side_panel_footer_height() const { return side_panel_grabs_keyboard(side_panel_) ? kBarHeight : 0; }
+
+  // Pixel height of the panel's scrollable content window (panel height
+  // minus the header and, for actionable panels, the footer) -- shared by
+  // the wheel-scroll clamp and ensure_todo_selection_visible so they agree
+  // on how much is actually visible at once.
+  int side_panel_visible_height() {
+    return std::max(1, monitor(side_panel_monitor_).height - 3 * kBarHeight - side_panel_footer_height());
+  }
+
+  bool side_panel_footer_hit(int x, int y, int panel_height) const {
+    const int top = panel_height - side_panel_footer_height();
+    return side_panel_footer_height() > 0 && y >= top && y < panel_height;
+  }
+
+  // Contextual keybindings for whichever panel is open, shown as an overlay
+  // in place of the panel's normal content when side_panel_help_visible_ is
+  // toggled on (see the "? Toggle help" footer).
+  std::string side_panel_help_body() const {
+    switch (side_panel_) {
+      case SidePanel::Notifications:
+        return "Click a notification to mark it read\nMiddle-click to dismiss it\nclear (top) dismisses all\nScroll for more, Esc closes";
+      case SidePanel::Todos:
+        return "a add\nd mark done\ns start/stop clocking\n^n / ^p or up/down to move\nEsc closes";
+      case SidePanel::Agents:
+        return "Click an agent to focus its window\nMiddle-click a file-backed agent to dismiss it\nclear (top) dismisses all, Esc closes";
+      case SidePanel::Info:
+        return "Click a row to act on it\nEsc closes";
+      default:
+        return "";
+    }
+  }
+
   void draw_side_panel() {
     if (side_panel_ == SidePanel::Closed || side_panel_window_ == None) return;
     if (side_panel_ == SidePanel::Todos) load_todos();
     if (side_panel_ == SidePanel::Agents) refresh_agents();
-    constexpr int width = 360;
+    constexpr int width = kSidePanelWidth;
     const Monitor& target = monitor(side_panel_monitor_);
     const int height = std::max(1, target.height - 2 * kBarHeight);
     XMoveResizeWindow(display_, side_panel_window_, target.x + target.width - kDockWidth - width,
@@ -2279,39 +2369,74 @@ class X11Backend final : public Backend {
     if (side_panel_ == SidePanel::Info) title = info_panel_title_;
     draw_dock_text(side_panel_window_, 12, 20, title, bar_foreground_);
     if (side_panel_ == SidePanel::Notifications && !notifications_.empty())
-      draw_dock_text(side_panel_window_, width - 52, 20, "clear", bar_foreground_);
+      draw_dock_text(side_panel_window_, side_panel_clear_x(), 20, "clear", bar_foreground_);
     if (side_panel_ == SidePanel::Agents && std::any_of(agents_.begin(), agents_.end(), [](const AgentStatus& agent) { return agent.from_file; }))
-      draw_dock_text(side_panel_window_, width - 52, 20, "clear", bar_foreground_);
+      draw_dock_text(side_panel_window_, side_panel_clear_x(), 20, "clear", bar_foreground_);
+    // Every panel gets the same rounded close button in its top-right
+    // corner -- clicking it (or the existing right-click-anywhere shortcut)
+    // closes whichever panel is open.
+    XSetForeground(display_, bar_gc_, bar_card_.pixel);
+    fill_rounded_rect(side_panel_window_, side_panel_close_x(), side_panel_close_y(), kSidePanelCloseSize,
+                      kSidePanelCloseSize, kSidePanelCardRadius / 2);
+    draw_dock_text(side_panel_window_, side_panel_close_x() + (kSidePanelCloseSize - text_width("x")) / 2,
+                   side_panel_close_y() + (kSidePanelCloseSize + bar_font_->ascent - bar_font_->descent) / 2, "x", bar_foreground_);
     XSetForeground(display_, bar_gc_, border_normal_pixel_);
     XFillRectangle(display_, side_panel_window_, bar_gc_, 0, kBarHeight - 1, width, 1);
+    const int footer_height = side_panel_footer_height();
+    const int content_bottom = height - footer_height;
     side_panel_rows_.clear();
     int y = kBarHeight + 6 - side_panel_scroll_offset_;
+    // Every row is drawn as a rounded card (bar_card_, or bar_selected_ when
+    // highlighted) so all five side panels share one look, rather than only
+    // the selected row standing out against a flat background.
     auto row = [&](const std::string& text, bool selected = false) {
-      if (y + kBarHeight > kBarHeight && y < height && selected) {
-        XSetForeground(display_, bar_gc_, bar_selected_.pixel);
-        XFillRectangle(display_, side_panel_window_, bar_gc_, 6, y, width - 12, kBarHeight);
+      if (y + kBarHeight > kBarHeight && y < content_bottom && !text.empty()) {
+        XSetForeground(display_, bar_gc_, (selected ? bar_selected_ : bar_card_).pixel);
+        fill_rounded_rect(side_panel_window_, 8, y, width - 16, kBarHeight, kSidePanelCardRadius);
       }
-      if (y + kBarHeight > kBarHeight && y < height)
-        draw_dock_text(side_panel_window_, 12, y + (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2,
+      if (y + kBarHeight > kBarHeight && y < content_bottom)
+        draw_dock_text(side_panel_window_, 16, y + (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2,
                        text, selected ? bar_background_ : bar_foreground_);
       side_panel_rows_.push_back(y);
       y += kBarHeight + 2;
     };
-    if (side_panel_ == SidePanel::Notifications) {
+    // Todo text can run much longer than the other panels' rows, so its
+    // cards wrap to a couple of lines and grow to fit instead of clipping.
+    auto todo_row = [&](const std::string& text, bool selected = false) {
+      const std::vector<std::string> lines = wrap_lines(text, width - 32, 2);
+      const int line_height = todo_card_line_height();
+      const int card_height = todo_item_height(text);
+      if (y + card_height > kBarHeight && y < content_bottom && !text.empty()) {
+        XSetForeground(display_, bar_gc_, (selected ? bar_selected_ : bar_card_).pixel);
+        fill_rounded_rect(side_panel_window_, 8, y, width - 16, card_height, kSidePanelCardRadius);
+      }
+      if (y + card_height > kBarHeight && y < content_bottom) {
+        int text_y = y + (card_height - static_cast<int>(lines.size()) * line_height) / 2 + bar_font_->ascent;
+        for (const std::string& line : lines) {
+          draw_dock_text(side_panel_window_, 16, text_y, line, selected ? bar_background_ : bar_foreground_);
+          text_y += line_height;
+        }
+      }
+      side_panel_rows_.push_back(y);
+      y += card_height + 6;
+    };
+    if (side_panel_help_visible_ && side_panel_grabs_keyboard(side_panel_)) {
+      std::istringstream lines(side_panel_help_body());
+      for (std::string line; std::getline(lines, line);) row(line);
+    } else if (side_panel_ == SidePanel::Notifications) {
       if (notifications_.empty()) row("No notifications");
       for (const Notification& notification : notifications_) {
         row((notification.unread ? "• " : "  ") + notification.app + ": " + notification.summary, notification.unread);
         row(notification.body.empty() ? "" : "  " + notification.body, notification.unread);
       }
     } else if (side_panel_ == SidePanel::Todos) {
-      row("a add   d done   s start/stop   ^n/^p move");
       if (todo_input_active_) row("+ " + todo_input_text_ + "_", true);
       if (todos_.empty() && !todo_input_active_) {
         const std::string path = todo_org_path();
         row(path.empty() || !std::filesystem::exists(path) ? "No TODO.org in this project" : "No pending TODO items");
       }
       for (std::size_t index = 0; index < todos_.size(); ++index)
-        row((todos_[index].active ? "[*] " : "[ ] ") + todos_[index].text, !todo_input_active_ && static_cast<int>(index) == todo_selected_);
+        todo_row(todo_row_text(todos_[index]), !todo_input_active_ && static_cast<int>(index) == todo_selected_);
     } else if (side_panel_ == SidePanel::Agents) {
       if (agents_.empty()) row("No coding agents are running");
       for (const AgentStatus& agent : agents_)
@@ -2328,28 +2453,49 @@ class X11Backend final : public Backend {
       std::istringstream lines(info_panel_body_);
       for (std::string line; std::getline(lines, line);) row(line);
     }
+    // "? Toggle help" footer -- the one hint every actionable panel keeps
+    // visible, instead of permanently showing its instructions inline (as
+    // Todos used to) or requiring the separate global Keybindings panel.
+    if (footer_height > 0) {
+      XSetForeground(display_, bar_gc_, border_normal_pixel_);
+      XFillRectangle(display_, side_panel_window_, bar_gc_, 0, content_bottom, width, 1);
+      const std::string hint = side_panel_help_visible_ ? "?  Hide help" : "?  Toggle help";
+      draw_dock_text(side_panel_window_, (width - text_width(hint)) / 2,
+                     content_bottom + (footer_height + bar_font_->ascent - bar_font_->descent) / 2, hint, bar_foreground_);
+    }
     XFlush(display_);
   }
 
   // Todos is the one side panel that takes keyboard focus (arrow/^n/^p
   // navigation, a/d actions), so entering/leaving it grabs/ungrabs the
   // keyboard the same way the launcher and hint overlays do.
+  // Grabbing the keyboard while a panel is open is what lets a bare "?"
+  // (no Super) reach mepwm instead of whatever client last had focus --
+  // shared by every panel side_panel_grabs_keyboard() covers.
+  void enter_side_panel_keyboard() {
+    XGrabKeyboard(display_, root_, False, GrabModeAsync, GrabModeAsync, CurrentTime);
+  }
+
+  void leave_side_panel_keyboard() { XUngrabKeyboard(display_, CurrentTime); }
+
   void enter_todo_panel() {
     load_todos();
     todo_selected_ = todos_.empty() ? -1 : 0;
     todo_input_active_ = false;
     todo_input_text_.clear();
-    XGrabKeyboard(display_, root_, False, GrabModeAsync, GrabModeAsync, CurrentTime);
+    enter_side_panel_keyboard();
   }
 
   void leave_todo_panel() {
-    XUngrabKeyboard(display_, CurrentTime);
+    leave_side_panel_keyboard();
     todo_input_active_ = false;
     todo_input_text_.clear();
   }
 
   void close_side_panel() {
     if (side_panel_ == SidePanel::Todos) leave_todo_panel();
+    else if (side_panel_grabs_keyboard(side_panel_)) leave_side_panel_keyboard();
+    side_panel_help_visible_ = false;
     side_panel_ = SidePanel::Closed;
     if (side_panel_window_ != None) XUnmapWindow(display_, side_panel_window_);
     draw_docks();
@@ -2363,21 +2509,36 @@ class X11Backend final : public Backend {
       attributes.background_pixel = bar_background_.pixel;
       attributes.border_pixel = bar_selected_.pixel;
       attributes.event_mask = ExposureMask | ButtonPressMask;
-      side_panel_window_ = XCreateWindow(display_, root_, 0, 0, 360, 200, 1, DefaultDepth(display_, screen_), CopyFromParent,
+      side_panel_window_ = XCreateWindow(display_, root_, 0, 0, kSidePanelWidth, 200, 1, DefaultDepth(display_, screen_), CopyFromParent,
                                          DefaultVisual(display_, screen_), CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWEventMask,
                                          &attributes);
       XDefineCursor(display_, side_panel_window_, cursor_);
     }
     if (side_panel_ == SidePanel::Todos) leave_todo_panel();
+    else if (side_panel_grabs_keyboard(side_panel_)) leave_side_panel_keyboard();
     side_panel_ = panel;
+    side_panel_help_visible_ = false;
     side_panel_monitor_ = current_monitor_;
     side_panel_scroll_offset_ = 0;
     if (panel == SidePanel::Notifications)
       for (Notification& notification : notifications_) notification.unread = false;
     if (panel == SidePanel::Todos) enter_todo_panel();
+    else if (side_panel_grabs_keyboard(panel)) enter_side_panel_keyboard();
     XMapRaised(display_, side_panel_window_);
     draw_side_panel();
     draw_docks();
+  }
+
+  // Escape closes, ? toggles the contextual help layer -- shared by every
+  // panel except Todos (which has its own handle_todo_key for add/done/etc)
+  // and Help (which is already nothing but keybindings).
+  void handle_side_panel_key(const XKeyEvent& event) {
+    // XLookupString (not XkbKeycodeToKeysym) so Shift+/ resolves to "?"
+    // rather than the unshifted "/" -- matches handle_todo_key's approach.
+    KeySym key = NoSymbol;
+    XLookupString(const_cast<XKeyEvent*>(&event), nullptr, 0, &key, nullptr);
+    if (key == XK_Escape) { close_side_panel(); return; }
+    if (key == XK_question) { side_panel_help_visible_ = !side_panel_help_visible_; draw_side_panel(); return; }
   }
 
   void move_todo_selection(int delta) {
@@ -2386,19 +2547,43 @@ class X11Backend final : public Backend {
     todo_selected_ = todo_selected_ < 0 ? 0 : (todo_selected_ + delta + count) % count;
   }
 
-  // Keeps the selected row inside the panel's visible scroll window,
-  // mirroring the row-height math handle_side_panel_button's wheel handler
-  // already uses for this panel.
+  std::string todo_row_text(const TodoItem& todo) const { return (todo.active ? "[*] " : "[ ] ") + todo.text; }
+
+  int todo_card_line_height() const { return bar_font_->ascent + bar_font_->descent + 6; }
+
+  // Height of a todo card once its text is wrapped to at most 2 lines --
+  // shared by draw_side_panel, ensure_todo_selection_visible, and the wheel
+  // scroll clamp so all three agree on where each item actually sits.
+  int todo_item_height(const std::string& text) {
+    const std::size_t lines = std::max<std::size_t>(1, wrap_lines(text, kSidePanelWidth - 32, 2).size());
+    return std::max(kBarHeight, static_cast<int>(lines) * todo_card_line_height() + 14);
+  }
+
+  // Total content height of the todo panel at its current item list, used to
+  // clamp scrolling (see handle_side_panel_button's wheel handler).
+  int todo_content_height() {
+    const int row_height = kBarHeight + 2;
+    int height = row_height * (todo_input_active_ ? 1 : 0);
+    if (todos_.empty() && !todo_input_active_) height += row_height;
+    for (const TodoItem& todo : todos_) height += todo_item_height(todo_row_text(todo)) + 6;
+    return height;
+  }
+
+  // Keeps the selected row inside the panel's visible scroll window. Todo
+  // cards can be taller than one line (wrapped text), so this walks actual
+  // per-item heights rather than assuming a uniform row height.
   void ensure_todo_selection_visible() {
     if (todo_selected_ < 0) return;
     const int row_height = kBarHeight + 2;
-    const int header_rows = 1 + (todo_input_active_ ? 1 : 0);
-    const int index = header_rows + todo_selected_;
-    const int visible = std::max(1, (monitor(side_panel_monitor_).height - 3 * kBarHeight) / row_height);
-    int scroll_row = side_panel_scroll_offset_ / row_height;
-    if (index < scroll_row) scroll_row = index;
-    else if (index >= scroll_row + visible) scroll_row = index - visible + 1;
-    side_panel_scroll_offset_ = std::max(0, scroll_row) * row_height;
+    int item_top = row_height * (todo_input_active_ ? 1 : 0);
+    for (int index = 0; index < todo_selected_; ++index)
+      item_top += todo_item_height(todo_row_text(todos_[static_cast<std::size_t>(index)])) + 6;
+    const int item_height = todo_item_height(todo_row_text(todos_[static_cast<std::size_t>(todo_selected_)]));
+    const int visible = side_panel_visible_height();
+    if (item_top < side_panel_scroll_offset_) side_panel_scroll_offset_ = item_top;
+    else if (item_top + item_height > side_panel_scroll_offset_ + visible)
+      side_panel_scroll_offset_ = item_top + item_height - visible;
+    side_panel_scroll_offset_ = std::max(0, side_panel_scroll_offset_);
   }
 
   void handle_todo_key(const XKeyEvent& event) {
@@ -2430,6 +2615,8 @@ class X11Backend final : public Backend {
       return;
     }
     if (key == XK_Escape || (state == Mod4Mask && key == XK_t)) { close_side_panel(); return; }
+    if (key == XK_question) { side_panel_help_visible_ = !side_panel_help_visible_; draw_side_panel(); return; }
+    if (side_panel_help_visible_) return;
     if (state == 0 && key == XK_a) { todo_input_active_ = true; todo_input_text_.clear(); draw_side_panel(); return; }
     if (state == 0 && key == XK_d && todo_selected_ >= 0 && static_cast<std::size_t>(todo_selected_) < todos_.size()) {
       mark_todo_done(todos_[static_cast<std::size_t>(todo_selected_)]);
@@ -2548,26 +2735,40 @@ class X11Backend final : public Backend {
 
   void handle_side_panel_button(const XButtonEvent& event) {
     if (event.window != side_panel_window_) return;
+    const int panel_height = std::max(1, monitor(side_panel_monitor_).height - 2 * kBarHeight);
     if (event.button == Button3) { close_side_panel(); return; }
-    if (event.button == Button4 || event.button == Button5) {
-      const int delta = event.button == Button4 ? -3 * (kBarHeight + 2) : 3 * (kBarHeight + 2);
-      const int rows = side_panel_ == SidePanel::Notifications ? static_cast<int>(notifications_.size() * 2) :
-                       side_panel_ == SidePanel::Todos ? static_cast<int>(todos_.size()) :
-                       side_panel_ == SidePanel::Agents ? static_cast<int>(agents_.size()) : static_cast<int>(side_panel_rows_.size());
-      const int visible = std::max(1, (monitor(side_panel_monitor_).height - 3 * kBarHeight) / (kBarHeight + 2));
-      side_panel_scroll_offset_ = std::clamp(side_panel_scroll_offset_ + delta, 0, std::max(0, (rows - visible) * (kBarHeight + 2)));
+    if (event.button == Button1 && side_panel_close_hit(event.x, event.y)) { close_side_panel(); return; }
+    if (event.button == Button1 && side_panel_footer_hit(event.x, event.y, panel_height)) {
+      side_panel_help_visible_ = !side_panel_help_visible_;
       draw_side_panel();
       return;
     }
-    if (event.y < kBarHeight && event.button == Button1 && event.x >= 260 && side_panel_ == SidePanel::Notifications) {
+    if (event.button == Button4 || event.button == Button5) {
+      const int delta = event.button == Button4 ? -3 * (kBarHeight + 2) : 3 * (kBarHeight + 2);
+      int max_scroll;
+      if (side_panel_ == SidePanel::Todos && !side_panel_help_visible_) {
+        max_scroll = std::max(0, todo_content_height() - side_panel_visible_height());
+      } else {
+        const int rows = side_panel_help_visible_ ? static_cast<int>(side_panel_rows_.size()) :
+                         side_panel_ == SidePanel::Notifications ? static_cast<int>(notifications_.size() * 2) :
+                         side_panel_ == SidePanel::Agents ? static_cast<int>(agents_.size()) : static_cast<int>(side_panel_rows_.size());
+        const int visible = std::max(1, side_panel_visible_height() / (kBarHeight + 2));
+        max_scroll = std::max(0, (rows - visible) * (kBarHeight + 2));
+      }
+      side_panel_scroll_offset_ = std::clamp(side_panel_scroll_offset_ + delta, 0, max_scroll);
+      draw_side_panel();
+      return;
+    }
+    if (event.y < kBarHeight && event.button == Button1 && event.x >= side_panel_clear_x() - 8 && side_panel_ == SidePanel::Notifications) {
       for (const Notification& notification : notifications_) emit_notification_closed(notification.id, 2);
       notifications_.clear();
       draw_side_panel(); draw_docks(); return;
     }
-    if (side_panel_ == SidePanel::Agents && event.y < kBarHeight && event.button == Button1 && event.x >= 260) {
+    if (side_panel_ == SidePanel::Agents && event.y < kBarHeight && event.button == Button1 && event.x >= side_panel_clear_x() - 8) {
       for (const AgentStatus& agent : agents_) if (agent.from_file && !agent.file_path.empty()) unlink(agent.file_path.c_str());
       refresh_agents(); draw_side_panel(); draw_docks(); return;
     }
+    if (side_panel_help_visible_) return;
     const int row = static_cast<int>((event.y - kBarHeight - 6 + side_panel_scroll_offset_) / (kBarHeight + 2));
     if (row < 0) return;
     if (side_panel_ == SidePanel::Info && event.button == Button1) {
@@ -2716,9 +2917,12 @@ class X11Backend final : public Backend {
     XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &bar_foreground_);
     XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &bar_background_);
     XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &bar_selected_);
+    XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &bar_card_);
     XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), palette[0].c_str(), &bar_foreground_);
     XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), palette[1].c_str(), &bar_background_);
     XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), palette[2].c_str(), &bar_selected_);
+    XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_),
+                      mix_hex(palette[1], palette[0], 0.10).c_str(), &bar_card_);
     draw_bar(); draw_docks();
     refresh_wallpaper();
   }
@@ -2746,6 +2950,30 @@ class X11Backend final : public Backend {
       return false;
     }
     return (0.299 * r + 0.587 * g + 0.114 * b) > 140.0;
+  }
+
+  // Blends `t` of hex_b into hex_a (used to derive the side-panel card tint
+  // from the active theme). Falls back to hex_a unchanged for a non-hex
+  // color -- e.g. an X11 color name from a Lua theme -- rather than
+  // throwing, matching color_is_light's tolerance for that case.
+  static std::string mix_hex(const std::string& hex_a, const std::string& hex_b, double t) {
+    if (hex_a.size() != 7 || hex_a[0] != '#' || hex_b.size() != 7 || hex_b[0] != '#') return hex_a;
+    try {
+      const int ar = std::stoi(hex_a.substr(1, 2), nullptr, 16);
+      const int ag = std::stoi(hex_a.substr(3, 2), nullptr, 16);
+      const int ab = std::stoi(hex_a.substr(5, 2), nullptr, 16);
+      const int br = std::stoi(hex_b.substr(1, 2), nullptr, 16);
+      const int bg = std::stoi(hex_b.substr(3, 2), nullptr, 16);
+      const int bb = std::stoi(hex_b.substr(5, 2), nullptr, 16);
+      const int r = std::clamp(static_cast<int>(std::lround(ar + (br - ar) * t)), 0, 255);
+      const int g = std::clamp(static_cast<int>(std::lround(ag + (bg - ag) * t)), 0, 255);
+      const int b = std::clamp(static_cast<int>(std::lround(ab + (bb - ab) * t)), 0, 255);
+      char buffer[8];
+      std::snprintf(buffer, sizeof(buffer), "#%02x%02x%02x", r, g, b);
+      return std::string(buffer);
+    } catch (const std::exception&) {
+      return hex_a;
+    }
   }
 
   // Derived from the active palette's background (palette[1], see
@@ -3163,6 +3391,8 @@ class X11Backend final : public Backend {
                       "#202124", &bar_background_);
     XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_),
                       "#5294e2", &bar_selected_);
+    XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_),
+                      mix_hex("#202124", "#f8f8f2", 0.10).c_str(), &bar_card_);
     hint_font_ = XftFontOpenName(display_, screen_, "sans-11");
     if (!hint_font_) hint_font_ = bar_font_;
     XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_),
@@ -3226,6 +3456,63 @@ class X11Backend final : public Backend {
       offset += bytes;
     }
     return width;
+  }
+
+  // Longest UTF-8-safe byte prefix of `text` that renders within max_width
+  // pixels. Always advances at least one codepoint so callers can't spin
+  // forever on a glyph wider than max_width by itself.
+  std::size_t fit_prefix_bytes(const std::string& text, int max_width) {
+    int width = 0;
+    std::size_t offset = 0;
+    while (offset < text.size()) {
+      FcChar32 codepoint;
+      const std::size_t bytes = utf8_codepoint(text, offset, &codepoint);
+      XGlyphInfo extent{};
+      XftTextExtentsUtf8(display_, XftCharExists(display_, bar_font_, codepoint) ? bar_font_ : fallback_font(codepoint),
+                          reinterpret_cast<const FcChar8*>(text.data() + offset), static_cast<int>(bytes), &extent);
+      if (offset > 0 && width + extent.xOff > max_width) break;
+      width += extent.xOff;
+      offset += bytes;
+    }
+    return offset;
+  }
+
+  // Word-wraps `text` into at most max_lines lines that each fit max_width
+  // pixels, hard-breaking any single word that's wider than max_width on its
+  // own. If the text still doesn't fit, the last line is trimmed and given a
+  // trailing ellipsis so nothing renders past the panel's edge.
+  std::vector<std::string> wrap_lines(const std::string& text, int max_width, std::size_t max_lines) {
+    std::vector<std::string> lines;
+    if (max_lines == 0) return lines;
+    std::vector<std::string> words;
+    std::istringstream stream(text);
+    for (std::string word; stream >> word;) words.push_back(word);
+    if (words.empty()) return lines;
+
+    std::size_t index = 0;
+    while (index < words.size() && lines.size() < max_lines) {
+      if (text_width(words[index]) > max_width) {
+        const std::size_t split = fit_prefix_bytes(words[index], max_width);
+        std::string remainder = words[index].substr(split);
+        words[index] = words[index].substr(0, split);
+        if (!remainder.empty()) words.insert(words.begin() + static_cast<long>(index) + 1, std::move(remainder));
+      }
+      std::string line = words[index++];
+      while (index < words.size()) {
+        const std::string candidate = line + " " + words[index];
+        if (text_width(candidate) > max_width) break;
+        line = candidate;
+        ++index;
+      }
+      lines.push_back(std::move(line));
+    }
+    if (index < words.size() && !lines.empty()) {
+      std::string& last = lines.back();
+      const int ellipsis_width = text_width("…");
+      const std::size_t keep = fit_prefix_bytes(last, std::max(0, max_width - ellipsis_width));
+      last = last.substr(0, keep) + "…";
+    }
+    return lines;
   }
 
   void draw_text(int x, const std::string& value, const XftColor& color) {
@@ -3767,7 +4054,8 @@ class X11Backend final : public Backend {
                                  XK_a, XK_z, XK_m, XK_r, XK_minus, XK_comma, XK_period, XK_1, XK_2, XK_3,
                                  XK_4, XK_5, XK_6, XK_7, XK_8, XK_9, XK_w, XK_b, XK_d, XK_f, XK_t};
     const KeySym shift_keys[] = {XK_q, XK_space, XK_c, XK_minus, XK_comma, XK_period, XK_h, XK_j, XK_k, XK_l,
-                                 XK_r, XK_d, XK_t, XK_slash, XK_Tab};
+                                 XK_r, XK_d, XK_t, XK_slash, XK_Tab, XK_1, XK_2, XK_3, XK_4, XK_5, XK_6,
+                                 XK_7, XK_8, XK_9};
     const KeySym ctrl_keys[] = {XK_h, XK_j, XK_k, XK_l};
     for (const unsigned int ignored : ignored_modifiers) {
       for (const KeySym key : plain_keys) {
@@ -4672,6 +4960,38 @@ class X11Backend final : public Backend {
     draw_bar();
   }
 
+  void send_to_workspace(Window window, int index) {
+    if (window == None || index < 0 || index >= kWorkspaceCount) return;
+    const int source = find_workspace(window);
+    if (source < 0 || source == index) return;
+    Workspace& from = workspaces_[source];
+    Workspace& to = workspaces_[index];
+    const bool floating = window_state_[window].floating;
+    forget_window(from, window);
+    if (floating) {
+      insert_floating(to, window);
+    } else {
+      insert_tiled(to, window);
+    }
+    if (source == current_workspace_) {
+      if (from.focused != None) {
+        focus(from.focused);
+      } else {
+        XSetInputFocus(display_, root_, RevertToPointerRoot, CurrentTime);
+        Window none = None;
+        set_active_window(none);
+      }
+    }
+    if (index == current_workspace_) {
+      show_window(window);
+      focus(window);
+    } else {
+      hide_window(window);
+    }
+    arrange();
+    draw_bar();
+  }
+
   void hide_workspace(const Workspace& target) {
     std::vector<Window> windows;
     collect_windows(target.root.get(), windows);
@@ -5320,6 +5640,7 @@ class X11Backend final : public Backend {
         if (hints_visible_) handle_hint_key(event.xkey);
         else if (launcher_visible_) handle_launcher_key(event.xkey);
         else if (side_panel_ == SidePanel::Todos) handle_todo_key(event.xkey);
+        else if (side_panel_grabs_keyboard(side_panel_)) handle_side_panel_key(event.xkey);
         else handle_key(event.xkey);
         break;
       case PropertyNotify:
@@ -5362,6 +5683,7 @@ class X11Backend final : public Backend {
       if (key == XK_d) adjust_nmaster(1);
       if (key == XK_t) open_theme_panel();
       if (key == XK_slash) toggle_side_panel(SidePanel::Help);
+      if (key >= XK_1 && key <= XK_9) send_to_workspace(workspace().focused, static_cast<int>(key - XK_1));
       return;
     }
     if (state == (Mod4Mask | ControlMask)) {
@@ -5503,6 +5825,7 @@ class X11Backend final : public Backend {
   std::size_t side_panel_monitor_ = 0;
   std::vector<int> side_panel_rows_;
   int side_panel_scroll_offset_ = 0;
+  bool side_panel_help_visible_ = false;
   std::vector<Notification> notifications_;
   unsigned int next_notification_id_ = 1;
   std::vector<TodoItem> todos_;
@@ -5552,6 +5875,10 @@ class X11Backend final : public Backend {
   XftColor bar_foreground_{};
   XftColor bar_background_{};
   XftColor bar_selected_{};
+  // A subtle tint between background and foreground, used for side-panel
+  // item cards so they read as distinct rows without the loudness of the
+  // accent color. Derived from the active theme so it adapts automatically.
+  XftColor bar_card_{};
   std::unordered_map<FcChar32, XftFont*> fallback_fonts_;
   std::vector<BarHit> task_hits_;
   int bar_task_list_x_ = 960;

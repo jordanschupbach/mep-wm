@@ -53,6 +53,11 @@ Resize the selected manual-layout pane with `Super+Shift+h`, `j`, `k`, or `l`.
 `h` and `k` shrink the pane; `j` and `l` grow it. At an outer edge, the
 binding uses the only available split boundary.
 
+`Super+Shift+1` through `Super+Shift+9` send the focused window to that
+workspace within the active project. The window moves off screen and focus
+falls back to whatever the current workspace now shows; use `Super+1`
+through `Super+9` to switch there and see it.
+
 `Super+Space` (or `Super+a`) cycles the workspace between manual, master-stack,
 and monocle layouts. `Super+h`, `j`, `k`, and `l` focus the nearest visible pane
 or client to the left, down, up, or right. `Super+1` through `Super+9` select a
@@ -103,6 +108,12 @@ individual notification or file-backed agent to dismiss it.
 Wi-Fi and Bluetooth open actionable device panels; their first row toggles the
 radio and device rows connect or disconnect. Media, Git, keyboard-layout, and
 theme panels likewise expose their original widget actions.
+The Notifications, Todos, Agents, and Info (Wi-Fi/Bluetooth/media/etc.) panels
+grab the keyboard while open, so `Escape` closes them and `?` toggles a
+contextual help layer over that panel's own content -- a "? Toggle help" hint
+sits at the bottom of each of these panels. This replaces those panels'
+instructions being shown inline all the time; the full window-manager
+keybinding list is still its own panel via `Super+Shift+/`.
 
 The built-in widget glyphs use `UbuntuMono Nerd Font Mono`, matching MWM;
 install the Ubuntu Mono Nerd Font for those icons to render.
