@@ -7,28 +7,45 @@ CLOCK: [2026-08-08 Sat 06:51]--[2026-08-08 Sat 07:11] =>  0:20
 :LOGBOOK:
 CLOCK: [2026-08-08 Sat 07:19]--[2026-08-08 Sat 07:31] =>  0:12
 :END:
-* TODO Add edit to todo sidebar (by pressing e) (opens the TODO.org in a terminal in $EDITOR)
-* TODO Make todo widget look nicer
-* TODO Fix wallpaper functionality 
-* TODO Add timer to todo widget (when started)
-* TODO Add pomodoro timer widget
-* TODO Make apps dockable to program launcher
-* TODO make available as flake
+* DONE Add edit to todo sidebar (by pressing e) (opens the TODO.org in a terminal in $EDITOR)
+:LOGBOOK:
+CLOCK: [2026-08-08 Sat 07:38]--[2026-08-08 Sat 07:43] =>  0:05
+:END:
+* DONE Make todo widget look nicer
+:LOGBOOK:
+CLOCK: [2026-08-08 Sat 07:51]--[2026-08-08 Sat 08:01] =>  0:10
+:END:
+* DONE Fix wallpaper functionality 
+:LOGBOOK:
+CLOCK: [2026-08-08 Sat 07:43]--[2026-08-08 Sat 07:50] =>  0:07
+:END:
+* DONE Add timer to todo widget (when started)
+:LOGBOOK:
+CLOCK: [2026-08-08 Sat 08:01]--[2026-08-08 Sat 08:07] =>  0:06
+:END:
+* DONE Add pomodoro timer widget
+:LOGBOOK:
+CLOCK: [2026-08-08 Sat 08:07]--[2026-08-08 Sat 08:19] =>  0:12
+:END:
+* TODO Add themes and theme picker
+* TODO Remove shading and border from sidebars
+* TODO fix popups for volume, brightness, etc.
+* TODO Add drop down to project widget to select active projects
+* TODO Fix placement and look of system tray (currently just nm-applet)
 * TODO add static analysis tools to flake/build process
 * TODO turn on all the warnings (as errors) in the build process and fix
 * TODO make pass on code quality and style
-* TODO Add drop down to project widget to select active projects
 * TODO Add projects sidebar
-* TODO Add email sidebar
-* TODO fix popups for volume, brightness, etc.
-* TODO Add themes and theme picker
-* TODO Remove shading and border from sidebars
 * TODO Improve wifi widget
-* TODO Fix placement and look of system tray (currently just nm-applet)
 * TODO Fix behaviour of toggle border functionality
 * TODO Add maximize binding (mod+m) to maximize current window
 * TODO Add pin binding (mod+shift+p) to maximize current window
 * TODO Add floating binding (mod+shift+f) to toggle floating for current window
 * TODO Add resizing behaviour for floating windows (mod+shift+h,j,k,l keys)
 * TODO Add moving behaviour for floating windows (mod+alt+h,j,k,l keys)
+* TODO Make apps dockable to program launcher
+* TODO Add email sidebar
 * TODO Add git sidebar
+* TODO Add messaging sidebar
+* TODO Add ai sidebar
+* TODO make available as flake

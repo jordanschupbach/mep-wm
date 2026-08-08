@@ -132,8 +132,13 @@ MEPWM sets a random wallpaper (via `feh --bg-fill`) on startup and again
 whenever the active theme's background crosses the light/dark threshold —
 click, scroll, or select a different entry on the bottom-bar theme widget
 (or its panel). Images are picked from `assets/light_comic_wallpapers` or
-`assets/dark_comic_wallpapers` (relative to the working directory `mepwm`
-was launched from) depending on the resulting theme; override those
+`assets/dark_comic_wallpapers` depending on the resulting theme; a relative
+directory is first tried against the working directory `mepwm` was launched
+from (so `just run`/`just xephyr`, run from the repo root, work unchanged),
+then against the directory containing the running `mepwm` binary and its
+parent -- which is how an installed build (e.g. the Nix package, which ships
+`assets/` under `share/mep-wm/`) finds its wallpapers even when launched
+from a session with an unrelated working directory. Override those
 directories with the `MEPWM_WALLPAPER_LIGHT_DIR`/`MEPWM_WALLPAPER_DARK_DIR`
 environment variables or `mwm.set_wallpapers(light_dir, dark_dir)` in
 `config.lua`. Cycling between two themes on the same side of that threshold

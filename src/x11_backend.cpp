@@ -64,8 +64,17 @@ constexpr int kLeftDockCount = 8;
 // they all read as one family of widget rather than four different designs.
 constexpr int kSidePanelWidth = 420;
 constexpr int kSidePanelCardRadius = 10;
+// Gap between one row/card and the next, shared by every panel's layout,
+// scroll-clamp, and click hit-testing math so they all agree on where rows
+// sit -- previously plain rows used a cramped 2px gap while todo cards used
+// 6px, so switching panels felt like two different densities.
+constexpr int kSidePanelRowGap = 6;
 constexpr int kSidePanelCloseSize = 28;
 constexpr int kSidePanelCloseMargin = 10;
+// Standard pomodoro durations: a 25-minute work session, then a 5-minute
+// break, before returning to idle for the next session to be started by hand.
+constexpr std::time_t kPomodoroWorkSeconds = 25 * 60;
+constexpr std::time_t kPomodoroBreakSeconds = 5 * 60;
 // Vertical offset that centers the fixed-size stack of left-dock launcher
 // icons within a dock that's taller than the icons themselves.
 int left_dock_top_offset(int side_height) {
@@ -99,6 +108,7 @@ constexpr const char kIconGit[] = "\uf126";
 constexpr const char kIconMedia[] = "\uf001";
 constexpr const char kIconKeyboard[] = "\uf11c";
 constexpr const char kIconClock[] = "\uf017";
+constexpr const char kIconPomodoro[] = "\uf254";
 constexpr const char kIconLauncher[] = "\uf135";
 constexpr const char kIconFirefox[] = "\uf269";
 constexpr const char kIconTerminal[] = "\uf120";
@@ -150,6 +160,7 @@ enum class LauncherMode { Applications, Projects, ActiveProjects, Windows };
 // Note: cannot use "None" as a member name here — X11/X.h (pulled in via
 // Xlib.h) #defines None to 0L, which breaks enum class member declarations.
 enum class InfoAction { NoneAction, Wifi, Bluetooth, Media, Git, Keyboard, Theme };
+enum class PomodoroPhase { Idle, Work, Break };
 
 // A leaf's last-arranged screen rect on a given monitor pass. Recorded even
 // for leaves with zero tabs so an empty pane (freshly split, nothing opened
@@ -263,11 +274,13 @@ struct Notification {
 // `line` is the 0-based line number the item was parsed from in TODO.org, so
 // it can be located again to flip TODO -> DONE without re-scanning the file.
 // `active` mirrors org-mode clocking: true when an open (unterminated) CLOCK
-// line sits in this headline's :LOGBOOK: drawer.
+// line sits in this headline's :LOGBOOK: drawer. `clock_start` is that open
+// CLOCK line's timestamp (0 when inactive), used to render a running timer.
 struct TodoItem {
   std::string text;
   std::size_t line = 0;
   bool active = false;
+  std::time_t clock_start = 0;
 };
 
 struct AgentStatus {
@@ -1840,8 +1853,12 @@ class X11Backend final : public Backend {
     const auto active_todo = std::find_if(todos_.begin(), todos_.end(), [](const TodoItem& item) { return item.active; });
     const bool has_active_todo = active_todo != todos_.end();
     std::string todo_pill_text = std::string(kIconTodo) + " ";
-    if (has_active_todo) todo_pill_text += active_todo->text.size() > 36 ? active_todo->text.substr(0, 35) + "…" : active_todo->text;
-    else todo_pill_text += "No active TODO";
+    if (has_active_todo) {
+      todo_pill_text += active_todo->text.size() > 36 ? active_todo->text.substr(0, 35) + "…" : active_todo->text;
+      todo_pill_text += "  (" + format_elapsed(std::time(nullptr) - active_todo->clock_start) + ")";
+    } else {
+      todo_pill_text += "No active TODO";
+    }
     const int todo_pill_width = text_width(todo_pill_text) + 14;
     XSetForeground(display_, bar_gc_, has_active_todo ? todo_active_pixel_ : todo_inactive_pixel_);
     XFillRectangle(display_, dock.bottom_buffer, bar_gc_, content_x, 0, todo_pill_width, kBarHeight);
@@ -2120,6 +2137,16 @@ class X11Backend final : public Backend {
     return std::nullopt;
   }
 
+  // Extracts the start time from an open CLOCK line ("CLOCK: [2026-08-08 Sat
+  // 07:19]"), i.e. the timestamp inside the first bracket pair.
+  static std::optional<std::time_t> parse_clock_start(const std::string& clock_line) {
+    const std::size_t open = clock_line.find('[');
+    if (open == std::string::npos) return std::nullopt;
+    const std::size_t close = clock_line.find(']', open);
+    if (close == std::string::npos) return std::nullopt;
+    return parse_org_timestamp(clock_line.substr(open + 1, close - open - 1));
+  }
+
   // Parses org-mode headlines ("* TODO Buy milk"); only the plain TODO
   // keyword is treated as a pending item, DONE (and everything else) is
   // skipped so completed items never show up. A headline is "active" when
@@ -2134,7 +2161,9 @@ class X11Backend final : public Backend {
     for (std::size_t line_number = 0; line_number < lines.size(); ++line_number) {
       std::size_t keyword_start = 0, text_start = 0;
       if (!parse_org_headline(lines[line_number], "TODO", &keyword_start, &text_start)) continue;
-      todos_.push_back({lines[line_number].substr(text_start), line_number, find_open_clock_line(lines, line_number).has_value()});
+      const auto clock_line = find_open_clock_line(lines, line_number);
+      const std::time_t clock_start = clock_line ? parse_clock_start(lines[*clock_line]).value_or(0) : 0;
+      todos_.push_back({lines[line_number].substr(text_start), line_number, clock_line.has_value(), clock_start});
     }
     if (todo_selected_ >= static_cast<int>(todos_.size())) todo_selected_ = todos_.empty() ? -1 : static_cast<int>(todos_.size()) - 1;
   }
@@ -2339,7 +2368,7 @@ class X11Backend final : public Backend {
       case SidePanel::Notifications:
         return "Click a notification to mark it read\nMiddle-click to dismiss it\nclear (top) dismisses all\nScroll for more, Esc closes";
       case SidePanel::Todos:
-        return "a add\nd mark done\ns start/stop clocking\n^n / ^p or up/down to move\nEsc closes";
+        return "a add\nd mark done\ns start/stop clocking\ne edit TODO.org\n^n / ^p or up/down to move\nEsc closes";
       case SidePanel::Agents:
         return "Click an agent to focus its window\nMiddle-click a file-backed agent to dismiss it\nclear (top) dismisses all, Esc closes";
       case SidePanel::Info:
@@ -2396,9 +2425,9 @@ class X11Backend final : public Backend {
       }
       if (y + kBarHeight > kBarHeight && y < content_bottom)
         draw_dock_text(side_panel_window_, 16, y + (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2,
-                       text, selected ? bar_background_ : bar_foreground_);
+                       ellipsize(text, width - 32), selected ? bar_background_ : bar_foreground_);
       side_panel_rows_.push_back(y);
-      y += kBarHeight + 2;
+      y += kBarHeight + kSidePanelRowGap;
     };
     // Todo text can run much longer than the other panels' rows, so its
     // cards wrap to a couple of lines and grow to fit instead of clipping.
@@ -2418,7 +2447,7 @@ class X11Backend final : public Backend {
         }
       }
       side_panel_rows_.push_back(y);
-      y += card_height + 6;
+      y += card_height + kSidePanelRowGap;
     };
     if (side_panel_help_visible_ && side_panel_grabs_keyboard(side_panel_)) {
       std::istringstream lines(side_panel_help_body());
@@ -2547,7 +2576,25 @@ class X11Backend final : public Backend {
     todo_selected_ = todo_selected_ < 0 ? 0 : (todo_selected_ + delta + count) % count;
   }
 
-  std::string todo_row_text(const TodoItem& todo) const { return (todo.active ? "[*] " : "[ ] ") + todo.text; }
+  // Renders elapsed time the way a running timer reads at a glance: just
+  // seconds under a minute, just minutes under an hour, hours+minutes above
+  // that -- never more than two units at once.
+  static std::string format_elapsed(std::time_t seconds) {
+    if (seconds < 0) seconds = 0;
+    if (seconds < 60) return std::to_string(seconds) + "s";
+    const long total_minutes = seconds / 60;
+    if (total_minutes < 60) return std::to_string(total_minutes) + "m";
+    const long hours = total_minutes / 60;
+    const long minutes = total_minutes % 60;
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "%ldh%02ldm", hours, minutes);
+    return buffer;
+  }
+
+  std::string todo_row_text(const TodoItem& todo) const {
+    if (!todo.active) return "[ ] " + todo.text;
+    return "[*] " + todo.text + "  (" + format_elapsed(std::time(nullptr) - todo.clock_start) + ")";
+  }
 
   int todo_card_line_height() const { return bar_font_->ascent + bar_font_->descent + 6; }
 
@@ -2562,10 +2609,10 @@ class X11Backend final : public Backend {
   // Total content height of the todo panel at its current item list, used to
   // clamp scrolling (see handle_side_panel_button's wheel handler).
   int todo_content_height() {
-    const int row_height = kBarHeight + 2;
+    const int row_height = kBarHeight + kSidePanelRowGap;
     int height = row_height * (todo_input_active_ ? 1 : 0);
     if (todos_.empty() && !todo_input_active_) height += row_height;
-    for (const TodoItem& todo : todos_) height += todo_item_height(todo_row_text(todo)) + 6;
+    for (const TodoItem& todo : todos_) height += todo_item_height(todo_row_text(todo)) + kSidePanelRowGap;
     return height;
   }
 
@@ -2574,10 +2621,10 @@ class X11Backend final : public Backend {
   // per-item heights rather than assuming a uniform row height.
   void ensure_todo_selection_visible() {
     if (todo_selected_ < 0) return;
-    const int row_height = kBarHeight + 2;
+    const int row_height = kBarHeight + kSidePanelRowGap;
     int item_top = row_height * (todo_input_active_ ? 1 : 0);
     for (int index = 0; index < todo_selected_; ++index)
-      item_top += todo_item_height(todo_row_text(todos_[static_cast<std::size_t>(index)])) + 6;
+      item_top += todo_item_height(todo_row_text(todos_[static_cast<std::size_t>(index)])) + kSidePanelRowGap;
     const int item_height = todo_item_height(todo_row_text(todos_[static_cast<std::size_t>(todo_selected_)]));
     const int visible = side_panel_visible_height();
     if (item_top < side_panel_scroll_offset_) side_panel_scroll_offset_ = item_top;
@@ -2628,6 +2675,11 @@ class X11Backend final : public Backend {
     }
     if (state == 0 && key == XK_s && todo_selected_ >= 0 && static_cast<std::size_t>(todo_selected_) < todos_.size()) {
       toggle_todo_active();
+      return;
+    }
+    if (state == 0 && key == XK_e) {
+      const std::string path = todo_org_path();
+      if (!path.empty()) spawn_editor(path);
       return;
     }
     if (key == XK_Up || (state == ControlMask && key == XK_p)) {
@@ -2744,7 +2796,7 @@ class X11Backend final : public Backend {
       return;
     }
     if (event.button == Button4 || event.button == Button5) {
-      const int delta = event.button == Button4 ? -3 * (kBarHeight + 2) : 3 * (kBarHeight + 2);
+      const int delta = event.button == Button4 ? -3 * (kBarHeight + kSidePanelRowGap) : 3 * (kBarHeight + kSidePanelRowGap);
       int max_scroll;
       if (side_panel_ == SidePanel::Todos && !side_panel_help_visible_) {
         max_scroll = std::max(0, todo_content_height() - side_panel_visible_height());
@@ -2752,8 +2804,8 @@ class X11Backend final : public Backend {
         const int rows = side_panel_help_visible_ ? static_cast<int>(side_panel_rows_.size()) :
                          side_panel_ == SidePanel::Notifications ? static_cast<int>(notifications_.size() * 2) :
                          side_panel_ == SidePanel::Agents ? static_cast<int>(agents_.size()) : static_cast<int>(side_panel_rows_.size());
-        const int visible = std::max(1, side_panel_visible_height() / (kBarHeight + 2));
-        max_scroll = std::max(0, (rows - visible) * (kBarHeight + 2));
+        const int visible = std::max(1, side_panel_visible_height() / (kBarHeight + kSidePanelRowGap));
+        max_scroll = std::max(0, (rows - visible) * (kBarHeight + kSidePanelRowGap));
       }
       side_panel_scroll_offset_ = std::clamp(side_panel_scroll_offset_ + delta, 0, max_scroll);
       draw_side_panel();
@@ -2769,7 +2821,7 @@ class X11Backend final : public Backend {
       refresh_agents(); draw_side_panel(); draw_docks(); return;
     }
     if (side_panel_help_visible_) return;
-    const int row = static_cast<int>((event.y - kBarHeight - 6 + side_panel_scroll_offset_) / (kBarHeight + 2));
+    const int row = static_cast<int>((event.y - kBarHeight - 6 + side_panel_scroll_offset_) / (kBarHeight + kSidePanelRowGap));
     if (row < 0) return;
     if (side_panel_ == SidePanel::Info && event.button == Button1) {
       if (info_action_ == InfoAction::Wifi) {
@@ -2986,6 +3038,27 @@ class X11Backend final : public Backend {
     return color_is_light(theme_palettes_[index][1]);
   }
 
+  // The default wallpaper dirs ("assets/light_comic_wallpapers" etc.) are
+  // relative, which only resolves against the current working directory --
+  // fine for `just run`/`just xephyr` (launched from the repo root), but
+  // not for a real session launching an installed mepwm from an arbitrary
+  // cwd. Fall back to looking next to (and one level above) the running
+  // binary, which covers both the build/ layout and an installed
+  // bin/ + share/mep-wm/ layout, before giving up.
+  static std::filesystem::path resolve_wallpaper_dir(const std::filesystem::path& dir) {
+    if (dir.is_absolute() || std::filesystem::exists(dir)) return dir;
+    std::error_code error;
+    const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", error);
+    if (error) return dir;
+    const std::filesystem::path exe_dir = exe.parent_path();
+    for (const std::filesystem::path& base :
+         {exe_dir, exe_dir.parent_path(), exe_dir.parent_path() / "share" / "mep-wm"}) {
+      std::filesystem::path candidate = base / dir;
+      if (std::filesystem::exists(candidate)) return candidate;
+    }
+    return dir;
+  }
+
   // No caching: this only runs on theme switches (rare -- a keypress or a
   // reload), so re-reading a small directory each time is cheap and avoids
   // having to invalidate a cache when mwm.set_wallpapers() changes the dirs.
@@ -2996,6 +3069,8 @@ class X11Backend final : public Backend {
     if (raw_dir == "~" || raw_dir.rfind("~/", 0) == 0) {
       if (const char* home = std::getenv("HOME"); home && *home)
         dir = std::filesystem::path(home) / raw_dir.substr(raw_dir == "~" ? 1 : 2);
+    } else {
+      dir = resolve_wallpaper_dir(dir);
     }
     DIR* directory = opendir(dir.c_str());
     if (!directory) return result;
@@ -3477,6 +3552,18 @@ class X11Backend final : public Backend {
     return offset;
   }
 
+  // Trims `text` to a single line that fits max_width, appending an ellipsis
+  // if anything was cut -- unlike wrap_lines, this keeps whitespace exactly
+  // as given (side-panel rows like the Keybindings list rely on a double
+  // space between a shortcut and its description), so it doesn't re-tokenize
+  // into words.
+  std::string ellipsize(const std::string& text, int max_width) {
+    if (text_width(text) <= max_width) return text;
+    const int ellipsis_width = text_width("…");
+    const std::size_t keep = fit_prefix_bytes(text, std::max(0, max_width - ellipsis_width));
+    return text.substr(0, keep) + "…";
+  }
+
   // Word-wraps `text` into at most max_lines lines that each fit max_width
   // pixels, hard-breaking any single word that's wider than max_width on its
   // own. If the text still doesn't fit, the last line is trimmed and given a
@@ -3532,8 +3619,68 @@ class X11Backend final : public Backend {
     }
   }
 
+  // Seconds left in the current phase: the full work duration at rest
+  // (Idle), the frozen count while paused, or a live countdown to
+  // `pomodoro_deadline_` while running.
+  std::time_t pomodoro_remaining() const {
+    if (pomodoro_phase_ == PomodoroPhase::Idle) return kPomodoroWorkSeconds;
+    if (!pomodoro_running_) return pomodoro_remaining_;
+    return std::max<std::time_t>(0, pomodoro_deadline_ - std::time(nullptr));
+  }
+
+  // Flips Work -> Break -> Idle once the running phase's deadline passes,
+  // dropping a notification at each transition so it's noticed even if the
+  // bar isn't being watched. Called on every draw_bar() -- cheap, and
+  // catches the transition as soon as a redraw happens rather than needing
+  // its own timer.
+  void advance_pomodoro_if_done() {
+    if (!pomodoro_running_ || std::time(nullptr) < pomodoro_deadline_) return;
+    if (pomodoro_phase_ == PomodoroPhase::Work) {
+      pomodoro_phase_ = PomodoroPhase::Break;
+      pomodoro_deadline_ = std::time(nullptr) + kPomodoroBreakSeconds;
+      notifications_.push_back({next_notification_id_++, "mepwm", "Pomodoro", "Work session done -- take a break.", true});
+    } else {
+      pomodoro_phase_ = PomodoroPhase::Idle;
+      pomodoro_running_ = false;
+      pomodoro_remaining_ = 0;
+      notifications_.push_back({next_notification_id_++, "mepwm", "Pomodoro", "Break's over -- ready for another session.", true});
+    }
+  }
+
+  // Left-click: starts a work session from idle, pauses a running phase, or
+  // resumes a paused one.
+  void toggle_pomodoro() {
+    const std::time_t now = std::time(nullptr);
+    if (pomodoro_phase_ == PomodoroPhase::Idle) {
+      pomodoro_phase_ = PomodoroPhase::Work;
+      pomodoro_running_ = true;
+      pomodoro_deadline_ = now + kPomodoroWorkSeconds;
+    } else if (pomodoro_running_) {
+      pomodoro_remaining_ = std::max<std::time_t>(0, pomodoro_deadline_ - now);
+      pomodoro_running_ = false;
+    } else {
+      pomodoro_running_ = true;
+      pomodoro_deadline_ = now + pomodoro_remaining_;
+    }
+  }
+
+  // Right-click: cancels the current session outright, back to idle.
+  void reset_pomodoro() {
+    pomodoro_phase_ = PomodoroPhase::Idle;
+    pomodoro_running_ = false;
+    pomodoro_remaining_ = 0;
+  }
+
+  static std::string format_countdown(std::time_t seconds) {
+    seconds = std::max<std::time_t>(0, seconds);
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "%02ld:%02ld", static_cast<long>(seconds / 60), static_cast<long>(seconds % 60));
+    return buffer;
+  }
+
   void draw_bar() {
     if (!bar_) return;
+    advance_pomodoro_if_done();
     const int width = std::max(1, DisplayWidth(display_, screen_));
     if (bar_pixmap_width_ != width) {
       if (bar_xft_draw_) XftDrawDestroy(bar_xft_draw_);
@@ -3600,13 +3747,34 @@ class X11Backend final : public Backend {
     const int clock_width = text_width(clock_widget) + 32;
     const int clock_x = width - kDockWidth - clock_width - tray_pixel_width();
     text(clock_x, clock_widget, bar_foreground_);
+
+    // Pomodoro widget: sits just left of the clock, at the front of the
+    // right-side widget cluster. A filled pill (like the todo-active pill in
+    // the bottom bar) while a session is running or paused makes the state
+    // glanceable without reading the countdown; plain text at rest, matching
+    // the clock widget it sits beside.
+    const std::string pomodoro_phase_label = pomodoro_phase_ == PomodoroPhase::Idle ? std::string() :
+        pomodoro_phase_ == PomodoroPhase::Work ? (pomodoro_running_ ? "Work " : "Paused ") :
+                                                  (pomodoro_running_ ? "Break " : "Paused ");
+    const std::string pomodoro_widget_text =
+        std::string(kIconPomodoro) + " " + pomodoro_phase_label + format_countdown(pomodoro_remaining());
+    const int pomodoro_widget_width = text_width(pomodoro_widget_text) + 24;
+    const int pomodoro_widget_x = clock_x - 16 - pomodoro_widget_width;
+    pomodoro_widget_start_x_ = pomodoro_widget_x;
+    pomodoro_widget_end_x_ = pomodoro_widget_x + pomodoro_widget_width;
+    if (pomodoro_phase_ != PomodoroPhase::Idle) {
+      XSetForeground(display_, bar_gc_, (pomodoro_running_ ? todo_active_pixel_ : todo_inactive_pixel_));
+      XFillRectangle(display_, bar_pixmap_, bar_gc_, pomodoro_widget_x, 0, pomodoro_widget_width, kBarHeight);
+    }
+    text(pomodoro_widget_x + 12, pomodoro_widget_text, pomodoro_phase_ == PomodoroPhase::Idle ? bar_foreground_ : bar_background_);
+
     task_hits_.clear();
     std::vector<Window> windows;
     collect_windows(workspace().root.get(), windows);
     windows.insert(windows.end(), workspace().floating.begin(), workspace().floating.end());
     bar_task_list_x_ = layout_widget_end_x_ + 32;
     int x = bar_task_list_x_;
-    const int end = std::max(x, clock_x);
+    const int end = std::max(x, pomodoro_widget_start_x_);
     for (Window window : windows) {
       char* title = nullptr;
       std::string label = XFetchName(display_, window, &title) && title ? title : "untitled";
@@ -5342,6 +5510,23 @@ class X11Backend final : public Backend {
     signal(SIGCHLD, SIG_IGN);
   }
 
+  // Opens `path` in $EDITOR (falling back to vi) inside a new terminal, the
+  // same kitty-or-xterm wrapper spawn_terminal_running uses for the agent
+  // command, so editing TODO.org behaves like any other terminal-launched tool.
+  void spawn_editor(const std::string& path) const {
+    spawn_terminal_running(std::filesystem::path(path).parent_path().string(),
+                            "${EDITOR:-vi} " + shell_quote(path));
+  }
+
+  // Single-quotes `value` for safe inclusion in a shell command line,
+  // escaping any embedded single quotes.
+  static std::string shell_quote(const std::string& value) {
+    std::string quoted = "'";
+    for (char ch : value) quoted += (ch == '\'') ? "'\\''" : std::string(1, ch);
+    quoted += "'";
+    return quoted;
+  }
+
   void spawn_terminal_in(const std::string& directory) const {
     const pid_t child = fork();
     if (child < 0) {
@@ -5760,6 +5945,12 @@ class X11Backend final : public Backend {
         }
         return;
       }
+      if (event.x >= pomodoro_widget_start_x_ && event.x < pomodoro_widget_end_x_) {
+        if (event.button == Button1) toggle_pomodoro();
+        if (event.button == Button3) reset_pomodoro();
+        draw_bar();
+        return;
+      }
       for (const BarHit& hit : task_hits_) {
         if (event.x >= hit.left && event.x < hit.right) {
           focus(hit.window);
@@ -5885,6 +6076,15 @@ class X11Backend final : public Backend {
   int workspace_start_x_ = kDockWidth;
   int layout_widget_start_x_ = kDockWidth;
   int layout_widget_end_x_ = kDockWidth;
+  // Pomodoro widget state: `pomodoro_deadline_` is the absolute time the
+  // current phase ends while running; `pomodoro_remaining_` freezes the
+  // seconds left while paused (deadline is meaningless then).
+  PomodoroPhase pomodoro_phase_ = PomodoroPhase::Idle;
+  bool pomodoro_running_ = false;
+  std::time_t pomodoro_deadline_ = 0;
+  std::time_t pomodoro_remaining_ = 0;
+  int pomodoro_widget_start_x_ = 0;
+  int pomodoro_widget_end_x_ = 0;
   bool hints_visible_ = false;
   std::string hint_query_;
   std::vector<Hint> hints_;

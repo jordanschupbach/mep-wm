@@ -26,8 +26,9 @@ pkgs.stdenv.mkDerivation {
 
   installPhase = ''
     runHook preInstall
-    mkdir -p $out/bin
+    mkdir -p $out/bin $out/share/mep-wm
     cp mepwm $out/bin/
+    cp -r assets $out/share/mep-wm/assets
     runHook postInstall
   '';
 
