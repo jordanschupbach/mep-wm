@@ -7,6 +7,7 @@
 #include <X11/extensions/Xinerama.h>
 #include <X11/cursorfont.h>
 #include <X11/keysym.h>
+#include <Imlib2.h>
 #include <dbus/dbus.h>
 #include <lua.hpp>
 
@@ -59,6 +60,12 @@ constexpr double kMinSplitWeight = 0.05;
 constexpr int kTraySpacing = 4;
 constexpr int kLauncherWidth = 640;
 constexpr int kLauncherMaxRows = 8;
+// Image preview pane that sits to the right of the launcher list when it's
+// in wallpaper mode -- a fixed width (rather than e.g. matching whatever's
+// left on the monitor) so the preview reads as a stable panel instead of
+// stretching unpredictably between monitors.
+constexpr int kWallpaperPreviewWidth = 420;
+constexpr int kWallpaperPreviewGap = 12;
 constexpr int kLeftDockCount = 8;
 // Side panels (notifications, todos, agents, help, info) share this layout so
 // they all read as one family of widget rather than four different designs.
@@ -166,7 +173,7 @@ enum class Orientation { Vertical, Horizontal };
 enum class LayoutMode { Manual, MasterStack, Monocle };
 enum class SliderKind { Backlight, Volume, Microphone };
 enum class SidePanel { Closed, Notifications, Todos, Agents, Help, Info };
-enum class LauncherMode { Applications, Projects, ActiveProjects, Windows, Themes };
+enum class LauncherMode { Applications, Projects, ActiveProjects, Windows, Themes, Wallpapers };
 // Note: cannot use "None" as a member name here — X11/X.h (pulled in via
 // Xlib.h) #defines None to 0L, which breaks enum class member declarations.
 enum class InfoAction { NoneAction, Wifi, Bluetooth, Media, Git, Keyboard };
@@ -380,6 +387,7 @@ class X11Backend final : public Backend {
     if (hint_font_ && hint_font_ != bar_font_) XftFontClose(display_, hint_font_);
     if (bar_pixmap_) XFreePixmap(display_, bar_pixmap_);
     if (launcher_pixmap_) XFreePixmap(display_, launcher_pixmap_);
+    if (wallpaper_preview_pixmap_) XFreePixmap(display_, wallpaper_preview_pixmap_);
     for (const DockWindows& dock : docks_) {
       if (dock.left_buffer) XFreePixmap(display_, dock.left_buffer);
       if (dock.bottom_buffer) XFreePixmap(display_, dock.bottom_buffer);
@@ -403,6 +411,12 @@ class X11Backend final : public Backend {
     XSetIOErrorHandler(on_x_io_error);
     cursor_ = XCreateFontCursor(display_, XC_left_ptr);
     XDefineCursor(display_, root_, cursor_);
+    // Imlib2's context is process-global rather than tied to a handle we pass
+    // around, so it only needs setting once here; render_wallpaper_thumbnail()
+    // later just swaps imlib_context_set_drawable() per call.
+    imlib_context_set_display(display_);
+    imlib_context_set_visual(DefaultVisual(display_, screen_));
+    imlib_context_set_colormap(DefaultColormap(display_, screen_));
     another_window_manager_flag() = false;
     XSetErrorHandler(on_x_error);
     XSelectInput(display_, root_, SubstructureRedirectMask | SubstructureNotifyMask |
@@ -2402,6 +2416,7 @@ class X11Backend final : public Backend {
         {"Super+r", "Reload config"},
         {"Super+Shift+r", "Restart mepwm"},
         {"Super+Shift+t", "Theme picker"},
+        {"Super+Shift+w", "Wallpaper picker (fuzzy search with a live image preview)"},
         {"Super+Shift+slash", "Toggle this help panel"},
         {"?", "In Notifications/Todos/Agents/Info: toggle that panel's contextual help (Esc closes it)"},
         {"Super+Shift+q", "Quit"},
@@ -3245,6 +3260,44 @@ class X11Backend final : public Backend {
     closedir(directory);
     std::sort(result.begin(), result.end());
     return result;
+  }
+
+  // Combines both theme buckets into one deduplicated, sorted list -- the
+  // picker lets you pick any wallpaper regardless of which bucket the active
+  // theme currently draws from (see set_random_wallpaper()).
+  void scan_wallpapers() {
+    wallpaper_paths_ = scan_wallpaper_dir(config_.wallpaper_dir_light);
+    const std::vector<std::string> dark = scan_wallpaper_dir(config_.wallpaper_dir_dark);
+    wallpaper_paths_.insert(wallpaper_paths_.end(), dark.begin(), dark.end());
+    std::sort(wallpaper_paths_.begin(), wallpaper_paths_.end());
+    wallpaper_paths_.erase(std::unique(wallpaper_paths_.begin(), wallpaper_paths_.end()), wallpaper_paths_.end());
+  }
+
+  static std::string wallpaper_label(const std::string& path) {
+    return std::filesystem::path(path).filename().string();
+  }
+
+  // Decodes and scales `path` to fit inside box_w x box_h (preserving aspect
+  // ratio, centered) directly onto `pixmap` via Imlib2 -- see the display/
+  // visual/colormap context set once in run(). Returns false, leaving the
+  // pixmap untouched, if the file can't be decoded as an image.
+  static bool render_wallpaper_thumbnail(const std::string& path, Pixmap pixmap, int box_w, int box_h) {
+    Imlib_Image image = imlib_load_image(path.c_str());
+    if (!image) return false;
+    imlib_context_set_image(image);
+    const int source_w = imlib_image_get_width();
+    const int source_h = imlib_image_get_height();
+    if (source_w <= 0 || source_h <= 0) {
+      imlib_free_image();
+      return false;
+    }
+    const double scale = std::min(static_cast<double>(box_w) / source_w, static_cast<double>(box_h) / source_h);
+    const int dest_w = std::max(1, static_cast<int>(source_w * scale));
+    const int dest_h = std::max(1, static_cast<int>(source_h * scale));
+    imlib_context_set_drawable(pixmap);
+    imlib_render_image_on_drawable_at_size((box_w - dest_w) / 2, (box_h - dest_h) / 2, dest_w, dest_h);
+    imlib_free_image();
+    return true;
   }
 
   static void run_feh_bg_fill(const std::string& path) {
@@ -4190,6 +4243,24 @@ class X11Backend final : public Backend {
       launcher_scroll_ = 0;
       return;
     }
+    if (launcher_mode_ == LauncherMode::Wallpapers) {
+      std::vector<std::pair<int, std::size_t>> matches;
+      for (std::size_t index = 0; index < wallpaper_paths_.size(); ++index) {
+        const int score = fuzzy_score(launcher_query_, wallpaper_label(wallpaper_paths_[index]));
+        if (score >= 0) matches.emplace_back(score, index);
+      }
+      if (!launcher_query_.empty()) {
+        std::sort(matches.begin(), matches.end(), [&](const auto& left, const auto& right) {
+          return left.first != right.first ? left.first > right.first
+                                           : wallpaper_paths_[left.second] < wallpaper_paths_[right.second];
+        });
+      }
+      wallpaper_matches_.clear();
+      for (const auto& match : matches) wallpaper_matches_.push_back(match.second);
+      launcher_selection_ = 0;
+      launcher_scroll_ = 0;
+      return;
+    }
     if (launcher_mode_ == LauncherMode::Themes) {
       std::vector<std::pair<int, std::size_t>> matches;
       for (std::size_t index = 0; index < theme_names_.size(); ++index) {
@@ -4280,6 +4351,7 @@ class X11Backend final : public Backend {
     const char* title = launcher_mode_ == LauncherMode::Applications ? "Run: "
                       : launcher_mode_ == LauncherMode::Windows ? "Window: "
                       : launcher_mode_ == LauncherMode::Themes ? "Theme: "
+                      : launcher_mode_ == LauncherMode::Wallpapers ? "Wallpaper: "
                       : launcher_mode_ == LauncherMode::Projects ? "Projects: " : "Active projects: ";
     draw_launcher_text(10, (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2,
                        std::string(title) + launcher_query_, bar_foreground_);
@@ -4291,6 +4363,8 @@ class X11Backend final : public Backend {
                              ? (window_candidates_.empty() ? "No open windows" : "No matching windows")
                          : launcher_mode_ == LauncherMode::Themes
                              ? "No matching themes"
+                         : launcher_mode_ == LauncherMode::Wallpapers
+                             ? (wallpaper_paths_.empty() ? "No wallpapers found" : "No matching wallpapers")
                              : "No matching projects", bar_foreground_);
     }
     // Theme rows get an accent-color swatch at the right edge so ~15 themes
@@ -4313,6 +4387,9 @@ class X11Backend final : public Backend {
         const std::size_t theme = theme_matches_[launcher_scroll_ + row];
         label = (static_cast<int>(theme) == theme_index_ ? "* " : "  ") + theme_names_[theme];
         swatch_pixel = alloc_color(theme_palettes_[theme][2]);
+      } else if (launcher_mode_ == LauncherMode::Wallpapers) {
+        const std::string& path = wallpaper_paths_[wallpaper_matches_[launcher_scroll_ + row]];
+        label = (path == current_wallpaper_path_ ? "* " : "  ") + wallpaper_label(path);
       } else {
         label = project_label(projects_[project_matches_[launcher_scroll_ + row]].path);
       }
@@ -4325,6 +4402,7 @@ class X11Backend final : public Backend {
     }
     XCopyArea(display_, launcher_pixmap_, launcher_window_, bar_gc_, 0, 0, width, height, 0, 0);
     XFlush(display_);
+    draw_wallpaper_preview(x, width, y, height);
   }
 
   void close_launcher() {
@@ -4340,6 +4418,57 @@ class X11Backend final : public Backend {
     launcher_visible_ = false;
     XUngrabKeyboard(display_, CurrentTime);
     XUnmapWindow(display_, launcher_window_);
+    if (wallpaper_preview_window_ != None) XUnmapWindow(display_, wallpaper_preview_window_);
+  }
+
+  // Renders (or hides, outside wallpaper mode) the fzf/Telescope-style
+  // preview pane next to the launcher list, showing the highlighted row's
+  // wallpaper scaled to fit. `launcher_x/width/y/height` are the just-drawn
+  // launcher panel's geometry, computed by draw_launcher(), so the preview
+  // lines its top edge up with the list and grows/shrinks with it.
+  void draw_wallpaper_preview(int launcher_x, int launcher_width, int y, int height) {
+    if (launcher_mode_ != LauncherMode::Wallpapers) {
+      if (wallpaper_preview_window_ != None) XUnmapWindow(display_, wallpaper_preview_window_);
+      return;
+    }
+    const Monitor& target_monitor = monitor(current_monitor_);
+    const int preview_x = launcher_x + launcher_width + kWallpaperPreviewGap;
+    const int available = target_monitor.x + target_monitor.width - 10 - preview_x;
+    if (available < 160) {
+      if (wallpaper_preview_window_ != None) XUnmapWindow(display_, wallpaper_preview_window_);
+      return;
+    }
+    const int width = std::min(kWallpaperPreviewWidth, available);
+    if (wallpaper_preview_window_ == None) {
+      XSetWindowAttributes attributes{};
+      attributes.override_redirect = True;
+      attributes.background_pixel = bar_background_.pixel;
+      attributes.border_pixel = bar_selected_.pixel;
+      attributes.event_mask = ExposureMask;
+      wallpaper_preview_window_ = XCreateWindow(display_, root_, 0, 0, width, height, 1, DefaultDepth(display_, screen_),
+                                                CopyFromParent, DefaultVisual(display_, screen_),
+                                                CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWEventMask, &attributes);
+      XStoreName(display_, wallpaper_preview_window_, "mepwm-wallpaper-preview");
+      XDefineCursor(display_, wallpaper_preview_window_, cursor_);
+    }
+    XMoveResizeWindow(display_, wallpaper_preview_window_, preview_x, y, width, height);
+    if (wallpaper_preview_pixmap_) XFreePixmap(display_, wallpaper_preview_pixmap_);
+    wallpaper_preview_pixmap_ = XCreatePixmap(display_, wallpaper_preview_window_, width, height, DefaultDepth(display_, screen_));
+    XSetForeground(display_, bar_gc_, bar_background_.pixel);
+    XFillRectangle(display_, wallpaper_preview_pixmap_, bar_gc_, 0, 0, width, height);
+    bool rendered = false;
+    if (!wallpaper_matches_.empty()) {
+      const std::string& path = wallpaper_paths_[wallpaper_matches_[launcher_selection_]];
+      rendered = render_wallpaper_thumbnail(path, wallpaper_preview_pixmap_, width, height);
+    }
+    if (!rendered) {
+      const char* message = wallpaper_paths_.empty() ? "No wallpapers found" : "No preview available";
+      draw_dock_text(wallpaper_preview_pixmap_, std::max(10, (width - text_width(message)) / 2),
+                     (height + bar_font_->ascent - bar_font_->descent) / 2, message, bar_foreground_);
+    }
+    XCopyArea(display_, wallpaper_preview_pixmap_, wallpaper_preview_window_, bar_gc_, 0, 0, width, height, 0, 0);
+    XMapRaised(display_, wallpaper_preview_window_);
+    XFlush(display_);
   }
 
   // Applies the theme under the highlighted row so the picker previews
@@ -4355,6 +4484,7 @@ class X11Backend final : public Backend {
     launcher_mode_ = mode;
     if (mode == LauncherMode::Applications) scan_launcher_apps();
     if (mode == LauncherMode::Windows) scan_windows();
+    if (mode == LauncherMode::Wallpapers) scan_wallpapers();
     if (mode == LauncherMode::Themes) theme_preview_saved_index_ = theme_index_;
     launcher_query_.clear();
     filter_launcher_apps();
@@ -4479,10 +4609,17 @@ class X11Backend final : public Backend {
     open_launcher(LauncherMode::Themes);
   }
 
+  void toggle_wallpaper_picker() {
+    if (launcher_visible_ && launcher_mode_ == LauncherMode::Wallpapers) { close_launcher(); return; }
+    if (launcher_visible_) close_launcher();
+    open_launcher(LauncherMode::Wallpapers);
+  }
+
   std::size_t launcher_match_count() const {
     return launcher_mode_ == LauncherMode::Applications ? launcher_matches_.size()
          : launcher_mode_ == LauncherMode::Windows ? window_matches_.size()
          : launcher_mode_ == LauncherMode::Themes ? theme_matches_.size()
+         : launcher_mode_ == LauncherMode::Wallpapers ? wallpaper_matches_.size()
                                                     : project_matches_.size();
   }
 
@@ -4513,6 +4650,17 @@ class X11Backend final : public Backend {
       theme_preview_saved_index_ = -1;  // confirmed: nothing left to revert
       close_launcher();
       apply_current_theme();
+      return;
+    }
+    if (launcher_mode_ == LauncherMode::Wallpapers) {
+      if (wallpaper_matches_.empty()) return;
+      current_wallpaper_path_ = wallpaper_paths_[wallpaper_matches_[launcher_selection_]];
+      // Matches the current theme's bucket so refresh_wallpaper() leaves this
+      // pick alone until the theme actually crosses the light/dark threshold
+      // (see set_random_wallpaper()), rather than immediately rerolling it.
+      wallpaper_is_light_ = theme_is_light();
+      close_launcher();
+      apply_wallpaper();
       return;
     }
     if (launcher_mode_ != LauncherMode::Applications) {
@@ -4599,7 +4747,7 @@ class X11Backend final : public Backend {
                                  XK_a, XK_z, XK_m, XK_r, XK_minus, XK_comma, XK_period, XK_1, XK_2, XK_3,
                                  XK_4, XK_5, XK_6, XK_7, XK_8, XK_9, XK_w, XK_b, XK_d, XK_f, XK_t};
     const KeySym shift_keys[] = {XK_q, XK_space, XK_c, XK_minus, XK_comma, XK_period, XK_h, XK_j, XK_k, XK_l,
-                                 XK_r, XK_d, XK_t, XK_slash, XK_Tab, XK_1, XK_2, XK_3, XK_4, XK_5, XK_6,
+                                 XK_r, XK_d, XK_t, XK_w, XK_slash, XK_Tab, XK_1, XK_2, XK_3, XK_4, XK_5, XK_6,
                                  XK_7, XK_8, XK_9};
     const KeySym ctrl_keys[] = {XK_h, XK_j, XK_k, XK_l};
     for (const unsigned int ignored : ignored_modifiers) {
@@ -6321,6 +6469,7 @@ class X11Backend final : public Backend {
       if (key == XK_r) restart();
       if (key == XK_d) adjust_nmaster(1);
       if (key == XK_t) toggle_theme_picker();
+      if (key == XK_w) toggle_wallpaper_picker();
       if (key == XK_slash) toggle_side_panel(SidePanel::Help);
       if (key >= XK_1 && key <= XK_9) send_to_workspace(workspace().focused, static_cast<int>(key - XK_1));
       return;
@@ -6528,6 +6677,10 @@ class X11Backend final : public Backend {
   std::vector<std::pair<Window, std::string>> window_candidates_;
   std::vector<std::size_t> window_matches_;
   std::vector<std::size_t> theme_matches_;
+  std::vector<std::string> wallpaper_paths_;
+  std::vector<std::size_t> wallpaper_matches_;
+  Window wallpaper_preview_window_ = None;
+  Pixmap wallpaper_preview_pixmap_ = None;
   std::size_t launcher_selection_ = 0;
   std::size_t launcher_scroll_ = 0;
   XftFont* bar_font_ = nullptr;

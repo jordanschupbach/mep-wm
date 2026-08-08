@@ -30,6 +30,7 @@
             pkgs.libx11
             pkgs.libXinerama
             pkgs.libXft
+            pkgs.imlib2
             pkgs.lua
             pkgs.dbus
             pkgs.libxkbcommon

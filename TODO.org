@@ -1,6 +1,9 @@
 * DONE Make sure no global variables are used in the codebase
 * DONE Fix theme picker to be a picker (like project picker and program picker) instead of a sidebar.
-* TODO Add wallpaper picker (like project picker and program picker).
+* DONE Add wallpaper picker (like project picker and program picker).
+:LOGBOOK:
+CLOCK: [2026-08-08 Sat 14:28]
+:END:
 * TODO Improve wifi widget
 * TODO Add pin binding (mod+shift+p) to maximize current window
 * TODO Add floating binding (mod+shift+f) to toggle floating for current window

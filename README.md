@@ -183,6 +183,16 @@ shown again. The letterboxing step shells out to ImageMagick's `convert`;
 if it isn't on `PATH` (or fails), MEPWM falls back to filling the full
 screen with the unprocessed image.
 
+Press `Super+Shift+w` to pick a wallpaper by hand instead of waiting for the
+next random reroll -- the same fuzzy-searchable popup as the application,
+project, and theme pickers, listing every image from both the light and dark
+directories, but with an fzf/Telescope-style preview pane beside the list
+that renders the highlighted row's image (via Imlib2) as you move the
+selection. Enter sets it as the current wallpaper immediately; Escape closes
+the picker without changing anything. A manually-picked wallpaper sticks
+until the active theme's background actually crosses the light/dark
+threshold, the same as any other wallpaper (see above).
+
 ## Mouse controls
 
 The X11 backend provides an arrow cursor in the nested display. Click a client
