@@ -1933,8 +1933,29 @@ class X11Backend final : public Backend {
     return "Microphone";
   }
 
+  // Only updates the in-memory value shown by the popup/dock -- no hardware
+  // I/O. Split out from commit_slider_percent() so dragging can redraw the
+  // popup on every motion event without paying for a sysfs write or an
+  // amixer fork+exec on every pixel of mouse movement (see
+  // handle_slider_position()).
   void set_slider_percent(int percent) {
     percent = std::clamp(percent, 0, 100);
+    if (slider_kind_ == SliderKind::Backlight) {
+      backlight_percent_ = percent;
+    } else if (slider_kind_ == SliderKind::Volume) {
+      volume_percent_ = percent;
+      volume_muted_ = false;
+    } else {
+      mic_percent_ = percent;
+    }
+  }
+
+  // Pushes the current slider value out to the hardware/daemon. Expensive
+  // (spawns a process for volume/mic, does a file write for backlight), so
+  // callers should throttle this during a drag rather than calling it per
+  // motion event.
+  void commit_slider_percent() {
+    const int percent = std::max(0, slider_percent());
     if (slider_kind_ == SliderKind::Backlight) {
       const long maximum = read_long(backlight_max_path_);
       if (maximum > 0) {
@@ -1943,11 +1964,8 @@ class X11Backend final : public Backend {
       }
     } else if (slider_kind_ == SliderKind::Volume) {
       spawn_command("amixer -q set Master " + std::to_string(percent) + "% unmute");
-      volume_percent_ = percent;
-      volume_muted_ = false;
     } else {
       spawn_command("amixer -q set Capture " + std::to_string(percent) + "% unmute");
-      mic_percent_ = percent;
     }
     widgets_refreshed_ = 0;
   }
@@ -1998,12 +2016,25 @@ class X11Backend final : public Backend {
     draw_slider_popup();
   }
 
+  // Called on every MotionNotify while dragging, which can fire far faster
+  // than the ~25Hz below (no motion-event compression on this window -- see
+  // the main dispatch loop). The popup redraw is cheap so it happens every
+  // time for smooth visual feedback, but the actual hardware write
+  // (commit_slider_percent(): an amixer fork+exec, or a sysfs file write) is
+  // throttled, and the full dock redraw (draw_docks(), which also re-parses
+  // the todo file) is deferred entirely to drag-end -- see the ButtonRelease
+  // case in dispatch(). Without this, holding and sliding used to fork a new
+  // amixer process and redraw every dock on every pixel of mouse movement.
   void handle_slider_position(int x) {
     constexpr int pad = 12;
     constexpr int track_width = 216;
     set_slider_percent(std::clamp((x - pad) * 100 / track_width, 0, 100));
     draw_slider_popup();
-    draw_docks();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - slider_last_commit_ >= std::chrono::milliseconds(40)) {
+      slider_last_commit_ = now;
+      commit_slider_percent();
+    }
   }
 
   struct PowerButton {
@@ -5030,11 +5061,10 @@ class X11Backend final : public Backend {
   }
 
   // Toggles all of the border chrome together -- top bar, bottom bar, and
-  // both side docks -- rather than just the top bar. Visual-only: doesn't
-  // reclaim their screen space in the tiling math (kBarHeight/kDockWidth are
-  // baked into dozens of geometry calculations). Also re-fits the wallpaper
-  // (see apply_wallpaper()): letterboxed to the inner desktop rect while the
-  // bars are shown, edge-to-edge once they're hidden.
+  // both side docks -- rather than just the top bar. Also reclaims their
+  // screen space in the tiling math (see arrange()'s dock_margin/bar_margin)
+  // and re-fits the wallpaper (see apply_wallpaper()): letterboxed to the
+  // inner desktop rect while the bars are shown, edge-to-edge once hidden.
   void toggle_bar() {
     bars_visible_ = !bars_visible_;
     if (bars_visible_) {
@@ -5044,8 +5074,6 @@ class X11Backend final : public Backend {
         XMapRaised(display_, dock.bottom);
         XMapRaised(display_, dock.right);
       }
-      draw_bar();
-      draw_docks();
     } else {
       XUnmapWindow(display_, bar_);
       for (const DockWindows& dock : docks_) {
@@ -5054,6 +5082,7 @@ class X11Backend final : public Backend {
         XUnmapWindow(display_, dock.right);
       }
     }
+    arrange();
     apply_wallpaper();
   }
 
@@ -5447,12 +5476,17 @@ class X11Backend final : public Backend {
   void arrange() {
     Workspace& target = workspace();
     const int gap = static_cast<int>(config_.gap);
+    // Only reserve space for the bars/docks while they're actually mapped --
+    // see toggle_bar(), which unmaps them without touching this margin
+    // before, leaving tiled windows sized as if the chrome were still there.
+    const int dock_margin = bars_visible_ ? kDockWidth : 0;
+    const int bar_margin = bars_visible_ ? kBarHeight : 0;
     for (std::size_t index = 0; index < monitors_.size(); ++index) {
       const Monitor& target_monitor = monitor(index);
-      const int x = target_monitor.x + kDockWidth + gap;
-      const int y = target_monitor.y + kBarHeight + gap;
-      const int width = std::max(1, target_monitor.width - 2 * kDockWidth - 2 * gap);
-      const int height = std::max(1, target_monitor.height - 2 * kBarHeight - 2 * gap);
+      const int x = target_monitor.x + dock_margin + gap;
+      const int y = target_monitor.y + bar_margin + gap;
+      const int width = std::max(1, target_monitor.width - 2 * dock_margin - 2 * gap);
+      const int height = std::max(1, target_monitor.height - 2 * bar_margin - 2 * gap);
       if (target.mode == LayoutMode::Manual) {
         arrange_manual(target.root.get(), x, y, width, height, index);
       } else {
@@ -5920,8 +5954,14 @@ class X11Backend final : public Backend {
         }
         break;
       case ButtonRelease:
-        if (slider_visible_ && event.xbutton.window == slider_window_ && event.xbutton.button == Button1)
+        if (slider_visible_ && event.xbutton.window == slider_window_ && event.xbutton.button == Button1) {
           slider_dragging_ = false;
+          // Guarantees the final position lands even if it fell inside the
+          // drag throttle window, and syncs the dock's volume/mic/backlight
+          // icon, which handle_slider_position() no longer redraws per-move.
+          commit_slider_percent();
+          draw_docks();
+        }
         break;
       case MotionNotify:
         if (slider_visible_ && slider_dragging_ && event.xmotion.window == slider_window_)
@@ -6148,6 +6188,7 @@ class X11Backend final : public Backend {
   bool slider_visible_ = false;
   bool slider_dragging_ = false;
   SliderKind slider_kind_ = SliderKind::Backlight;
+  std::chrono::steady_clock::time_point slider_last_commit_{};
   Window power_menu_window_ = None;
   bool power_menu_visible_ = false;
   int power_menu_diameter_ = 64;
