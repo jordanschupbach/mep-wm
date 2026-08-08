@@ -3842,7 +3842,14 @@ class X11Backend final : public Backend {
 
   void insert_floating(Workspace& target, Window window) { target.floating.push_back(window); }
 
-  void remove_tiled(Workspace& target, Window window) {
+  // prune_empty controls whether a leaf that's left with no tabs is
+  // automatically deleted/merged away. Callers that remove a window because
+  // it's leaving the tiled tree entirely (closed, floated, fullscreened)
+  // want the empty pane cleaned up. move_client_direction, which relocates a
+  // window to a *different* pane within the same tree, passes false so the
+  // vacated pane stays put -- the user asked for it, so it's theirs to
+  // delete with merge_pane (Super+d) rather than have it vanish for them.
+  void remove_tiled(Workspace& target, Window window, bool prune_empty = true) {
     Node* leaf = find_leaf(target.root.get(), window);
     if (!leaf) return;
     const auto position = std::find(leaf->tabs.begin(), leaf->tabs.end(), window);
@@ -3850,7 +3857,7 @@ class X11Backend final : public Backend {
     const auto stack_position = std::find(target.stack_order.begin(), target.stack_order.end(), window);
     if (stack_position != target.stack_order.end()) target.stack_order.erase(stack_position);
     if (leaf->tabs.empty()) {
-      remove_empty_leaf(target, leaf);
+      if (prune_empty) remove_empty_leaf(target, leaf);
     } else {
       leaf->active_tab %= leaf->tabs.size();
       target.selected_leaf = leaf;
@@ -4305,8 +4312,11 @@ class X11Backend final : public Backend {
     if (!found || !best_leaf) return;
 
     // remove_tiled drops the window from stack_order too; it's still tiled
-    // once it lands in best_leaf below, so put it back at the end.
-    remove_tiled(target, window);
+    // once it lands in best_leaf below, so put it back at the end. Don't
+    // auto-prune source_leaf if this empties it -- leave the now-empty pane
+    // in place so the layout doesn't change out from under the user; they
+    // can delete it explicitly with merge_pane (Super+d) if they want it gone.
+    remove_tiled(target, window, /*prune_empty=*/false);
     target.stack_order.push_back(window);
     best_leaf->tabs.push_back(window);
     best_leaf->active_tab = best_leaf->tabs.size() - 1;
