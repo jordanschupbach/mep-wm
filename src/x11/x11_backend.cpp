@@ -3224,7 +3224,7 @@ class X11Backend final : public Backend {
     if (error) return dir;
     const std::filesystem::path exe_dir = exe.parent_path();
     for (const std::filesystem::path& base :
-         {exe_dir, exe_dir.parent_path(), exe_dir.parent_path() / "share" / "mep-wm"}) {
+         {exe_dir, exe_dir.parent_path(), exe_dir.parent_path() / "share" / "mepwm"}) {
       std::filesystem::path candidate = base / dir;
       if (std::filesystem::exists(candidate)) return candidate;
     }

@@ -2,6 +2,14 @@
 
 MEP-wm (Mise En Place window manager) is a window manager that has everything in place.
 
+On Linux, mepwm is the window manager (X11 native, experimental Wayland).
+On macOS it runs as an **overlay manager** (AeroSpace/Amethyst style): the
+native window server keeps owning windows and mepwm arranges them through the
+Accessibility API. A Windows overlay backend is planned. Shared policy
+(layouts, focus rules, keybindings) lives in `src/core/` behind a
+`core::Platform` bridge; see `docs/PORTING.md` for the architecture and the
+parity roadmap.
+
 ## Development
 
 Enter the Nix shell and build the project:
@@ -11,9 +19,124 @@ nix develop
 just build
 ```
 
+`nix build` produces an installable package (`result/bin/mepwm`) on both
+Linux and macOS.
+
 `mepwm` is split into a reusable `mepwm` library and a small executable in
-`src/main.cpp`. It has an X11 tiling backend and an experimental wlroots-based
-Wayland compositor backend. Select one with `--backend x11` or `--backend wayland`.
+`src/main.cpp`. It has an X11 tiling backend, an experimental wlroots-based
+Wayland compositor backend, and a macOS overlay backend. Select one with
+`--backend x11|wayland|macos` (the default is the native backend for the
+platform you built on).
+
+## macOS overlay
+
+```sh
+nix develop
+just build
+./build/mepwm            # defaults to --backend macos on macOS
+```
+
+The first run triggers the system Accessibility prompt (run from a
+terminal, mepwm inherits the terminal's permission; launched as an app it
+needs its own grant). mepwm waits until the permission is granted under
+System Settings → Privacy & Security → Accessibility and then starts on
+its own -- no relaunch needed.
+
+### Installing (macOS)
+
+```sh
+just install           # binaries + assets into ~/.local (or: just install /usr/local)
+just service-install   # install + run as a login LaunchAgent
+```
+
+`just install` also copies a `MEP-wm.app` bundle into `~/Applications`, so
+Spotlight and Launchpad find "MEP-wm" (`just install-app /Applications`
+installs it for all users instead). The app is a menu-bar-less accessory
+(`LSUIElement`) running the same program as the CLI binary; a
+single-instance lock makes a Spotlight launch exit quietly when the
+LaunchAgent (or a terminal run) already has an overlay running.
+
+`just service-install` registers `~/Library/LaunchAgents/com.mepwm.plist`
+pointing at the installed binary: mepwm starts immediately, at every login,
+and restarts on crashes -- quitting with `Mod+Shift+q` stays quit. Logs go
+to `~/Library/Logs/mepwm.log` (`just service-log` tails them). Manage it
+with `just service-start` / `service-stop` / `service-restart` /
+`service-status`, and remove it with `just service-uninstall` (keeps the
+binaries; `just uninstall` removes those). Because the service runs the
+binary directly, macOS ties the Accessibility grant to it -- rerunning
+`just service-install` after a rebuild reinstalls the binary and may make
+macOS ask for the Accessibility permission again.
+
+Windows tile inside the screen's *visible frame*, so the macOS menu bar and
+Dock always keep their space. Inside that area mepwm draws its own chrome as
+click-through overlay panels: a top bar (focused window title + clock), a
+bottom bar (pomodoro, now-playing, git branch, keyboard layout, appearance,
+battery, volume, mic, wifi, bluetooth, load, memory, disk, and an info
+widget that opens the keybinding help sidebar), a left dock (one cell per
+managed window, focused highlighted), and a right dock with the X11-style
+sidebar toggles: notifications (a log of window/pomodoro events), todos,
+and AI agents (claude/codex processes plus `mwm-agents` status files; the
+cell highlights when an agent needs input). The
+bars accept clicks without stealing focus: the pomodoro widget starts/stops
+a 25/5 timer, every other widget opens its sidebar panel (wifi, bluetooth,
+media with prev/play/next, battery, volume with mute and quick-set levels,
+mic, git status, keyboard with click-to-switch layouts, theme with a
+dark/light toggle, and a system panel for load/mem/disk), and a left-dock
+cell focuses that window. Rows starting with `>` in a panel are clickable.
+The now-playing widget reads Spotify or Music when one is running; its
+first use (and the dark/light toggle, via System Events) triggers macOS's
+one-time Automation permission prompt.
+
+Widgets use the same Nerd Font icons as the X11 bar when a Nerd Font is
+installed (mepwm picks the first installed "* Nerd Font" family
+automatically; override with `MEPWM_ICON_FONT="JetBrainsMono Nerd Font"` or
+disable icons with `MEPWM_ICON_FONT=none`). Without one, widgets fall back
+to text labels.
+`Mod+t` toggles a todo sidebar (reads `MEPWM_TODO_FILE`, else
+`TODO.org` in the launch directory, else `~/TODO.org`), `Mod+Shift+t` opens
+the theme picker (live preview while the highlight moves; Enter commits,
+Escape reverts), and `Mod+Shift+/` toggles a keybinding help sidebar. The wifi widget shows just "on" unless
+mepwm has the Location permission (macOS gates SSIDs behind it). The `gap`
+setting pads the tiled windows, and each managed window gets a border ring
+in the gap (`border_color_focused` highlights the focused window). Set
+`MEPWM_DEBUG=1` to log hotkey registration/presses and spawns to stderr.
+
+The manual split/tab layout (`Super+v`/`Super+s`/`Super+Tab` on X11) has not
+been ported to the overlay engine yet -- macOS currently tiles master/stack
+only. See docs/PORTING.md phase 2.
+
+The layout is the same manual tree as X11: every pane holds tabs, and new
+windows open as tabs in the selected pane. The modifier (`Mod` below) is
+the Globe/fn key held together with Command by default. `Mod+v` splits the
+selected pane side by side, `Mod+s` splits it stacked (the new empty pane
+is selected and highlighted, so the next window opens there),
+`Mod+n`/`Mod+p` and `Mod+Tab`/`Mod+Shift+Tab` cycle a pane's tabs,
+`Mod+m` (or `Mod+d`, as on X11) merges
+a pane with its sibling (absorbing its windows as tabs), and
+`Mod+-`/`Mod+=` resize the selected split. Panes with more than one tab get a clickable tab bar.
+`Mod+h/j/k/l` focuses panes by direction, `Mod+Shift+h/j/k/l` resizes by
+moving the nearest split boundary in that direction, `Mod+Ctrl+h/j/k/l`
+moves the focused window into the neighboring pane, `Mod+1..9` switches
+workspace,
+`Mod+Shift+1..9` sends the window there, `Mod+Enter` opens a terminal, and
+`Mod+Shift+q` exits (windows keep their last arranged frames).
+
+Workspaces are emulated the way AeroSpace does it: windows on inactive
+workspaces are parked in the bottom-right corner of the screen (macOS
+keeps a small sliver visible; the window is still alive and Cmd-Tab-able).
+Switching re-tiles the incoming workspace; focusing a parked window by any
+means (Cmd-Tab, Dock) automatically switches to its workspace. The top bar
+shows a cell per occupied workspace -- click one to switch.
+
+The default `fn+cmd` modifier avoids clashing with application shortcuts
+(fn-involving hotkeys are matched via an event tap, since macOS's hotkey
+API cannot register fn as a modifier). Prefer a different key? Run with
+`--modifier fn|cmd|alt|ctrl` (or set `MEPWM_MODIFIER`) -- `fn` uses the
+Globe/fn key alone, and note the Command modifier shadows `Cmd+H` (Hide),
+`Cmd+M` (Minimize), `Cmd+R` (reload), and `Cmd+-`/`Cmd+=` (zoom) in every
+app, while `alt` gives the AeroSpace-style Option layout. If you remapped
+the Globe key in System Settings > Keyboard (e.g. to switch input sources),
+held-down fn still works as the modifier.
 
 For safe X11 development inside an existing X11 desktop, run:
 

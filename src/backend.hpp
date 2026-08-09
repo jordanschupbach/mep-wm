@@ -18,7 +18,11 @@ class Backend {
   virtual int run(const Config& config) = 0;
 };
 
+// Each factory is defined in its backend's translation unit; only the
+// backends compiled on the current platform may be referenced (the
+// MEPWM_WITH_* guards in window_manager.cpp keep the linker honest).
 std::unique_ptr<Backend> make_x11_backend();
 std::unique_ptr<Backend> make_wayland_backend();
+std::unique_ptr<Backend> make_macos_backend();
 
 }  // namespace mepwm

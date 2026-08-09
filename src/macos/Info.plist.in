@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key><string>English</string>
+  <key>CFBundleExecutable</key><string>${MACOSX_BUNDLE_EXECUTABLE_NAME}</string>
+  <key>CFBundleIdentifier</key><string>${MACOSX_BUNDLE_GUI_IDENTIFIER}</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleName</key><string>${MACOSX_BUNDLE_BUNDLE_NAME}</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>${MACOSX_BUNDLE_SHORT_VERSION_STRING}</string>
+  <key>CFBundleVersion</key><string>${MACOSX_BUNDLE_BUNDLE_VERSION}</string>
+  <!-- Accessory app: no Dock icon or Cmd-Tab entry, matching the activation
+       policy the backend sets at runtime. -->
+  <key>LSUIElement</key><true/>
+  <key>NSHighResolutionCapable</key><true/>
+  <!-- Required usage descriptions: macOS kills a bundled app outright when
+       it touches these APIs without them (bare terminal binaries are
+       exempt, which is why only the .app crashed). Bluetooth: the
+       status-bar widget's power/device probe. Apple Events: the dark/light
+       toggle (System Events) and the now-playing widget (Spotify/Music). -->
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>MEP-wm shows Bluetooth power and connected devices in its status bar.</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>MEP-wm uses System Events for the dark/light toggle and reads Spotify/Music for the now-playing widget.</string>
+</dict>
+</plist>
