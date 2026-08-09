@@ -1,6 +1,7 @@
 #include "core/geometry.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 
 namespace mepwm::core {

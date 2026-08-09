@@ -1764,7 +1764,7 @@ std::string TilingEngine::pomodoro_text() const {
       icons_ ? icons::kPomodoro : (pomodoro_ == PomodoroPhase::Break ? "break" : "pom");
   if (pomodoro_ == PomodoroPhase::Idle) return prefix;
   const std::time_t remaining = std::max<std::time_t>(0, pomodoro_end_ - std::time(nullptr));
-  char timer[16];
+  char timer[32];
   std::snprintf(timer, sizeof timer, " %02ld:%02ld", static_cast<long>(remaining / 60),
                 static_cast<long>(remaining % 60));
   return prefix + timer;
