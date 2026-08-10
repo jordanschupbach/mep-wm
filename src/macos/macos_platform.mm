@@ -17,6 +17,7 @@
 #include <mach/mach.h>
 #include <sys/mount.h>
 #include <sys/sysctl.h>
+#include <sys/wait.h>
 
 #include <algorithm>
 #include <cctype>
@@ -626,8 +627,11 @@ class MacosPlatform final : public core::Platform {
     // Accessory: no Dock icon, no menu bar takeover -- mepwm is an overlay.
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     wait_for_accessibility_permission();
-    // Spawned terminals are fire-and-forget; never leave zombies behind.
-    std::signal(SIGCHLD, SIG_IGN);
+    // SIGCHLD must keep its default disposition: with SIGCHLD ignored, POSIX
+    // makes pclose()'s wait4 block until ALL children exit, so one long-lived
+    // spawned program (a directly exec'd terminal) wedges every
+    // capture_command() call -- and with it the poll loop and event tap.
+    // spawn() double-forks instead, so no child outlives its exec anyway.
 
     icon_font_name_ = detect_icon_font();
     if (!icon_font_name_.empty()) {
@@ -1531,11 +1535,24 @@ class MacosPlatform final : public core::Platform {
 
   void spawn(const std::string& shell_command) override {
     if (debug_) std::fprintf(stderr, "mepwm: spawn: %s\n", shell_command.c_str());
+    // Double fork: the grandchild runs the command and is adopted by init, so
+    // a long-lived program (a spawned terminal) is never mepwm's child. The
+    // intermediate
+    // exits immediately and is reaped right here, leaving popen/pclose as the
+    // only wait() users in the process.
     const pid_t child = fork();
     if (child == 0) {
       setsid();
-      execl("/bin/sh", "sh", "-c", shell_command.c_str(), static_cast<char*>(nullptr));
-      _exit(127);
+      const pid_t grandchild = fork();
+      if (grandchild == 0) {
+        execl("/bin/sh", "sh", "-c", shell_command.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+      }
+      _exit(grandchild > 0 ? 0 : 127);
+    }
+    if (child > 0) {
+      int status = 0;
+      waitpid(child, &status, 0);
     }
   }
 

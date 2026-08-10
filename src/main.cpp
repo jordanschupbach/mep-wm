@@ -23,7 +23,9 @@ bool acquire_single_instance_lock() {
   const char* tmpdir = std::getenv("TMPDIR");
   const std::string path =
       std::string(tmpdir != nullptr && *tmpdir != '\0' ? tmpdir : "/tmp") + "/mepwm.lock";
-  const int fd = ::open(path.c_str(), O_CREAT | O_RDWR, 0600);
+  // O_CLOEXEC: spawned programs (terminals!) must not inherit the lock fd,
+  // or they keep "another instance is running" true after mepwm exits.
+  const int fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
   if (fd < 0) return true;  // can't create the lock file: don't block startup
   if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
     ::close(fd);
