@@ -28,6 +28,44 @@ Wayland compositor backend, and a macOS overlay backend. Select one with
 `--backend x11|wayland|macos` (the default is the native backend for the
 platform you built on).
 
+## Using mep-wm as a flake input
+
+Another flake can consume mep-wm directly instead of vendoring the source
+(e.g. as a git submodule):
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    # mep-wm's Wayland backend needs wlroots 0.20, which typically lags
+    # behind on stable channels, so pin it to an unstable nixpkgs input.
+    unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
+    mep-wm.url = "github:jordanschupbach/mep-wm";
+    mep-wm.inputs.nixpkgs.follows = "unstable";
+  };
+
+  outputs = { self, nixpkgs, unstable, mep-wm, ... }: {
+    # e.g. inside a NixOS module or package set:
+    #   mep-wm.packages.${system}.default
+  };
+}
+```
+
+The `default` package installs `bin/mepwm` and `bin/mep-wm-cli`. Add it to
+`environment.systemPackages` (NixOS) or `home.packages` (home-manager) like
+any other derivation:
+
+```nix
+{ inputs, pkgs, ... }: {
+  environment.systemPackages = [
+    inputs.mep-wm.packages.${pkgs.system}.default
+  ];
+}
+```
+
+To bump the pinned mep-wm commit later, run `nix flake lock --update-input
+mep-wm` in the consuming flake (or `nix flake update` to bump everything).
+
 ## macOS overlay
 
 ```sh

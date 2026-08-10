@@ -33,6 +33,12 @@
           dbus
           libxkbcommon
           libxdmcp
+          # wlroots' headers (wlr_output.h) pull in pixman.h and libdrm at
+          # compile time, and libxcb needs libXau; none of the three are
+          # pulled in transitively, so they must be listed explicitly.
+          pixman
+          libdrm
+          xorg.libXau
         ];
 
         # Extra tools for hacking on the Linux backends (nested Xephyr

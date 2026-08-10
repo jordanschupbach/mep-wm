@@ -5,6 +5,9 @@
 CLOCK: [2026-08-08 Sat 14:28]
 :END:
 * TODO Improve wifi widget
+:LOGBOOK:
+CLOCK: [2026-08-10 Mon 10:43]
+:END:
 * TODO Add pin binding (mod+shift+p) to maximize current window
 * TODO Add floating binding (mod+shift+f) to toggle floating for current window
 * TODO Add resizing behaviour for floating windows (mod+shift+h,j,k,l keys)
