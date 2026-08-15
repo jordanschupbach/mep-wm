@@ -1113,7 +1113,7 @@ void TilingEngine::handle_picker_selected(const Event& event) {
                        [&](const ProjectState& project) { return project.path == entered_path; });
       if (found == projects_.end()) return;
       switch_project(static_cast<std::size_t>(found - projects_.begin()));
-      spawn_terminal_in(entered_path);
+      if (windows_in(current_workspace_).empty()) spawn_terminal_in(entered_path);
       return;
     }
   }
@@ -1124,8 +1124,10 @@ void TilingEngine::handle_picker_selected(const Event& event) {
   switch_project(index);
   // The recent-projects picker doubles as "start working here": it opens a
   // terminal in the project, matching X11. The active-projects picker only
-  // switches.
-  if (pending == PendingPicker::Projects) spawn_terminal_in(path);
+  // switches. Skip the terminal if the landing workspace already has windows.
+  if (pending == PendingPicker::Projects && windows_in(current_workspace_).empty()) {
+    spawn_terminal_in(path);
+  }
 }
 
 void TilingEngine::spawn_terminal_in(const std::string& directory) {

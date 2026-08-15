@@ -1055,7 +1055,7 @@ class X11Backend final : public Backend {
                                  [&](const Project& project) { return project.path == normalized; });
     if (it == backend->projects_.end()) return 0;
     backend->switch_project(static_cast<std::size_t>(it - backend->projects_.begin()));
-    backend->spawn_terminal_in(normalized);
+    if (!workspace_has_clients(backend->workspace())) backend->spawn_terminal_in(normalized);
     return 0;
   }
 
@@ -4677,8 +4677,9 @@ class X11Backend final : public Backend {
           const std::size_t project = static_cast<std::size_t>(it - projects_.begin());
           close_launcher();
           switch_project(project);
-          spawn_terminal_in(entered_path);
-          if (with_agent) spawn_terminal_running(entered_path, config_.agent_command);
+          const bool needs_terminal = workspace_has_clients(workspace()) == false;
+          if (needs_terminal) spawn_terminal_in(entered_path);
+          if (needs_terminal && with_agent) spawn_terminal_running(entered_path, config_.agent_command);
           return;
         }
       }
@@ -4688,8 +4689,9 @@ class X11Backend final : public Backend {
       const std::string path = projects_[project].path;
       close_launcher();
       switch_project(project);
-      if (open_terminal) spawn_terminal_in(path);
-      if (open_terminal && with_agent) spawn_terminal_running(path, config_.agent_command);
+      const bool needs_terminal = open_terminal && !workspace_has_clients(workspace());
+      if (needs_terminal) spawn_terminal_in(path);
+      if (needs_terminal && with_agent) spawn_terminal_running(path, config_.agent_command);
       return;
     }
     if (launcher_matches_.empty()) return;
