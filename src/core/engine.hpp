@@ -136,6 +136,11 @@ class TilingEngine final : public Backend {
   void preview_theme(int index);
   std::size_t effective_theme() const;  // previewed theme if any, else committed
   void sync_theme_colors();  // border colors follow the active palette
+  // Pushes fg/bg/accent to kitty: rewrites its theme include (so terminals
+  // launched from now on match) and nudges already-running kitty windows
+  // via remote control, so open and future terminals stay in sync with the
+  // picker (including live preview, matching the border/chrome behavior).
+  void sync_terminal_theme() const;
   void save_theme() const;
   void load_theme();
 
