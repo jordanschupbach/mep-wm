@@ -1,6 +1,7 @@
 #include "core/engine.hpp"
 
 #include "core/icons.hpp"
+#include "core/terminal_theme.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -184,138 +185,6 @@ std::string mix_hex(const std::string& base, const std::string& toward, double a
   char blended[8];
   std::snprintf(blended, sizeof blended, "#%02x%02x%02x", channels[0], channels[1], channels[2]);
   return blended;
-}
-
-// Terminal theming. kitty (the default on every platform) gets a dedicated
-// config include plus its remote-control protocol, below. xterm and urxvt
-// (the X11 fallback and a common manual choice) get their startup colors
-// from the X resource database, and -- like every other VT100-descended
-// emulator (alacritty, foot, kitty too) -- honor the OSC 10/11/12 escape
-// sequences for live recoloring, so already-running sessions are updated by
-// writing those sequences directly to each terminal's pty. iTerm2/
-// Terminal.app have no equivalent hook available from a shell command, so
-// they're left unthemed.
-std::string kitty_config_dir() {
-  if (const char* config_home = std::getenv("XDG_CONFIG_HOME");
-      config_home != nullptr && *config_home != '\0') {
-    return std::string(config_home) + "/kitty";
-  }
-  if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
-    return std::string(home) + "/.config/kitty";
-  }
-  return {};
-}
-
-std::string shell_single_quote(const std::string& value) {
-  std::string quoted = "'";
-  for (char ch : value) {
-    if (ch == '\'') quoted += "'\\''";
-    else quoted += ch;
-  }
-  quoted += "'";
-  return quoted;
-}
-
-void write_kitty_theme_file(const std::string& path, const ThemeDef& theme) {
-  std::ofstream file(path);
-  if (!file) return;
-  file << "background " << theme.bg << '\n'
-       << "foreground " << theme.fg << '\n'
-       << "cursor " << theme.accent << '\n'
-       << "cursor_text_color " << theme.bg << '\n'
-       << "url_color " << theme.accent << '\n'
-       << "selection_background " << theme.accent << '\n'
-       << "selection_foreground " << theme.bg << '\n'
-       << "active_tab_background " << theme.accent << '\n'
-       << "active_tab_foreground " << theme.bg << '\n'
-       << "inactive_tab_background " << mix_hex(theme.bg, theme.fg, 0.15) << '\n'
-       << "tab_bar_background " << theme.bg << '\n';
-}
-
-// kitty only picks up mepwm-theme.conf for cold-started windows if
-// kitty.conf includes it; append that include once, non-destructively, so
-// we never clobber the user's own kitty config.
-void ensure_kitty_conf_includes_theme(const std::string& config_dir) {
-  static const char kIncludeLine[] = "include mepwm-theme.conf";
-  const std::string conf_path = config_dir + "/kitty.conf";
-  std::ifstream existing(conf_path);
-  if (existing) {
-    std::string line;
-    while (std::getline(existing, line)) {
-      if (line.find(kIncludeLine) != std::string::npos) return;
-    }
-  }
-  std::ofstream file(conf_path, std::ios::app);
-  if (file) file << '\n' << kIncludeLine << '\n';
-}
-
-std::string xresources_theme_path() {
-  if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
-    return std::string(home) + "/.Xresources.d/mepwm-theme";
-  }
-  return {};
-}
-
-// xterm and urxvt both read these class resources from the X resource
-// database (RESOURCE_MANAGER) at startup; `*` matches either the class or
-// instance name so per-window overrides in the user's own resources still
-// take precedence.
-void write_xresources_theme_file(const std::string& path, const ThemeDef& theme) {
-  std::ofstream file(path);
-  if (!file) return;
-  file << "xterm*background: " << theme.bg << '\n'
-       << "xterm*foreground: " << theme.fg << '\n'
-       << "xterm*cursorColor: " << theme.accent << '\n'
-       << "xterm*highlightColor: " << theme.accent << '\n'
-       << "URxvt*background: " << theme.bg << '\n'
-       << "URxvt*foreground: " << theme.fg << '\n'
-       << "URxvt*cursorColor: " << theme.accent << '\n'
-       << "URxvt*highlightColor: " << theme.accent << '\n';
-}
-
-// xrdb (which xterm/urxvt both read their resources through) parses via cpp,
-// so a plain #include is the natural, non-destructive way to pull our file
-// in; append it once if the user's ~/.Xresources doesn't already have it.
-void ensure_xresources_includes_theme(const std::string& theme_path) {
-  const char* home = std::getenv("HOME");
-  if (home == nullptr || *home == '\0') return;
-  const std::string xresources_path = std::string(home) + "/.Xresources";
-  const std::string include_line = "#include \"" + theme_path + "\"";
-  std::ifstream existing(xresources_path);
-  if (existing) {
-    std::string line;
-    while (std::getline(existing, line)) {
-      if (line.find(theme_path) != std::string::npos) return;
-    }
-  }
-  std::ofstream file(xresources_path, std::ios::app);
-  if (file) file << '\n' << include_line << '\n';
-}
-
-// Every VT100-descended terminal (xterm, urxvt, alacritty, foot, kitty)
-// accepts these OSC sequences to recolor itself live; %s placeholders are
-// filled with already-validated "#rrggbb" literals from the built-in theme
-// table, never user input, so no shell-injection risk from the substitution.
-std::string osc_color_sequence(const ThemeDef& theme) {
-  return "\\033]10;" + std::string(theme.fg) + "\\007" + "\\033]11;" + std::string(theme.bg) +
-         "\\007" + "\\033]12;" + std::string(theme.accent) + "\\007";
-}
-
-// Finds every currently-running xterm/urxvt/alacritty/foot session's pty
-// (the direct child of the emulator process owns it) and writes the OSC
-// color sequence straight into it, exactly as if the shell inside had
-// printed it -- restyling already-open windows without their cooperation.
-// kitty is excluded here since sync_terminal_theme already restyles it (and
-// primes new-window colors) via its own remote-control call.
-std::string live_recolor_running_terminals_command(const ThemeDef& theme) {
-  // Substring (not exact) match: distro packaging can wrap the real binary
-  // (e.g. NixOS's comm shows ".xterm-wrapped", not "xterm").
-  return "for _epid in $(ps -eo pid=,comm= | awk '$2 ~ "
-         "/xterm|urxvt|rxvt-unicode|alacritty|foot/{print $1}'); do "
-         "ps -eo ppid=,tty= | awk -v p=\"$_epid\" '$1==p && $2!=\"?\"{print $2}'; "
-         "done | sort -u | while IFS= read -r _pty; do "
-         "printf '" + osc_color_sequence(theme) + "' > \"/dev/$_pty\" 2>/dev/null; "
-         "done";
 }
 
 // The chosen theme persists by name next to the projects file, so it
@@ -1126,32 +995,8 @@ void TilingEngine::sync_theme_colors() {
 
 void TilingEngine::sync_terminal_theme() const {
   const ThemeDef& theme = themes()[effective_theme()];
-  std::error_code error;
-
-  if (const std::string config_dir = kitty_config_dir(); !config_dir.empty()) {
-    std::filesystem::create_directories(config_dir, error);
-    const std::string theme_path = config_dir + "/mepwm-theme.conf";
-    write_kitty_theme_file(theme_path, theme);
-    ensure_kitty_conf_includes_theme(config_dir);
-    // `--configured` updates the palette new OS windows inherit within a
-    // running kitty instance, so this one command covers both already-open
-    // and future terminals; silently no-ops if kitty isn't running or its
-    // remote control is disabled.
-    platform_->spawn("command -v kitty >/dev/null 2>&1 && kitty @ set-colors --all --configured " +
-                      shell_single_quote(theme_path) + " >/dev/null 2>&1 || true");
-  }
-
-  if (const std::string xresources_path = xresources_theme_path(); !xresources_path.empty()) {
-    std::filesystem::create_directories(std::filesystem::path(xresources_path).parent_path(), error);
-    write_xresources_theme_file(xresources_path, theme);
-    ensure_xresources_includes_theme(xresources_path);
-    // Merging our file directly (rather than just appending the #include)
-    // takes effect immediately even if the user's shell never re-sources
-    // ~/.Xresources this session.
-    platform_->spawn("command -v xrdb >/dev/null 2>&1 && [ -n \"$DISPLAY\" ] && xrdb -merge " +
-                      shell_single_quote(xresources_path) + " >/dev/null 2>&1 || true");
-  }
-  platform_->spawn(live_recolor_running_terminals_command(theme) + " >/dev/null 2>&1 || true");
+  ::mepwm::core::sync_terminal_theme(theme.fg, theme.bg, theme.accent,
+                                      [this](const std::string& command) { platform_->spawn(command); });
 }
 
 void TilingEngine::apply_theme(std::size_t index) {

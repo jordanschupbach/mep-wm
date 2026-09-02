@@ -1,4 +1,5 @@
 #include "backend.hpp"
+#include "core/terminal_theme.hpp"
 
 #include <X11/XKBlib.h>
 #include <X11/Xatom.h>
@@ -3108,6 +3109,10 @@ class X11Backend final : public Backend {
     border_focused_pixel_ = alloc_color(palette[2]);
     border_normal_pixel_ = alloc_color(mix_hex(palette[1], palette[0], 0.35));
     refresh_all_borders();
+    // Keeps kitty/xterm/urxvt/alacritty/foot (running and future windows)
+    // in sync with the picker, matching the border/bar behavior above.
+    core::sync_terminal_theme(palette[0], palette[1], palette[2],
+                               [](const std::string& command) { spawn_command(command); });
     // The tray window itself (not just its icons) paints the gap between
     // icons, so it needs to follow the theme too -- otherwise it stays the
     // hardcoded black it's bootstrapped with in create_tray() (before the
