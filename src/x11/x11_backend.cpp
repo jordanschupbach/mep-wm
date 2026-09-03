@@ -1,4 +1,5 @@
 #include "backend.hpp"
+#include "core/mep_theme.hpp"
 #include "core/terminal_theme.hpp"
 #include "core/theme_palette.hpp"
 
@@ -3133,6 +3134,11 @@ class X11Backend final : public Backend {
     // including the 16-slot ANSI palette that neofetch's swatch reads from.
     core::sync_terminal_theme(palette.fg, palette.bg, palette.accent, palette.ansi,
                                [](const std::string& command) { spawn_command(command); });
+    // Keeps any running `mep` editor windows in sync too (same treatment as
+    // the terminal sync just above).
+    if (const char* mep_name = core::mep_colorscheme_for(theme_names_[static_cast<std::size_t>(theme_index_)])) {
+      core::sync_mep_theme(mep_name);
+    }
     // The tray window itself (not just its icons) paints the gap between
     // icons, so it needs to follow the theme too -- otherwise it stays the
     // hardcoded black it's bootstrapped with in create_tray() (before the
