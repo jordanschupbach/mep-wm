@@ -200,7 +200,13 @@ struct Node {
   std::vector<double> weights;
   std::vector<Window> tabs;
   std::size_t active_tab = 0;
-  std::unordered_map<std::size_t, Rect> rect_by_monitor;
+  // A leaf's last-arranged screen rect. A workspace tree belongs to exactly
+  // one monitor (see workspaces_ below), so a leaf only ever needs one rect,
+  // recorded unconditionally -- including for empty leaves -- so a freshly
+  // split pane with nothing open in it yet still has a rect to select,
+  // highlight, and place a tab bar against.
+  Rect rect;
+  bool has_rect = false;
 
   bool is_leaf() const { return children.empty(); }
 };
@@ -216,9 +222,13 @@ struct Workspace {
   std::vector<Window> floating;
 };
 
+// One monitor's full set of 9 workspaces.
+using WorkspaceSet = std::array<Workspace, kWorkspaceCount>;
+
 struct Project {
   std::string path;
-  std::array<Workspace, kWorkspaceCount> workspaces;
+  // One WorkspaceSet per monitor -- see workspaces_ below.
+  std::vector<WorkspaceSet> workspaces;
 };
 
 // Per-window state that outlives which workspace/container currently holds
@@ -396,12 +406,14 @@ class X11Backend final : public Backend {
     }
     for (auto& entry : fallback_fonts_)
       if (entry.second != bar_font_ && entry.second != icon_font_) XftFontClose(display_, entry.second);
-    if (bar_xft_draw_) XftDrawDestroy(bar_xft_draw_);
+    for (XftDraw* draw : bar_xft_draws_)
+      if (draw) XftDrawDestroy(draw);
     if (launcher_xft_draw_) XftDrawDestroy(launcher_xft_draw_);
     if (bar_font_) XftFontClose(display_, bar_font_);
     if (icon_font_) XftFontClose(display_, icon_font_);
     if (hint_font_ && hint_font_ != bar_font_) XftFontClose(display_, hint_font_);
-    if (bar_pixmap_) XFreePixmap(display_, bar_pixmap_);
+    for (Pixmap pixmap : bar_pixmaps_)
+      if (pixmap) XFreePixmap(display_, pixmap);
     if (launcher_pixmap_) XFreePixmap(display_, launcher_pixmap_);
     if (wallpaper_preview_pixmap_) XFreePixmap(display_, wallpaper_preview_pixmap_);
     if (theme_preview_pixmap_) XFreePixmap(display_, theme_preview_pixmap_);
@@ -451,7 +463,8 @@ class X11Backend final : public Backend {
     update_monitors();
     startup.checkpoint("configure display and monitors");
 
-    create_bar();
+    init_bar_resources();
+    create_bars();
     startup.checkpoint("create top bar");
     create_docks();
     startup.checkpoint("create sidebars");
@@ -504,7 +517,10 @@ class X11Backend final : public Backend {
   }
 
  private:
-  Workspace& workspace() { return workspaces_[current_workspace_]; }
+  Workspace& workspace() { return workspace_at(current_monitor_); }
+  Workspace& workspace_at(std::size_t monitor_index) {
+    return workspaces_[monitor_index][current_workspace_[monitor_index]];
+  }
 
   static std::string project_state_path() {
     if (const char* data_home = std::getenv("XDG_DATA_HOME"); data_home && *data_home)
@@ -572,11 +588,52 @@ class X11Backend final : public Backend {
 
   static bool workspace_has_clients(const Workspace& value) { return value.root || !value.floating.empty(); }
 
+  static bool workspace_set_has_clients(const WorkspaceSet& value) {
+    return std::any_of(value.begin(), value.end(), workspace_has_clients);
+  }
+
   bool project_has_clients(std::size_t index) const {
-    if (index == active_project_index_) return std::any_of(workspaces_.begin(), workspaces_.end(), workspace_has_clients);
+    if (index == active_project_index_)
+      return std::any_of(workspaces_.begin(), workspaces_.end(), workspace_set_has_clients);
     if (index >= projects_.size()) return false;
     const auto& workspaces = projects_[index].workspaces;
-    return std::any_of(workspaces.begin(), workspaces.end(), workspace_has_clients);
+    return std::any_of(workspaces.begin(), workspaces.end(), workspace_set_has_clients);
+  }
+
+  // Moves every window on `doomed` (one monitor's full WorkspaceSet, about to
+  // be discarded because that monitor no longer exists) into monitor 0's
+  // matching workspace numbers, so unplugging a monitor -- or restoring a
+  // project that remembers more monitors than exist now -- never silently
+  // drops windows.
+  void migrate_monitor_workspaces(WorkspaceSet& doomed) {
+    if (workspaces_.empty()) return;
+    for (int index = 0; index < kWorkspaceCount; ++index) {
+      Workspace& source = doomed[index];
+      std::vector<Window> tiled;
+      collect_windows(source.root.get(), tiled);
+      Workspace& target = workspaces_[0][index];
+      for (Window window : tiled) {
+        window_state_[window].monitor = 0;
+        insert_tiled(target, window);
+      }
+      for (Window window : source.floating) {
+        window_state_[window].monitor = 0;
+        insert_floating(target, window);
+      }
+    }
+  }
+
+  // Grows or shrinks workspaces_/current_workspace_ to match monitor_count,
+  // migrating any about-to-vanish monitor's windows into monitor 0 first.
+  void resize_workspace_sets(std::size_t monitor_count) {
+    if (monitor_count == 0) return;
+    while (workspaces_.size() > monitor_count) {
+      migrate_monitor_workspaces(workspaces_.back());
+      workspaces_.pop_back();
+      if (!current_workspace_.empty()) current_workspace_.pop_back();
+    }
+    workspaces_.resize(monitor_count);
+    current_workspace_.resize(monitor_count, 0);
   }
 
   void switch_project(std::size_t index) {
@@ -585,11 +642,15 @@ class X11Backend final : public Backend {
       switch_workspace(0);
       return;
     }
-    hide_workspace(workspace());
+    for (std::size_t monitor_index = 0; monitor_index < workspaces_.size(); ++monitor_index) {
+      hide_workspace(workspace_at(monitor_index));
+    }
     projects_[active_project_index_].workspaces = std::move(workspaces_);
     active_project_index_ = index;
     workspaces_ = std::move(projects_[active_project_index_].workspaces);
-    current_workspace_ = 0;
+    resize_workspace_sets(monitors_.size());
+    std::fill(current_workspace_.begin(), current_workspace_.end(), 0);
+    current_monitor_ = std::min(current_monitor_, workspaces_.size() - 1);
     arrange();
     if (workspace().focused != None) focus(workspace().focused);
     else {
@@ -632,8 +693,12 @@ class X11Backend final : public Backend {
     if (discovered.empty()) discovered.push_back({0, 0, DisplayWidth(display_, screen_), DisplayHeight(display_, screen_)});
 
     monitors_ = std::move(discovered);
+    // Must run before clamping current_monitor_ below: shrinking migrates any
+    // about-to-vanish monitor's windows into monitor 0 (updating their
+    // WindowState::monitor as it goes), rather than just relabeling a tag and
+    // leaving them stranded in a WorkspaceSet that's about to be destroyed.
+    resize_workspace_sets(monitors_.size());
     current_monitor_ = std::min(current_monitor_, monitors_.size() - 1);
-    for (auto& entry : window_state_) entry.second.monitor = std::min(entry.second.monitor, monitors_.size() - 1);
   }
 
   // Xephyr can change the nested root size when its host window is resized.
@@ -641,19 +706,27 @@ class X11Backend final : public Backend {
   // a workspace switch must never reuse geometry captured before that resize.
   void refresh_display_geometry() {
     update_monitors();
-    if (bar_) {
-      const int width = std::max(1, DisplayWidth(display_, screen_));
-      XMoveResizeWindow(display_, bar_, 0, 0, width, kBarHeight);
-    }
+    if (!bars_.empty()) create_bars();
     create_docks();
   }
 
+  // Structurally moves window from its own monitor's tree/floating list into
+  // the destination monitor's currently-visible workspace, so it shows up
+  // immediately there. Each monitor owns an independent WorkspaceSet, so this
+  // is a real move (forget + insert), not just relabeling a tag.
   void send_to_monitor(Window window, std::size_t destination) {
     if (window == None || destination >= monitors_.size()) return;
     WindowState& state = window_state_[window];
-    if (state.monitor == destination) return;
+    const std::size_t source = state.monitor;
+    if (source == destination) return;
+    const int source_index = find_workspace(window);
+    if (source_index < 0) return;
+    Workspace& from = workspaces_[source][source_index];
+    Workspace& to = workspaces_[destination][current_workspace_[destination]];
+    const bool floating = state.floating;
+    forget_window(from, window);
     state.monitor = destination;
-    if (state.floating && !state.fullscreen) {
+    if (floating && !state.fullscreen) {
       const Monitor& target = monitor(destination);
       state.float_x = std::clamp(state.float_x, target.x,
                                  std::max(target.x, target.x + target.width - state.float_w));
@@ -661,6 +734,21 @@ class X11Backend final : public Backend {
                                  std::max(target.y + kBarHeight,
                                           target.y + target.height - state.float_h));
     }
+    if (floating) {
+      insert_floating(to, window);
+    } else {
+      insert_tiled(to, window);
+    }
+    if (source == current_monitor_) {
+      if (from.focused != None) {
+        focus(from.focused);
+      } else {
+        XSetInputFocus(display_, root_, RevertToPointerRoot, CurrentTime);
+        Window none = None;
+        set_active_window(none);
+      }
+    }
+    show_window(window);
     arrange();
   }
 
@@ -668,13 +756,7 @@ class X11Backend final : public Backend {
     if (monitors_.size() < 2) return;
     const int count = static_cast<int>(monitors_.size());
     current_monitor_ = static_cast<std::size_t>((static_cast<int>(current_monitor_) + delta + count) % count);
-    std::vector<Window> windows;
-    collect_windows(workspace().root.get(), windows);
-    windows.insert(windows.end(), workspace().floating.begin(), workspace().floating.end());
-    const auto found = std::find_if(windows.begin(), windows.end(), [&](Window window) {
-      return window_state_[window].monitor == current_monitor_;
-    });
-    if (found != windows.end()) focus(*found);
+    if (workspace().focused != None) focus(workspace().focused);
     draw_bar();
   }
 
@@ -1003,8 +1085,15 @@ class X11Backend final : public Backend {
     lua_pushvalue(state, 3);
     const int callback = luaL_ref(state, LUA_REGISTRYINDEX);
     backend->lua_mousebinds_.push_back({context, button, modifiers, callback});
-    Window target = context == "root" ? backend->root_ : backend->bar_;
-    XGrabButton(backend->display_, button, modifiers, target, False, ButtonPressMask, GrabModeAsync, GrabModeAsync, None, None);
+    if (context == "root") {
+      XGrabButton(backend->display_, button, modifiers, backend->root_, False, ButtonPressMask, GrabModeAsync,
+                  GrabModeAsync, None, None);
+    } else if (context == "tagbar") {
+      for (Window bar : backend->bars_) {
+        XGrabButton(backend->display_, button, modifiers, bar, False, ButtonPressMask, GrabModeAsync,
+                    GrabModeAsync, None, None);
+      }
+    }
     if (context == "client") {
       for (const auto& entry : backend->window_state_)
         XGrabButton(backend->display_, button, modifiers, entry.first, False, ButtonPressMask,
@@ -1181,7 +1270,7 @@ class X11Backend final : public Backend {
     // still drop the old X-server grabs, or they outlive the C++-side
     // bindings that would have handled them.
     XUngrabButton(display_, AnyButton, AnyModifier, root_);
-    XUngrabButton(display_, AnyButton, AnyModifier, bar_);
+    for (Window bar : bars_) XUngrabButton(display_, AnyButton, AnyModifier, bar);
     for (const auto& entry : window_state_) XUngrabButton(display_, AnyButton, AnyModifier, entry.first);
     lua_mousebinds_.clear();
     lua_widgets_.clear();
@@ -1298,15 +1387,19 @@ class X11Backend final : public Backend {
 
   void rebuild_client_list() {
     std::vector<Window> all;
-    for (Workspace& ws : workspaces_) {
-      collect_windows(ws.root.get(), all);
-      all.insert(all.end(), ws.floating.begin(), ws.floating.end());
+    for (WorkspaceSet& set : workspaces_) {
+      for (Workspace& ws : set) {
+        collect_windows(ws.root.get(), all);
+        all.insert(all.end(), ws.floating.begin(), ws.floating.end());
+      }
     }
     for (Project& project : projects_) {
       if (&project == &projects_[active_project_index_]) continue;
-      for (Workspace& ws : project.workspaces) {
-        collect_windows(ws.root.get(), all);
-        all.insert(all.end(), ws.floating.begin(), ws.floating.end());
+      for (WorkspaceSet& set : project.workspaces) {
+        for (Workspace& ws : set) {
+          collect_windows(ws.root.get(), all);
+          all.insert(all.end(), ws.floating.begin(), ws.floating.end());
+        }
       }
     }
     XChangeProperty(display_, root_, net_client_list_atom_, XA_WINDOW, 32, PropModeReplace,
@@ -1383,7 +1476,8 @@ class X11Backend final : public Backend {
     } else if (event.message_type == net_active_window_atom_) {
       const int index = find_workspace(event.window);
       if (index < 0) return;
-      if (index != current_workspace_) switch_workspace(index);
+      current_monitor_ = window_state_[event.window].monitor;
+      if (index != current_workspace_[current_monitor_]) switch_workspace(index);
       focus(event.window);
     }
   }
@@ -2409,7 +2503,9 @@ class X11Backend final : public Backend {
         {"Super+f", "Element hints (click anything by typing its label)"},
         {"Super+t", "Toggle todo list sidebar"},
         {"Super+i", "Recent projects picker"},
-        {"Super+o", "Active projects picker"},
+        {"Super+u", "Active projects picker"},
+        {"Super+o", "Focus the other monitor"},
+        {"Super+Shift+o", "Send window to the other monitor"},
         {"Super+h/j/k/l", "Focus direction (selects empty panes too in manual layout)"},
         {"Super+Ctrl+h/j/k/l", "Manual mode: move client into adjacent split"},
         {"Super+Ctrl+j/k", "Other modes: focus next/previous in stack order"},
@@ -3098,6 +3194,13 @@ class X11Backend final : public Backend {
     return -1;
   }
 
+  int bar_monitor(Window window) const {
+    for (std::size_t index = 0; index < bars_.size(); ++index) {
+      if (bars_[index] == window) return static_cast<int>(index);
+    }
+    return -1;
+  }
+
   void adjust_backlight(int delta) {
     const long value = read_long(backlight_path_);
     const long maximum = read_long(backlight_max_path_);
@@ -3529,20 +3632,24 @@ class X11Backend final : public Backend {
     };
     std::vector<Candidate> candidates;
 
-    if (bars_visible_ && bar_ != None) {
-      // Bar-relative x now equals screen x, since bar_ starts at x=0.
-      candidates.push_back({4, 4, bar_, kDockWidth / 2, kBarHeight / 2});
+    for (std::size_t monitor_index = 0; bars_visible_ && monitor_index < bars_.size(); ++monitor_index) {
+      const Window bar = bars_[monitor_index];
+      const Monitor& target_monitor = monitor(monitor_index);
+      candidates.push_back({target_monitor.x + 4, target_monitor.y + 4, bar, kDockWidth / 2, kBarHeight / 2});
       const int mode_x = kDockWidth;
-      candidates.push_back({mode_x + 4, 4, bar_, mode_x + 10, kBarHeight / 2});
+      candidates.push_back(
+          {target_monitor.x + mode_x + 4, target_monitor.y + 4, bar, mode_x + 10, kBarHeight / 2});
       for (int index = 0; index < kWorkspaceCount; ++index) {
-        const int x = workspace_start_x_ + index * 84;
-        candidates.push_back({x + 4, 4, bar_, x + 10, kBarHeight / 2});
+        const int x = workspace_start_x_[monitor_index] + index * 84;
+        candidates.push_back({target_monitor.x + x + 4, target_monitor.y + 4, bar, x + 10, kBarHeight / 2});
       }
-      for (const BarHit& hit : task_hits_) {
-        candidates.push_back({hit.left + 4, 4, bar_, (hit.left + hit.right) / 2, kBarHeight / 2});
+      for (const BarHit& hit : task_hits_[monitor_index]) {
+        candidates.push_back({target_monitor.x + hit.left + 4, target_monitor.y + 4, bar,
+                              (hit.left + hit.right) / 2, kBarHeight / 2});
       }
-      const int layout_x = DisplayWidth(display_, screen_) - kDockWidth;
-      candidates.push_back({layout_x + 4, 4, bar_, layout_x + kDockWidth / 2, kBarHeight / 2});
+      const int layout_x = target_monitor.width - kDockWidth;
+      candidates.push_back(
+          {target_monitor.x + layout_x + 4, target_monitor.y + 4, bar, layout_x + kDockWidth / 2, kBarHeight / 2});
     }
 
     for (std::size_t index = 0; bars_visible_ && index < monitors_.size() && index < docks_.size(); ++index) {
@@ -3571,13 +3678,16 @@ class X11Backend final : public Backend {
                             target_monitor.width - kDockWidth / 2, kBarHeight / 2});
     }
 
-    std::vector<Window> windows;
-    collect_windows(workspace().root.get(), windows);
-    windows.insert(windows.end(), workspace().floating.begin(), workspace().floating.end());
-    for (Window window : windows) {
-      XWindowAttributes attributes;
-      if (!XGetWindowAttributes(display_, window, &attributes) || attributes.map_state != IsViewable) continue;
-      candidates.push_back({attributes.x + 4, attributes.y + 4, window, attributes.width / 2, attributes.height / 2});
+    for (std::size_t monitor_index = 0; monitor_index < workspaces_.size(); ++monitor_index) {
+      Workspace& active = workspace_at(monitor_index);
+      std::vector<Window> windows;
+      collect_windows(active.root.get(), windows);
+      windows.insert(windows.end(), active.floating.begin(), active.floating.end());
+      for (Window window : windows) {
+        XWindowAttributes attributes;
+        if (!XGetWindowAttributes(display_, window, &attributes) || attributes.map_state != IsViewable) continue;
+        candidates.push_back({attributes.x + 4, attributes.y + 4, window, attributes.width / 2, attributes.height / 2});
+      }
     }
 
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& left, const Candidate& right) {
@@ -3654,7 +3764,7 @@ class X11Backend final : public Backend {
 
   void toggle_hints() {
     if (hints_visible_) { close_hints(); return; }
-    if (launcher_visible_ || slider_visible_ || bar_ == None) return;
+    if (launcher_visible_ || slider_visible_ || bars_.empty()) return;
     draw_bar();
     draw_docks();
     build_hints();
@@ -3727,18 +3837,12 @@ class X11Backend final : public Backend {
     refresh_hint_visibility();
   }
 
-  void create_bar() {
-    const int width = std::max(1, DisplayWidth(display_, screen_));
-    bar_ = XCreateSimpleWindow(display_, root_, 0, 0, width, kBarHeight,
-                               0, BlackPixel(display_, screen_), BlackPixel(display_, screen_));
-    XSetWindowAttributes attributes{};
-    attributes.override_redirect = True;
-    XChangeWindowAttributes(display_, bar_, CWOverrideRedirect, &attributes);
-    XSelectInput(display_, bar_, ExposureMask | ButtonPressMask);
-    XStoreName(display_, bar_, "mepwm-bar");
-    force_opaque(bar_);
-    XDefineCursor(display_, bar_, cursor_);
-    bar_gc_ = XCreateGC(display_, bar_, 0, nullptr);
+  // One-time font/color/GC allocation, shared across every monitor's bar.
+  // Called once from run(); window creation itself is create_bars() below,
+  // which (like create_docks()) is called both at startup and on every
+  // geometry refresh.
+  void init_bar_resources() {
+    bar_gc_ = XCreateGC(display_, root_, 0, nullptr);
     bar_font_ = XftFontOpenName(display_, screen_, "sans-16");
     if (!bar_font_) throw std::runtime_error("could not open an Xft bar font");
     icon_font_ = XftFontOpenName(display_, screen_, "UbuntuMono Nerd Font Mono:size=34");
@@ -3758,7 +3862,39 @@ class X11Backend final : public Backend {
                       "#202124", &hint_foreground_);
     XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_),
                       "#c23616", &hint_matched_);
-    XMapRaised(display_, bar_);
+  }
+
+  // Mirrors create_docks(): grows bars_ (and its parallel per-monitor drawing
+  // state) to match monitors_.size(), then repositions every bar to its own
+  // monitor's rect.
+  void create_bars() {
+    while (bars_.size() < monitors_.size()) {
+      Window bar = XCreateSimpleWindow(display_, root_, 0, 0, 1, kBarHeight, 0, BlackPixel(display_, screen_),
+                                       BlackPixel(display_, screen_));
+      XSetWindowAttributes attributes{};
+      attributes.override_redirect = True;
+      XChangeWindowAttributes(display_, bar, CWOverrideRedirect, &attributes);
+      XSelectInput(display_, bar, ExposureMask | ButtonPressMask);
+      XStoreName(display_, bar, "mepwm-bar");
+      force_opaque(bar);
+      XDefineCursor(display_, bar, cursor_);
+      bars_.push_back(bar);
+      bar_pixmaps_.push_back(None);
+      bar_pixmap_widths_.push_back(0);
+      bar_xft_draws_.push_back(nullptr);
+      workspace_start_x_.push_back(kDockWidth);
+      layout_widget_start_x_.push_back(kDockWidth);
+      layout_widget_end_x_.push_back(kDockWidth);
+      pomodoro_widget_start_x_.push_back(0);
+      pomodoro_widget_end_x_.push_back(0);
+      task_hits_.emplace_back();
+    }
+    for (std::size_t index = 0; index < monitors_.size(); ++index) {
+      const Monitor& target = monitors_[index];
+      XMoveResizeWindow(display_, bars_[index], target.x, target.y, std::max(1, target.width), kBarHeight);
+      if (!bars_visible_) continue;
+      XMapRaised(display_, bars_[index]);
+    }
     draw_bar();
   }
 
@@ -3885,13 +4021,13 @@ class X11Backend final : public Backend {
     return lines;
   }
 
-  void draw_text(int x, const std::string& value, const XftColor& color) {
+  void draw_text(XftDraw* draw, int x, const std::string& value, const XftColor& color) {
     int cursor = x;
     for (std::size_t offset = 0; offset < value.size();) {
       FcChar32 codepoint = 0;
       const std::size_t bytes = utf8_codepoint(value, offset, &codepoint);
       XftFont* font = XftCharExists(display_, bar_font_, codepoint) ? bar_font_ : fallback_font(codepoint);
-      XftDrawStringUtf8(bar_xft_draw_, &color, font, cursor,
+      XftDrawStringUtf8(draw, &color, font, cursor,
                         (kBarHeight + font->ascent - font->descent) / 2,
                         reinterpret_cast<const FcChar8*>(value.data() + offset), static_cast<int>(bytes));
       XGlyphInfo extent{};
@@ -3962,69 +4098,82 @@ class X11Backend final : public Backend {
   }
 
   void draw_bar() {
-    if (!bar_) return;
+    if (bars_.empty()) return;
     advance_pomodoro_if_done();
-    const int width = std::max(1, DisplayWidth(display_, screen_));
-    if (bar_pixmap_width_ != width) {
-      if (bar_xft_draw_) XftDrawDestroy(bar_xft_draw_);
-      if (bar_pixmap_) XFreePixmap(display_, bar_pixmap_);
-      bar_pixmap_ = XCreatePixmap(display_, bar_, width, kBarHeight, DefaultDepth(display_, screen_));
-      bar_xft_draw_ = XftDrawCreate(display_, bar_pixmap_, DefaultVisual(display_, screen_),
-                                    DefaultColormap(display_, screen_));
-      bar_pixmap_width_ = width;
+    for (std::size_t monitor_index = 0; monitor_index < bars_.size(); ++monitor_index) {
+      draw_bar_for_monitor(monitor_index);
     }
-    XSetForeground(display_, bar_gc_, bar_background_.pixel);
-    XFillRectangle(display_, bar_pixmap_, bar_gc_, 0, 0, width, kBarHeight);
+  }
 
-    auto text = [&](int x, const std::string& value, const XftColor& color) { draw_text(x, value, color); };
+  void draw_bar_for_monitor(std::size_t monitor_index) {
+    const Window bar = bars_[monitor_index];
+    const int width = std::max(1, monitor(monitor_index).width);
+    if (bar_pixmap_widths_[monitor_index] != width) {
+      if (bar_xft_draws_[monitor_index]) XftDrawDestroy(bar_xft_draws_[monitor_index]);
+      if (bar_pixmaps_[monitor_index]) XFreePixmap(display_, bar_pixmaps_[monitor_index]);
+      bar_pixmaps_[monitor_index] = XCreatePixmap(display_, bar, width, kBarHeight, DefaultDepth(display_, screen_));
+      bar_xft_draws_[monitor_index] = XftDrawCreate(display_, bar_pixmaps_[monitor_index],
+                                                     DefaultVisual(display_, screen_), DefaultColormap(display_, screen_));
+      bar_pixmap_widths_[monitor_index] = width;
+    }
+    const Pixmap pixmap = bar_pixmaps_[monitor_index];
+    XftDraw* xft_draw = bar_xft_draws_[monitor_index];
+    XSetForeground(display_, bar_gc_, bar_background_.pixel);
+    XFillRectangle(display_, pixmap, bar_gc_, 0, 0, width, kBarHeight);
+
+    auto text = [&](int x, const std::string& value, const XftColor& color) { draw_text(xft_draw, x, value, color); };
 
     // The launcher and layout-mode toggle live in the outermost kDockWidth
-    // cells so the bar can span the full display width; everything else
+    // cells so the bar can span the full monitor width; everything else
     // that used to be bar-relative x=0 now starts after the launcher cell.
-    draw_dock_cell_h(bar_pixmap_, 0, kDockWidth, kBarHeight, kIconLauncher);
+    draw_dock_cell_h(pixmap, 0, kDockWidth, kBarHeight, kIconLauncher);
     // The layout-mode indicator used to live in this corner; it's now the
     // combined icon+text widget just after the workspace numbers, freeing
     // this corner up for the power menu toggle.
-    draw_dock_cell_h(bar_pixmap_, width - kDockWidth, kDockWidth, kBarHeight, kIconPower);
+    draw_dock_cell_h(pixmap, width - kDockWidth, kDockWidth, kBarHeight, kIconPower);
 
     // Current project sits right after the launcher cell, ahead of the
     // workspace numbers, so it reads left-to-right as "launcher -> where am
-    // I -> which workspace".
+    // I -> which workspace". Project is global (shared across monitors), so
+    // this repeats identically on every monitor's bar.
     const std::string project_label_text =
         projects_.empty() ? "default" : project_label(projects_[active_project_index_].path);
     text(kDockWidth + 24, project_label_text, bar_foreground_);
 
     const int content_x = kDockWidth + 24 + text_width(project_label_text) + 32;
-    workspace_start_x_ = content_x;
+    workspace_start_x_[monitor_index] = content_x;
+    const int active_workspace = current_workspace_[monitor_index];
     for (int index = 0; index < kWorkspaceCount; ++index) {
       const int x = content_x + index * 84;
       std::vector<Window> occupied;
-      collect_windows(workspaces_[index].root.get(), occupied);
-      occupied.insert(occupied.end(), workspaces_[index].floating.begin(), workspaces_[index].floating.end());
-      if (index == current_workspace_) {
+      collect_windows(workspaces_[monitor_index][index].root.get(), occupied);
+      occupied.insert(occupied.end(), workspaces_[monitor_index][index].floating.begin(),
+                      workspaces_[monitor_index][index].floating.end());
+      if (index == active_workspace) {
         XSetForeground(display_, bar_gc_, bar_selected_.pixel);
-        XFillRectangle(display_, bar_pixmap_, bar_gc_, x, 0, 76, kBarHeight);
+        XFillRectangle(display_, pixmap, bar_gc_, x, 0, 76, kBarHeight);
       }
       if (!occupied.empty()) {
-        XSetForeground(display_, bar_gc_, index == current_workspace_ ? bar_background_.pixel : bar_foreground_.pixel);
-        XFillRectangle(display_, bar_pixmap_, bar_gc_, x + 6, 18, 10, 10);
+        XSetForeground(display_, bar_gc_, index == active_workspace ? bar_background_.pixel : bar_foreground_.pixel);
+        XFillRectangle(display_, pixmap, bar_gc_, x + 6, 18, 10, 10);
       }
-      text(x + 24, std::to_string(index + 1), index == current_workspace_ ? bar_background_ : bar_foreground_);
+      text(x + 24, std::to_string(index + 1), index == active_workspace ? bar_background_ : bar_foreground_);
     }
 
+    Workspace& active = workspace_at(monitor_index);
     // Layout-mode widget: icon plus name, merged from the old top-right
     // corner icon and the mode text that used to trail the project label,
     // now placed right after the workspace numbers.
-    const char* layout_icon = workspace().mode == LayoutMode::Manual ? kIconLayoutOther :
-                              workspace().mode == LayoutMode::MasterStack ? kIconLayoutTile : kIconLayoutMonocle;
-    const char* mode = workspace().mode == LayoutMode::Manual
+    const char* layout_icon = active.mode == LayoutMode::Manual ? kIconLayoutOther :
+                              active.mode == LayoutMode::MasterStack ? kIconLayoutTile : kIconLayoutMonocle;
+    const char* mode = active.mode == LayoutMode::Manual
                            ? "manual"
-                           : workspace().mode == LayoutMode::MasterStack ? "master-stack" : "monocle";
+                           : active.mode == LayoutMode::MasterStack ? "master-stack" : "monocle";
     const std::string layout_widget_text = std::string(layout_icon) + " " + mode;
     const int layout_widget_x = content_x + kWorkspaceCount * 84 + 24;
     text(layout_widget_x, layout_widget_text, bar_foreground_);
-    layout_widget_start_x_ = content_x + kWorkspaceCount * 84;
-    layout_widget_end_x_ = layout_widget_x + text_width(layout_widget_text) + 24;
+    layout_widget_start_x_[monitor_index] = content_x + kWorkspaceCount * 84;
+    layout_widget_end_x_[monitor_index] = layout_widget_x + text_width(layout_widget_text) + 24;
 
     const std::string clock_widget = std::string(kIconClock) + " " + clock_text_;
     const int clock_width = text_width(clock_widget) + 32;
@@ -4043,31 +4192,33 @@ class X11Backend final : public Backend {
         std::string(kIconPomodoro) + " " + pomodoro_phase_label + format_countdown(pomodoro_remaining());
     const int pomodoro_widget_width = text_width(pomodoro_widget_text) + 24;
     const int pomodoro_widget_x = clock_x - 16 - pomodoro_widget_width;
-    pomodoro_widget_start_x_ = pomodoro_widget_x;
-    pomodoro_widget_end_x_ = pomodoro_widget_x + pomodoro_widget_width;
+    pomodoro_widget_start_x_[monitor_index] = pomodoro_widget_x;
+    pomodoro_widget_end_x_[monitor_index] = pomodoro_widget_x + pomodoro_widget_width;
     if (pomodoro_phase_ != PomodoroPhase::Idle) {
       XSetForeground(display_, bar_gc_, (pomodoro_running_ ? todo_active_pixel_ : todo_inactive_pixel_));
-      XFillRectangle(display_, bar_pixmap_, bar_gc_, pomodoro_widget_x, 0, pomodoro_widget_width, kBarHeight);
+      XFillRectangle(display_, pixmap, bar_gc_, pomodoro_widget_x, 0, pomodoro_widget_width, kBarHeight);
     }
     text(pomodoro_widget_x + 12, pomodoro_widget_text, pomodoro_phase_ == PomodoroPhase::Idle ? bar_foreground_ : bar_background_);
 
-    // Tray sits at the front (left edge) of the right-side widget cluster,
-    // just left of the pomodoro widget, instead of wedged between the clock
-    // and the power-menu corner -- update_tray() reads this whenever it
-    // redraws independently of the bar (an icon docking/undocking).
-    tray_widget_x_ = pomodoro_widget_x - 16 - tray_pixel_width();
+    // The systray is a real XEmbed host and can only live in one place --
+    // monitor 0's bar, matching the "primary monitor" convention used
+    // elsewhere (e.g. the default wallpaper). tray_widget_x_ is consumed by
+    // update_tray(), which redraws independently of the bar.
+    if (monitor_index == 0) tray_widget_x_ = pomodoro_widget_x - 16 - tray_pixel_width();
 
-    task_hits_.clear();
+    task_hits_[monitor_index].clear();
     std::vector<Window> windows;
-    collect_windows(workspace().root.get(), windows);
-    windows.insert(windows.end(), workspace().floating.begin(), workspace().floating.end());
-    bar_task_list_x_ = layout_widget_end_x_ + 32;
-    int x = bar_task_list_x_;
-    // The tray now sits just left of the pomodoro widget (see tray_widget_x_
-    // above), so when it's occupying space the task list has to stop there
-    // instead of at the pomodoro widget, or a long window title would run
-    // straight under the tray icons.
-    const int end = std::max(x, tray_pixel_width() > 0 ? tray_widget_x_ - 16 : pomodoro_widget_start_x_);
+    collect_windows(active.root.get(), windows);
+    windows.insert(windows.end(), active.floating.begin(), active.floating.end());
+    int x = layout_widget_end_x_[monitor_index] + 32;
+    // On monitor 0, the tray sits just left of the pomodoro widget (see
+    // tray_widget_x_ above), so when it's occupying space the task list has
+    // to stop there instead of at the pomodoro widget, or a long window
+    // title would run straight under the tray icons. Other monitors never
+    // host the tray, so they always stop at the pomodoro widget.
+    const int end = monitor_index == 0
+                        ? std::max(x, tray_pixel_width() > 0 ? tray_widget_x_ - 16 : pomodoro_widget_start_x_[monitor_index])
+                        : std::max(x, pomodoro_widget_start_x_[monitor_index]);
     for (Window window : windows) {
       char* title = nullptr;
       std::string label = XFetchName(display_, window, &title) && title ? title : "untitled";
@@ -4075,15 +4226,15 @@ class X11Backend final : public Backend {
       if (label.size() > 24) label.resize(23), label += "…";
       const int item_width = text_width(label) + 32;
       if (x + item_width > end) break;
-      if (window == workspace().focused) {
+      if (window == active.focused) {
         XSetForeground(display_, bar_gc_, bar_selected_.pixel);
-        XFillRectangle(display_, bar_pixmap_, bar_gc_, x, 4, item_width, kBarHeight - 8);
+        XFillRectangle(display_, pixmap, bar_gc_, x, 4, item_width, kBarHeight - 8);
       }
-      text(x + 16, label, window == workspace().focused ? bar_background_ : bar_foreground_);
-      task_hits_.push_back({x, x + item_width, window});
+      text(x + 16, label, window == active.focused ? bar_background_ : bar_foreground_);
+      task_hits_[monitor_index].push_back({x, x + item_width, window});
       x += item_width + 1;
     }
-    XCopyArea(display_, bar_pixmap_, bar_, bar_gc_, 0, 0, width, kBarHeight, 0, 0);
+    XCopyArea(display_, pixmap, bar, bar_gc_, 0, 0, width, kBarHeight, 0, 0);
     XFlush(display_);
   }
 
@@ -4228,9 +4379,11 @@ class X11Backend final : public Backend {
   // workspace model), unlike mwm's single global tag list.
   void collect_project_windows(std::vector<Window>* windows) const {
     windows->clear();
-    for (const Workspace& value : workspaces_) {
-      windows->insert(windows->end(), value.stack_order.begin(), value.stack_order.end());
-      windows->insert(windows->end(), value.floating.begin(), value.floating.end());
+    for (const WorkspaceSet& set : workspaces_) {
+      for (const Workspace& value : set) {
+        windows->insert(windows->end(), value.stack_order.begin(), value.stack_order.end());
+        windows->insert(windows->end(), value.floating.begin(), value.floating.end());
+      }
     }
   }
 
@@ -4664,7 +4817,7 @@ class X11Backend final : public Backend {
   // Lists the active project (always, so the current selection is visible)
   // plus every other project that currently has clients -- projects with
   // nothing running in them clutter a "what's active" dropdown without
-  // adding anything the full picker (Super+i / Super+o) doesn't already do.
+  // adding anything the full picker (Super+i / Super+u) doesn't already do.
   void toggle_project_dropdown() {
     if (project_dropdown_visible_) { close_project_dropdown(); return; }
     if (projects_.empty()) return;
@@ -4739,7 +4892,8 @@ class X11Backend final : public Backend {
       close_launcher();
       const int index = find_workspace(window);
       if (index < 0) return;
-      if (index != current_workspace_) switch_workspace(index);
+      current_monitor_ = window_state_[window].monitor;
+      if (index != current_workspace_[current_monitor_]) switch_workspace(index);
       focus(window);
       arrange();
       return;
@@ -4845,12 +4999,12 @@ class X11Backend final : public Backend {
 
   void grab_keys() {
     const unsigned int ignored_modifiers[] = {0, LockMask, Mod2Mask, LockMask | Mod2Mask};
-    const KeySym plain_keys[] = {XK_Return, XK_q, XK_h, XK_i, XK_j, XK_k, XK_l, XK_o, XK_p, XK_v, XK_s, XK_Tab, XK_space,
+    const KeySym plain_keys[] = {XK_Return, XK_q, XK_h, XK_i, XK_j, XK_k, XK_l, XK_o, XK_p, XK_u, XK_v, XK_s, XK_Tab, XK_space,
                                  XK_a, XK_z, XK_m, XK_r, XK_minus, XK_comma, XK_period, XK_1, XK_2, XK_3,
                                  XK_4, XK_5, XK_6, XK_7, XK_8, XK_9, XK_w, XK_b, XK_d, XK_f, XK_t};
     const KeySym shift_keys[] = {XK_q, XK_space, XK_c, XK_minus, XK_comma, XK_period, XK_h, XK_j, XK_k, XK_l,
-                                 XK_r, XK_d, XK_t, XK_w, XK_slash, XK_Tab, XK_1, XK_2, XK_3, XK_4, XK_5, XK_6,
-                                 XK_7, XK_8, XK_9};
+                                 XK_r, XK_d, XK_t, XK_w, XK_slash, XK_Tab, XK_o, XK_1, XK_2, XK_3, XK_4, XK_5,
+                                 XK_6, XK_7, XK_8, XK_9};
     const KeySym ctrl_keys[] = {XK_h, XK_j, XK_k, XK_l};
     for (const unsigned int ignored : ignored_modifiers) {
       for (const KeySym key : plain_keys) {
@@ -4877,7 +5031,8 @@ class X11Backend final : public Backend {
     for (unsigned int index = 0; index < count; ++index) {
       XWindowAttributes attributes;
       if (XGetWindowAttributes(display_, windows[index], &attributes) &&
-          attributes.map_state == IsViewable && !attributes.override_redirect && windows[index] != bar_) {
+          attributes.map_state == IsViewable && !attributes.override_redirect &&
+          std::find(bars_.begin(), bars_.end(), windows[index]) == bars_.end()) {
         manage(windows[index]);
       }
     }
@@ -4982,7 +5137,7 @@ class X11Backend final : public Backend {
     XWindowAttributes attributes;
     if (!XGetWindowAttributes(display_, window, &attributes) || attributes.override_redirect) return;
 
-    int target_index = current_workspace_;
+    int target_index = current_workspace_[current_monitor_];
     WindowState& state = window_state_[window];
     state.monitor = current_monitor_;
 
@@ -4990,7 +5145,7 @@ class X11Backend final : public Backend {
     const bool is_transient = XGetTransientForHint(display_, window, &transient_for) != 0;
     bool should_float = is_transient || is_dialog_window_type(window);
     apply_lua_rules(window, &target_index, &should_float);
-    Workspace& target = workspaces_[target_index];
+    Workspace& target = workspaces_[current_monitor_][target_index];
 
     XSetWindowBorderWidth(display_, window, config_.border_width);
     XSetWindowBorder(display_, window, border_normal_pixel_);
@@ -5015,7 +5170,7 @@ class X11Backend final : public Backend {
     // Focusing requires the window to already be viewable (XSetInputFocus is a
     // BadMatch otherwise); map it up front so focus() below always succeeds.
     XMapWindow(display_, window);
-    if (target_index == current_workspace_) {
+    if (target_index == current_workspace_[current_monitor_]) {
       focus(window);
     } else {
       hide_window(window);
@@ -5023,9 +5178,16 @@ class X11Backend final : public Backend {
     arrange();
   }
 
+  // Searches the window's own monitor's WorkspaceSet (WindowState::monitor is
+  // the source of truth for which monitor structurally holds it); returns the
+  // workspace-within-that-monitor index, or -1 if not found there.
   int find_workspace(Window window) const {
+    const auto state_it = window_state_.find(window);
+    const std::size_t monitor_index = state_it != window_state_.end() ? state_it->second.monitor : 0;
+    if (monitor_index >= workspaces_.size()) return -1;
+    const WorkspaceSet& set = workspaces_[monitor_index];
     for (int index = 0; index < kWorkspaceCount; ++index) {
-      const Workspace& ws = workspaces_[index];
+      const Workspace& ws = set[index];
       if (find_leaf(ws.root.get(), window)) return index;
       if (std::find(ws.floating.begin(), ws.floating.end(), window) != ws.floating.end()) return index;
     }
@@ -5090,23 +5252,26 @@ class X11Backend final : public Backend {
     const int index = find_workspace(window);
     if (index < 0) {
       for (Project& project : projects_) {
-        for (Workspace& candidate : project.workspaces) {
-          if (!find_leaf(candidate.root.get(), window) &&
-              std::find(candidate.floating.begin(), candidate.floating.end(), window) == candidate.floating.end())
-            continue;
-          XUngrabButton(display_, AnyButton, AnyModifier, window);
-          forget_window(candidate, window);
-          window_state_.erase(window);
-          rebuild_client_list();
-          return;
+        for (WorkspaceSet& set : project.workspaces) {
+          for (Workspace& candidate : set) {
+            if (!find_leaf(candidate.root.get(), window) &&
+                std::find(candidate.floating.begin(), candidate.floating.end(), window) == candidate.floating.end())
+              continue;
+            XUngrabButton(display_, AnyButton, AnyModifier, window);
+            forget_window(candidate, window);
+            window_state_.erase(window);
+            rebuild_client_list();
+            return;
+          }
         }
       }
       return;
     }
     XUngrabButton(display_, AnyButton, AnyModifier, window);
     if (previously_focused_ == window) previously_focused_ = None;
-    const bool visible = index == current_workspace_;
-    forget_window(workspaces_[index], window);
+    const std::size_t monitor_index = window_state_[window].monitor;
+    const bool visible = monitor_index == current_monitor_ && index == current_workspace_[monitor_index];
+    forget_window(workspaces_[monitor_index][index], window);
     window_state_.erase(window);
     rebuild_client_list();
     if (visible) {
@@ -5143,7 +5308,7 @@ class X11Backend final : public Backend {
   // after every restack (arrange(), focus()) so a popup that's open when a
   // floating window gets raised doesn't vanish behind it.
   void raise_ui_chrome() {
-    XRaiseWindow(display_, bar_);
+    for (Window bar : bars_) XRaiseWindow(display_, bar);
     if (bars_visible_ && tray_ != None) XRaiseWindow(display_, tray_);
     for (const DockWindows& dock : docks_) {
       XRaiseWindow(display_, dock.left);
@@ -5158,8 +5323,8 @@ class X11Backend final : public Backend {
   }
 
   void focus(Window window) {
-    Workspace& target = workspace();
     if (window == None) {
+      Workspace& target = workspace();
       if (previously_focused_ != None) {
         update_border(previously_focused_, false);
         previously_focused_ = None;
@@ -5170,6 +5335,11 @@ class X11Backend final : public Backend {
       set_active_window(none);
       return;
     }
+    // Resolve the window's own monitor -- and switch current_monitor_ to it
+    // -- before touching workspace()/workspace_at(), since that now depends
+    // on current_monitor_ (each monitor owns an independent WorkspaceSet).
+    current_monitor_ = window_state_[window].monitor;
+    Workspace& target = workspace();
     Node* leaf = find_leaf(target.root.get(), window);
     const bool is_floating_window =
         !leaf && std::find(target.floating.begin(), target.floating.end(), window) != target.floating.end();
@@ -5181,7 +5351,6 @@ class X11Backend final : public Backend {
     }
     if (previously_focused_ != None && previously_focused_ != window) update_border(previously_focused_, false);
     target.focused = window;
-    current_monitor_ = window_state_[window].monitor;
     previously_focused_ = window;
     update_border(window, true);
     XSetInputFocus(display_, window, RevertToPointerRoot, CurrentTime);
@@ -5293,7 +5462,7 @@ class X11Backend final : public Backend {
     int selected_x = 0, selected_y = 0;
     bool have_reference = false;
     if (current_leaf) {
-      if (const Rect* rect = leaf_rect(current_leaf, current_monitor_)) {
+      if (const Rect* rect = leaf_rect(current_leaf)) {
         selected_x = rect->x + rect->w / 2;
         selected_y = rect->y + rect->h / 2;
         have_reference = true;
@@ -5321,7 +5490,7 @@ class X11Backend final : public Backend {
     collect_leaves(target.root.get(), leaves);
     for (Node* leaf : leaves) {
       if (leaf == current_leaf) continue;
-      const Rect* rect = leaf_rect(leaf, current_monitor_);
+      const Rect* rect = leaf_rect(leaf);
       if (!rect) continue;
       const Window window = leaf->tabs.empty() ? None : leaf->tabs[leaf->active_tab];
       candidates.push_back({rect->x + rect->w / 2, rect->y + rect->h / 2, leaf, window});
@@ -5385,7 +5554,7 @@ class X11Backend final : public Backend {
     if (!source_leaf || source_leaf->tabs.empty()) return;
     const Window window = source_leaf->tabs[source_leaf->active_tab];
 
-    const Rect* source_rect = leaf_rect(source_leaf, current_monitor_);
+    const Rect* source_rect = leaf_rect(source_leaf);
     if (!source_rect) return;
     const int selected_x = source_rect->x + source_rect->w / 2;
     const int selected_y = source_rect->y + source_rect->h / 2;
@@ -5398,7 +5567,7 @@ class X11Backend final : public Backend {
     Node* best_leaf = nullptr;
     for (Node* leaf : leaves) {
       if (leaf == source_leaf) continue;
-      const Rect* rect = leaf_rect(leaf, current_monitor_);
+      const Rect* rect = leaf_rect(leaf);
       if (!rect) continue;
       const int candidate_x = rect->x + rect->w / 2;
       const int candidate_y = rect->y + rect->h / 2;
@@ -5578,7 +5747,7 @@ class X11Backend final : public Backend {
   void toggle_bar() {
     bars_visible_ = !bars_visible_;
     if (bars_visible_) {
-      XMapRaised(display_, bar_);
+      for (Window bar : bars_) XMapRaised(display_, bar);
       for (const DockWindows& dock : docks_) {
         XMapRaised(display_, dock.left);
         XMapRaised(display_, dock.bottom);
@@ -5586,7 +5755,7 @@ class X11Backend final : public Backend {
       }
       update_tray();
     } else {
-      XUnmapWindow(display_, bar_);
+      for (Window bar : bars_) XUnmapWindow(display_, bar);
       for (const DockWindows& dock : docks_) {
         XUnmapWindow(display_, dock.left);
         XUnmapWindow(display_, dock.bottom);
@@ -5719,7 +5888,8 @@ class X11Backend final : public Backend {
   void set_fullscreen(Window window, bool enable) {
     const int index = find_workspace(window);
     if (index < 0) return;
-    Workspace& target = workspaces_[index];
+    const std::size_t monitor_index = window_state_[window].monitor;
+    Workspace& target = workspaces_[monitor_index][index];
     WindowState& state = window_state_[window];
     if (state.fullscreen == enable) return;
 
@@ -5751,7 +5921,7 @@ class X11Backend final : public Backend {
         insert_tiled(target, window);
       }
     }
-    if (index == current_workspace_) arrange();
+    if (monitor_index == current_monitor_ && index == current_workspace_[monitor_index]) arrange();
   }
 
   void kill_focused() {
@@ -5787,7 +5957,8 @@ class X11Backend final : public Backend {
     const int index = find_workspace(scratchpad_);
     if (scratchpad_hidden_) {
       scratchpad_hidden_ = false;
-      if (index != current_workspace_) switch_workspace(index);
+      current_monitor_ = window_state_[scratchpad_].monitor;
+      if (index != current_workspace_[current_monitor_]) switch_workspace(index);
       show_window(scratchpad_);
       focus(scratchpad_);
       arrange();
@@ -5799,11 +5970,13 @@ class X11Backend final : public Backend {
     }
   }
 
+  // Switches only current_monitor_'s own workspace, leaving every other
+  // monitor showing whatever workspace it already had active.
   void switch_workspace(int index) {
-    if (index == current_workspace_ || index < 0 || index >= kWorkspaceCount) return;
+    if (index == current_workspace_[current_monitor_] || index < 0 || index >= kWorkspaceCount) return;
     refresh_display_geometry();
     hide_workspace(workspace());
-    current_workspace_ = index;
+    current_workspace_[current_monitor_] = index;
     arrange();
     if (workspace().focused != None) {
       focus(workspace().focused);
@@ -5815,12 +5988,16 @@ class X11Backend final : public Backend {
     draw_bar();
   }
 
+  // Sends the focused window to workspace `index` on its own monitor
+  // (WindowState::monitor) -- i3-style, not a cross-monitor move (see
+  // send_to_monitor for that).
   void send_to_workspace(Window window, int index) {
     if (window == None || index < 0 || index >= kWorkspaceCount) return;
     const int source = find_workspace(window);
     if (source < 0 || source == index) return;
-    Workspace& from = workspaces_[source];
-    Workspace& to = workspaces_[index];
+    const std::size_t monitor_index = window_state_[window].monitor;
+    Workspace& from = workspaces_[monitor_index][source];
+    Workspace& to = workspaces_[monitor_index][index];
     const bool floating = window_state_[window].floating;
     forget_window(from, window);
     if (floating) {
@@ -5828,7 +6005,9 @@ class X11Backend final : public Backend {
     } else {
       insert_tiled(to, window);
     }
-    if (source == current_workspace_) {
+    const bool source_visible = monitor_index == current_monitor_ && source == current_workspace_[monitor_index];
+    const bool dest_visible = monitor_index == current_monitor_ && index == current_workspace_[monitor_index];
+    if (source_visible) {
       if (from.focused != None) {
         focus(from.focused);
       } else {
@@ -5837,7 +6016,7 @@ class X11Backend final : public Backend {
         set_active_window(none);
       }
     }
-    if (index == current_workspace_) {
+    if (dest_visible) {
       show_window(window);
       focus(window);
     } else {
@@ -5869,11 +6048,12 @@ class X11Backend final : public Backend {
     XMoveResizeWindow(display_, window, x, y, std::max(1, width), std::max(1, height));
   }
 
-  void arrange_leaf(Node* leaf, int x, int y, int width, int height, std::size_t monitor_index) {
+  void arrange_leaf(Node* leaf, int x, int y, int width, int height) {
     // Recorded unconditionally, including for empty leaves, so a freshly
     // split pane with nothing open in it yet still has a rect to select,
     // highlight, and place a tab bar against.
-    leaf->rect_by_monitor[monitor_index] = Rect{x, y, width, height};
+    leaf->rect = Rect{x, y, width, height};
+    leaf->has_rect = true;
     if (leaf->tabs.empty()) return;
     leaf->active_tab %= leaf->tabs.size();
     int content_y = y;
@@ -5883,7 +6063,6 @@ class X11Backend final : public Backend {
       content_height = std::max(1, height - kPaneTabBarHeight);
     }
     for (std::size_t index = 0; index < leaf->tabs.size(); ++index) {
-      if (window_state_[leaf->tabs[index]].monitor != monitor_index) continue;
       if (index == leaf->active_tab) {
         resize(leaf->tabs[index], x, content_y, width, content_height);
       } else {
@@ -5892,10 +6071,9 @@ class X11Backend final : public Backend {
     }
   }
 
-  static const Rect* leaf_rect(const Node* leaf, std::size_t monitor_index) {
-    if (!leaf) return nullptr;
-    const auto it = leaf->rect_by_monitor.find(monitor_index);
-    return it != leaf->rect_by_monitor.end() ? &it->second : nullptr;
+  static const Rect* leaf_rect(const Node* leaf) {
+    if (!leaf || !leaf->has_rect) return nullptr;
+    return &leaf->rect;
   }
 
   void collect_leaves(Node* node, std::vector<Node*>& leaves) const {
@@ -5904,10 +6082,10 @@ class X11Backend final : public Backend {
     for (auto& child : node->children) collect_leaves(child.get(), leaves);
   }
 
-  void arrange_manual(Node* node, int x, int y, int width, int height, std::size_t monitor_index) {
+  void arrange_manual(Node* node, int x, int y, int width, int height) {
     if (!node) return;
     if (node->is_leaf()) {
-      arrange_leaf(node, x, y, width, height, monitor_index);
+      arrange_leaf(node, x, y, width, height);
       return;
     }
     const int count = static_cast<int>(node->children.size());
@@ -5922,9 +6100,9 @@ class X11Backend final : public Backend {
                              ? available - offset
                              : std::max(1, static_cast<int>(available * node->weights[index] / total));
       if (node->orientation == Orientation::Vertical) {
-        arrange_manual(node->children[index].get(), x + offset, y, extent, height, monitor_index);
+        arrange_manual(node->children[index].get(), x + offset, y, extent, height);
       } else {
-        arrange_manual(node->children[index].get(), x, y + offset, width, extent, monitor_index);
+        arrange_manual(node->children[index].get(), x, y + offset, width, extent);
       }
       offset += extent + gap;
     }
@@ -5942,11 +6120,10 @@ class X11Backend final : public Backend {
     }
   }
 
-  void arrange_automatic(LayoutMode mode, int x, int y, int width, int height, std::size_t monitor_index) {
-    Workspace& target = workspace();
+  void arrange_automatic(Workspace& target, LayoutMode mode, int x, int y, int width, int height) {
     std::vector<Window> windows;
     for (Window window : target.stack_order) {
-      if (!window_state_[window].floating && window_state_[window].monitor == monitor_index) windows.push_back(window);
+      if (!window_state_[window].floating) windows.push_back(window);
     }
     if (windows.empty()) return;
 
@@ -5989,7 +6166,6 @@ class X11Backend final : public Backend {
   }
 
   void arrange() {
-    Workspace& target = workspace();
     const int gap = static_cast<int>(config_.gap);
     // Only reserve space for the bars/docks while they're actually mapped --
     // see toggle_bar(), which unmaps them without touching this margin
@@ -5997,18 +6173,19 @@ class X11Backend final : public Backend {
     const int dock_margin = bars_visible_ ? kDockWidth : 0;
     const int bar_margin = bars_visible_ ? kBarHeight : 0;
     for (std::size_t index = 0; index < monitors_.size(); ++index) {
+      Workspace& target = workspace_at(index);
       const Monitor& target_monitor = monitor(index);
       const int x = target_monitor.x + dock_margin + gap;
       const int y = target_monitor.y + bar_margin + gap;
       const int width = std::max(1, target_monitor.width - 2 * dock_margin - 2 * gap);
       const int height = std::max(1, target_monitor.height - 2 * bar_margin - 2 * gap);
       if (target.mode == LayoutMode::Manual) {
-        arrange_manual(target.root.get(), x, y, width, height, index);
+        arrange_manual(target.root.get(), x, y, width, height);
       } else {
-        arrange_automatic(target.mode, x, y, width, height, index);
+        arrange_automatic(target, target.mode, x, y, width, height);
       }
+      arrange_floating(target);
     }
-    arrange_floating(target);
     sync_pane_tab_bars();
     update_empty_pane_highlight();
     raise_ui_chrome();
@@ -6050,6 +6227,8 @@ class X11Backend final : public Backend {
   // there would be nothing on screen to show where a split landed, and
   // Super+hjkl would have no visible effect when moving onto it.
   void update_empty_pane_highlight() {
+    // Only the focused monitor's selected pane gets the highlight -- there's
+    // exactly one empty_pane_highlight_ window, shared across monitors.
     Workspace& target = workspace();
     Node* leaf = target.selected_leaf;
     const bool show = target.mode == LayoutMode::Manual && leaf && leaf->is_leaf() && leaf->tabs.empty();
@@ -6058,7 +6237,7 @@ class X11Backend final : public Backend {
       return;
     }
     ensure_empty_pane_highlight();
-    const Rect* rect = leaf_rect(leaf, current_monitor_);
+    const Rect* rect = leaf_rect(leaf);
     if (!rect) {
       XUnmapWindow(display_, empty_pane_highlight_);
       return;
@@ -6105,9 +6284,11 @@ class X11Backend final : public Backend {
   // the moment it's back down to one (or zero).
   void sync_pane_tab_bars() {
     std::vector<Node*> wanted;
-    if (workspace().mode == LayoutMode::Manual) {
+    for (std::size_t index = 0; index < monitors_.size(); ++index) {
+      Workspace& target = workspace_at(index);
+      if (target.mode != LayoutMode::Manual) continue;
       std::vector<Node*> leaves;
-      collect_leaves(workspace().root.get(), leaves);
+      collect_leaves(target.root.get(), leaves);
       for (Node* leaf : leaves) {
         if (leaf->tabs.size() > 1) wanted.push_back(leaf);
       }
@@ -6136,7 +6317,7 @@ class X11Backend final : public Backend {
       } else {
         window = existing->second;
       }
-      const Rect* rect = leaf_rect(leaf, current_monitor_);
+      const Rect* rect = leaf_rect(leaf);
       if (!rect) {
         XUnmapWindow(display_, window);
         continue;
@@ -6149,7 +6330,7 @@ class X11Backend final : public Backend {
 
   void handle_pane_tab_bar_button(Node* leaf, const XButtonEvent& event) {
     if (leaf->tabs.empty()) return;
-    const Rect* rect = leaf_rect(leaf, current_monitor_);
+    const Rect* rect = leaf_rect(leaf);
     const int width = rect ? rect->w : 1;
     const int count = static_cast<int>(leaf->tabs.size());
     const int cell_width = std::max(1, width / count);
@@ -6390,7 +6571,7 @@ class X11Backend final : public Backend {
             if (request.value_mask & CWY) mutable_state.float_y = request.y;
             if (request.value_mask & CWWidth) mutable_state.float_w = std::max(1, request.width);
             if (request.value_mask & CWHeight) mutable_state.float_h = std::max(1, request.height);
-            if (index == current_workspace_) {
+            if (index == current_workspace_[state.monitor]) {
               resize(request.window, mutable_state.float_x, mutable_state.float_y,
                      mutable_state.float_w, mutable_state.float_h);
             }
@@ -6420,7 +6601,7 @@ class X11Backend final : public Backend {
         }
         break;
       case EnterNotify:
-        if (event.xcrossing.window != bar_ && event.xcrossing.window != launcher_window_ &&
+        if (bar_monitor(event.xcrossing.window) < 0 && event.xcrossing.window != launcher_window_ &&
             dock_monitor(event.xcrossing.window) < 0) focus(event.xcrossing.window);
         break;
       case ButtonPress:
@@ -6433,14 +6614,19 @@ class X11Backend final : public Backend {
         // force-closing here first would make re-clicking a widget always
         // reopen it instead of closing it.
         if (hints_visible_) close_hints();
-        if (dock_monitor(event.xbutton.window) < 0 &&
-            !(event.xbutton.window == bar_ && event.xbutton.x >= DisplayWidth(display_, screen_) - kDockWidth) &&
-            !(event.xbutton.window == bar_ && event.xbutton.x >= kDockWidth && event.xbutton.x < workspace_start_x_)) {
-          if (side_panel_ != SidePanel::Closed && event.xbutton.window != side_panel_window_) close_side_panel();
-          if (launcher_visible_ && event.xbutton.window != launcher_window_) close_launcher();
-          if (slider_visible_ && event.xbutton.window != slider_window_) close_slider_popup();
-          if (power_menu_visible_ && event.xbutton.window != power_menu_window_) close_power_menu();
-          if (project_dropdown_visible_ && event.xbutton.window != project_dropdown_window_) close_project_dropdown();
+        {
+          const int clicked_bar = bar_monitor(event.xbutton.window);
+          const bool bar_power_corner =
+              clicked_bar >= 0 && event.xbutton.x >= monitor(static_cast<std::size_t>(clicked_bar)).width - kDockWidth;
+          const bool bar_project_corner = clicked_bar >= 0 && event.xbutton.x >= kDockWidth &&
+                                          event.xbutton.x < workspace_start_x_[static_cast<std::size_t>(clicked_bar)];
+          if (dock_monitor(event.xbutton.window) < 0 && !bar_power_corner && !bar_project_corner) {
+            if (side_panel_ != SidePanel::Closed && event.xbutton.window != side_panel_window_) close_side_panel();
+            if (launcher_visible_ && event.xbutton.window != launcher_window_) close_launcher();
+            if (slider_visible_ && event.xbutton.window != slider_window_) close_slider_popup();
+            if (power_menu_visible_ && event.xbutton.window != power_menu_window_) close_power_menu();
+            if (project_dropdown_visible_ && event.xbutton.window != project_dropdown_window_) close_project_dropdown();
+          }
         }
 
         if (side_panel_ != SidePanel::Closed && event.xbutton.window == side_panel_window_) {
@@ -6489,7 +6675,7 @@ class X11Backend final : public Backend {
           handle_slider_position(event.xmotion.x);
         break;
       case Expose:
-        if (event.xexpose.window == bar_ && event.xexpose.count == 0) draw_bar();
+        if (bar_monitor(event.xexpose.window) >= 0 && event.xexpose.count == 0) draw_bar();
         if (event.xexpose.window == launcher_window_ && event.xexpose.count == 0) draw_launcher();
         if (event.xexpose.window == slider_window_ && event.xexpose.count == 0) draw_slider_popup();
         if (event.xexpose.window == side_panel_window_ && event.xexpose.count == 0) draw_side_panel();
@@ -6497,7 +6683,7 @@ class X11Backend final : public Backend {
         if (event.xexpose.window == empty_pane_highlight_ && event.xexpose.count == 0) draw_empty_pane_highlight();
         if (event.xexpose.count == 0) {
           if (Node* leaf = pane_tab_bar_leaf_for(event.xexpose.window)) {
-            const Rect* rect = leaf_rect(leaf, current_monitor_);
+            const Rect* rect = leaf_rect(leaf);
             draw_pane_tab_bar(leaf, event.xexpose.window, rect ? rect->w : 1);
           }
         }
@@ -6539,7 +6725,12 @@ class X11Backend final : public Backend {
           }
           update_tray();
         }
-        if (find_workspace(event.xproperty.window) == current_workspace_) draw_bar();
+        {
+          const auto state_it = window_state_.find(event.xproperty.window);
+          if (state_it != window_state_.end() &&
+              find_workspace(event.xproperty.window) == current_workspace_[state_it->second.monitor])
+            draw_bar();
+        }
         break;
       default:
         break;
@@ -6566,6 +6757,7 @@ class X11Backend final : public Backend {
                                            (current_monitor_ + monitors_.size() - 1) % monitors_.size());
       if (key == XK_period) send_to_monitor(workspace().focused,
                                             (current_monitor_ + 1) % monitors_.size());
+      if (key == XK_o) send_to_monitor(workspace().focused, (current_monitor_ + 1) % monitors_.size());
       if (key == XK_h || key == XK_j || key == XK_k || key == XK_l) resize_pane(key);
       if (key == XK_Tab) next_tab(-1);
       if (key == XK_r) restart();
@@ -6590,7 +6782,8 @@ class X11Backend final : public Backend {
     if (state != Mod4Mask) return;
     if (key == XK_Return) spawn_terminal();
     if (key == XK_i) toggle_project_picker(false);
-    if (key == XK_o) toggle_project_picker(true);
+    if (key == XK_u) toggle_project_picker(true);
+    if (key == XK_o) focus_monitor(1);
     if (key == XK_p) toggle_launcher();
     if (key == XK_w) open_window_switcher();
     if (key == XK_f) toggle_hints();
@@ -6616,7 +6809,8 @@ class X11Backend final : public Backend {
 
   void handle_button(const XButtonEvent& event) {
     const unsigned int state = event.state & ~(LockMask | Mod2Mask);
-    const std::string context = event.window == root_ ? "root" : event.window == bar_ ? "tagbar" : "client";
+    const int clicked_bar = bar_monitor(event.window);
+    const std::string context = event.window == root_ ? "root" : clicked_bar >= 0 ? "tagbar" : "client";
     for (const LuaMousebind& binding : lua_mousebinds_) {
       if (binding.context != context || binding.button != event.button || binding.modifiers != state) continue;
       lua_rawgeti(lua_, LUA_REGISTRYINDEX, binding.callback);
@@ -6625,27 +6819,32 @@ class X11Backend final : public Backend {
         lua_pop(lua_, 1);
       }
     }
-    if (event.window == bar_) {
+    if (clicked_bar >= 0) {
+      // Clicking a monitor's bar makes it the current monitor, same as
+      // clicking its dock (see the DockWindows click handler) -- so a
+      // workspace-number click below switches that monitor's workspace.
+      current_monitor_ = static_cast<std::size_t>(clicked_bar);
+      const int bar_width = monitor(current_monitor_).width;
       // The launcher and the power menu toggle live in the outer kDockWidth
-      // corners now that the bar spans the full display width.
+      // corners now that each bar spans its own monitor's width.
       if (event.x < kDockWidth) {
         if (event.button == Button1) toggle_project_picker(false);
         return;
       }
-      if (event.x >= DisplayWidth(display_, screen_) - kDockWidth) {
+      if (event.x >= bar_width - kDockWidth) {
         if (event.button == Button1) { power_menu_visible_ ? close_power_menu() : open_power_menu(); }
         return;
       }
-      if (event.x < workspace_start_x_) {
+      if (event.x < workspace_start_x_[current_monitor_]) {
         if (event.button == Button1) toggle_project_dropdown();
         return;
       }
-      const int workspace_index = (event.x - workspace_start_x_) / 84;
+      const int workspace_index = (event.x - workspace_start_x_[current_monitor_]) / 84;
       if (workspace_index >= 0 && workspace_index < kWorkspaceCount) {
         switch_workspace(workspace_index);
         return;
       }
-      if (event.x >= layout_widget_start_x_ && event.x < layout_widget_end_x_) {
+      if (event.x >= layout_widget_start_x_[current_monitor_] && event.x < layout_widget_end_x_[current_monitor_]) {
         if (event.button == Button1) cycle_layout();
         if (event.button == Button3) {
           workspace().mode = LayoutMode::Monocle;
@@ -6653,13 +6852,13 @@ class X11Backend final : public Backend {
         }
         return;
       }
-      if (event.x >= pomodoro_widget_start_x_ && event.x < pomodoro_widget_end_x_) {
+      if (event.x >= pomodoro_widget_start_x_[current_monitor_] && event.x < pomodoro_widget_end_x_[current_monitor_]) {
         if (event.button == Button1) toggle_pomodoro();
         if (event.button == Button3) reset_pomodoro();
         draw_bar();
         return;
       }
-      for (const BarHit& hit : task_hits_) {
+      for (const BarHit& hit : task_hits_[current_monitor_]) {
         if (event.x >= hit.left && event.x < hit.right) {
           focus(hit.window);
           arrange();
@@ -6668,7 +6867,13 @@ class X11Backend final : public Backend {
       }
       return;
     }
-    if (find_workspace(event.window) != current_workspace_) return;
+    {
+      const auto state_it = window_state_.find(event.window);
+      const std::size_t clicked_monitor = state_it != window_state_.end() ? state_it->second.monitor : 0;
+      if (clicked_monitor >= current_workspace_.size() ||
+          find_workspace(event.window) != current_workspace_[clicked_monitor])
+        return;
+    }
     focus(event.window);
     if (state == Mod4Mask && event.button == Button1) {
       XAllowEvents(display_, AsyncPointer, CurrentTime);
@@ -6691,7 +6896,7 @@ class X11Backend final : public Backend {
   Display* display_ = nullptr;
   int screen_ = 0;
   Window root_ = None;
-  Window bar_ = None;
+  std::vector<Window> bars_;
   Window tray_ = None;
   std::vector<DockWindows> docks_;
   StartupTimer* startup_timer_ = nullptr;
@@ -6764,9 +6969,10 @@ class X11Backend final : public Backend {
   std::vector<AgentStatus> agents_;
   int agent_needs_input_ = 0;
   GC bar_gc_ = nullptr;
-  Pixmap bar_pixmap_ = None;
-  int bar_pixmap_width_ = 0;
-  XftDraw* bar_xft_draw_ = nullptr;
+  // One real bar window per monitor, mirroring docks_ -- see create_bars().
+  std::vector<Pixmap> bar_pixmaps_;
+  std::vector<int> bar_pixmap_widths_;
+  std::vector<XftDraw*> bar_xft_draws_;
   Window launcher_window_ = None;
   Pixmap launcher_pixmap_ = None;
   XftDraw* launcher_xft_draw_ = nullptr;
@@ -6797,11 +7003,11 @@ class X11Backend final : public Backend {
   // accent color. Derived from the active theme so it adapts automatically.
   XftColor bar_card_{};
   std::unordered_map<FcChar32, XftFont*> fallback_fonts_;
-  std::vector<BarHit> task_hits_;
-  int bar_task_list_x_ = 960;
-  int workspace_start_x_ = kDockWidth;
-  int layout_widget_start_x_ = kDockWidth;
-  int layout_widget_end_x_ = kDockWidth;
+  // Per-monitor bar hit-test state, populated by draw_bar_for_monitor().
+  std::vector<std::vector<BarHit>> task_hits_;
+  std::vector<int> workspace_start_x_;
+  std::vector<int> layout_widget_start_x_;
+  std::vector<int> layout_widget_end_x_;
   // Pomodoro widget state: `pomodoro_deadline_` is the absolute time the
   // current phase ends while running; `pomodoro_remaining_` freezes the
   // seconds left while paused (deadline is meaningless then).
@@ -6809,8 +7015,8 @@ class X11Backend final : public Backend {
   bool pomodoro_running_ = false;
   std::time_t pomodoro_deadline_ = 0;
   std::time_t pomodoro_remaining_ = 0;
-  int pomodoro_widget_start_x_ = 0;
-  int pomodoro_widget_end_x_ = 0;
+  std::vector<int> pomodoro_widget_start_x_;
+  std::vector<int> pomodoro_widget_end_x_;
   // Screen x for the tray window, at the front (left edge) of the pomodoro/
   // clock cluster. Recomputed by draw_bar() and consumed by update_tray(),
   // since tray icons can dock/undock (and so need repositioning) independent
@@ -6825,7 +7031,9 @@ class X11Backend final : public Backend {
   XftColor hint_foreground_{};
   XftColor hint_matched_{};
   Cursor cursor_ = None;
-  std::array<Workspace, kWorkspaceCount> workspaces_;
+  // One WorkspaceSet per monitor, kept in lockstep with monitors_/docks_ --
+  // see update_monitors().
+  std::vector<WorkspaceSet> workspaces_;
   std::vector<Project> projects_;
   std::size_t active_project_index_ = 0;
   Window project_dropdown_window_ = None;
@@ -6834,7 +7042,8 @@ class X11Backend final : public Backend {
   // opens -- rows are hit-tested against this rather than re-filtering
   // projects_ live, so a click always lands on the row it was drawn for.
   std::vector<std::size_t> project_dropdown_entries_;
-  int current_workspace_ = 0;
+  // Each monitor's own active workspace index (0-based); parallel to workspaces_.
+  std::vector<int> current_workspace_;
   std::vector<Monitor> monitors_;
   std::size_t current_monitor_ = 0;
   std::unordered_set<Window> expected_unmaps_;

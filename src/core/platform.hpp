@@ -48,7 +48,7 @@ enum class Action {
   SpawnTerminal,
   OpenAppPicker,
   OpenProjectPicker,        // all known projects (X11 Super+i)
-  OpenActiveProjectPicker,  // only projects that hold windows (X11 Super+o)
+  OpenActiveProjectPicker,  // only projects that hold windows (X11 Super+u)
   OpenThemePicker,          // fuzzy picker over the theme palettes (X11 Super+Shift+t)
   OpenWallpaperPicker,      // fuzzy picker over the wallpaper dirs (X11 Super+Shift+w)
   ToggleHelpPanel,

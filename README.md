@@ -223,8 +223,11 @@ through `Super+9` to switch there and see it.
 and monocle layouts. `Super+h`, `j`, `k`, and `l` focus the nearest visible pane
 or client to the left, down, up, or right. `Super+1` through `Super+9` select a
 workspace within the active project, `Super+Enter` opens the configured terminal,
-and `Super+Shift+q` exits the manager. The top bar shows all nine workspaces,
-marks the current one, and displays its active project and layout.
+and `Super+Shift+q` exits the manager. `Super+1`-`Super+9` switch only the
+workspace of whichever monitor is currently focused -- each monitor tracks
+its own workspace independently. The top bar (one per monitor, each showing
+that monitor's own workspaces) shows all nine workspaces, marks the current
+one, and displays its active project and layout.
 
 `Super+p` opens an application picker. It searches XDG `.desktop` entries by
 name; type to fuzzy-filter, use Up/Down (or Ctrl+p/Ctrl+n) to choose, Enter to
@@ -244,9 +247,9 @@ but it also re-fits the wallpaper: see [Wallpaper](#wallpaper).
 
 ## Projects
 
-Each project owns an independent set of nine workspaces. `Super+i` opens the
+Each project owns an independent set of nine workspaces per monitor. `Super+i` opens the
 project picker; choose a saved project, or type an existing directory and press
-Enter to add, switch to it, and open a terminal there. `Super+o` opens the active-project picker, which
+Enter to add, switch to it, and open a terminal there. `Super+u` opens the active-project picker, which
 lists only projects with open clients. Project paths persist in
 `$XDG_DATA_HOME/mepwm/projects` (or `~/.local/share/mepwm/projects`), and the
 home directory is available as the default project.
@@ -292,10 +295,14 @@ install the Ubuntu Mono Nerd Font for those icons to render.
 Lua configuration can extend the bottom dock with
 `mwm.widget({ name = "…", update = function() return "…" end, click = function(button) end, highlight = true })`.
 
-When Xinerama reports more than one monitor, workspaces remain shared globally
-and each window belongs to one monitor. `Super+,` and `Super+.` focus the
-previous or next monitor; add Shift to send the focused window there. Dropping
-a moved or resized floating window on another monitor also transfers it.
+When Xinerama reports more than one monitor, each monitor gets its own
+independent set of nine workspaces (and its own top bar) -- switching a
+workspace on one monitor never affects another. `Super+,` and `Super+.` focus
+the previous or next monitor; add Shift to send the focused window there,
+landing it on that monitor's currently visible workspace. `Super+o` is the
+shorthand for exactly two monitors: it focuses the other one, and
+`Super+Shift+o` sends the focused window there. Dropping a moved or resized
+floating window on another monitor also transfers it.
 
 ## Themes
 
