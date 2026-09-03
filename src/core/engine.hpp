@@ -141,6 +141,10 @@ class TilingEngine final : public Backend {
   // via remote control, so open and future terminals stay in sync with the
   // picker (including live preview, matching the border/chrome behavior).
   void sync_terminal_theme() const;
+  // Pushes the same theme into every running `mep` editor instance via its
+  // agent-control socket (mep_theme.hpp) -- best-effort, no-ops if mep
+  // isn't running.
+  void sync_mep_theme() const;
   void save_theme() const;
   void load_theme();
 

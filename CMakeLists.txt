@@ -77,10 +77,13 @@ set(MEPWM_SOURCES
   src/core/layout.cpp
   src/core/tree.cpp
   src/core/engine.cpp
+  src/core/mep_theme.cpp
   src/core/terminal_theme.cpp
   src/core/theme_palette.cpp
   src/wayland/wayland_backend.cpp
 )
+
+find_package(Threads REQUIRED)
 
 add_library(mepwm ${MEPWM_SOURCES})
 add_library(mepwm::mepwm ALIAS mepwm)
@@ -88,6 +91,9 @@ target_include_directories(mepwm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(mepwm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_features(mepwm PUBLIC cxx_std_17)
 target_compile_options(mepwm PRIVATE ${MEPWM_WARNING_FLAGS})
+# mep_theme.cpp fans a theme-sync write out to every running mep instance on
+# its own detached std::thread, so the picker never blocks on a stale socket.
+target_link_libraries(mepwm PRIVATE Threads::Threads)
 
 if(MEPWM_ENABLE_X11)
   pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)

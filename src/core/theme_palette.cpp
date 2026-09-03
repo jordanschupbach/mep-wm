@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <unordered_map>
 
 namespace mepwm::core {
 
@@ -108,6 +109,18 @@ std::array<std::string, 16> synthesize_ansi_palette(const std::string& fg, const
   const std::string bright_white = dark ? std::string("#ffffff") : mix_hex(bg, fg, 0.08);
   return {black, red, green, yellow, accent, magenta, cyan, white,
           bright_black, red, green, yellow, accent, magenta, cyan, bright_white};
+}
+
+const char* mep_colorscheme_for(const std::string& name) {
+  static const std::unordered_map<std::string, const char*> overrides = {
+      {"dark", "mep-dark"},
+      {"light", "one-light"},
+  };
+  if (const auto it = overrides.find(name); it != overrides.end()) return it->second;
+  for (const ThemePalette& palette : theme_palettes()) {
+    if (name == palette.name) return palette.name;
+  }
+  return nullptr;
 }
 
 }  // namespace mepwm::core

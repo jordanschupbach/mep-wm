@@ -1,6 +1,7 @@
 #include "core/engine.hpp"
 
 #include "core/icons.hpp"
+#include "core/mep_theme.hpp"
 #include "core/terminal_theme.hpp"
 #include "core/theme_palette.hpp"
 
@@ -980,12 +981,20 @@ void TilingEngine::sync_terminal_theme() const {
                                       [this](const std::string& command) { platform_->spawn(command); });
 }
 
+void TilingEngine::sync_mep_theme() const {
+  const ThemeDef& theme = themes()[effective_theme()];
+  if (const char* name = ::mepwm::core::mep_colorscheme_for(theme.name)) {
+    ::mepwm::core::sync_mep_theme(name);
+  }
+}
+
 void TilingEngine::apply_theme(std::size_t index) {
   if (index >= themes().size()) return;
   preview_theme_ = -1;
   theme_index_ = index;
   sync_theme_colors();
   sync_terminal_theme();
+  sync_mep_theme();
   save_theme();
   // Chrome first: the platform reuses the chrome palette for tab bars,
   // side panels, and the picker.
@@ -1001,6 +1010,7 @@ void TilingEngine::preview_theme(int index) {
   preview_theme_ = index;
   sync_theme_colors();
   sync_terminal_theme();
+  sync_mep_theme();
   refresh_chrome();
   refresh_borders();
   refresh_tab_bars();
@@ -1029,6 +1039,7 @@ void TilingEngine::load_theme() {
   }
   sync_theme_colors();
   sync_terminal_theme();
+  sync_mep_theme();
 }
 
 void TilingEngine::open_wallpaper_picker() {

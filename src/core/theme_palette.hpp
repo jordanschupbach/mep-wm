@@ -35,4 +35,17 @@ const std::vector<ThemePalette>& theme_palettes();
 std::array<std::string, 16> synthesize_ansi_palette(const std::string& fg, const std::string& bg,
                                                      const std::string& accent);
 
+// Translates one of theme_palettes()'s own names into the equivalent
+// colorscheme name registered by mep (github:jordanschupbach/mep, see
+// mep_theme.hpp), for keeping the two editors' themes in sync. Most names
+// already match exactly -- both projects source published palettes (Nord,
+// Dracula, Gruvbox, ...) from the same canonical hex values, just under
+// independently-authored tables -- so this is the identity map for those.
+// "dark"/"light" are mep-wm's own generic fallbacks (no published scheme
+// behind them, see theme_palettes()' header comment) with no literal
+// counterpart in mep, mapped instead to mep's own closest equivalents:
+// "mep-dark" (mep's own generic default, same purpose) and "one-light".
+// Returns nullptr if `name` isn't a theme_palettes() name at all.
+const char* mep_colorscheme_for(const std::string& name);
+
 }  // namespace mepwm::core
