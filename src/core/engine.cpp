@@ -2,6 +2,7 @@
 
 #include "core/icons.hpp"
 #include "core/terminal_theme.hpp"
+#include "core/theme_palette.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -138,36 +139,14 @@ std::string project_state_path() {
   return {};
 }
 
-// Built-in theme collection, matching the X11 backend's palettes: half
-// dark, half light. `accent` drives the highlight color and the
-// focused-window border.
-struct ThemeDef {
-  const char* name;
-  const char* fg;
-  const char* bg;
-  const char* accent;
-};
+// Built-in theme collection, shared with the X11 backend's picker via
+// core::theme_palettes() -- one source of truth for fg/bg/accent plus the
+// 16-slot ANSI palette that terminals (and neofetch's swatch) actually
+// paint with. `accent` drives the highlight color and the focused-window
+// border.
+using ThemeDef = ThemePalette;
 
-const std::vector<ThemeDef>& themes() {
-  static const std::vector<ThemeDef> list = {
-      {"dark", "#f8f8f2", "#202124", "#5294e2"},
-      {"nord", "#d8dee9", "#2e3440", "#88c0d0"},
-      {"dracula", "#f8f8f2", "#282a36", "#bd93f9"},
-      {"gruvbox-dark", "#ebdbb2", "#282828", "#fe8019"},
-      {"tokyo-night", "#c0caf5", "#1a1b26", "#7aa2f7"},
-      {"catppuccin-mocha", "#cdd6f4", "#1e1e2e", "#cba6f7"},
-      {"one-dark", "#abb2bf", "#282c34", "#61afef"},
-      {"everforest-dark", "#d3c6aa", "#2d353b", "#a7c080"},
-      {"light", "#202124", "#f4f4f4", "#3971ed"},
-      {"solarized-light", "#586e75", "#fdf6e3", "#268bd2"},
-      {"gruvbox-light", "#3c3836", "#fbf1c7", "#d65d0e"},
-      {"catppuccin-latte", "#4c4f69", "#eff1f5", "#8839ef"},
-      {"rose-pine-dawn", "#575279", "#faf4ed", "#907aa9"},
-      {"everforest-light", "#5c6a72", "#f3ead3", "#8da101"},
-      {"nord-light", "#2e3440", "#eceff4", "#5e81ac"},
-  };
-  return list;
-}
+const std::vector<ThemeDef>& themes() { return theme_palettes(); }
 
 // "#rrggbb" blend of `base` toward `toward` by `amount` (0..1); used for the
 // unfocused border so it stays visible without competing with content.
@@ -995,7 +974,9 @@ void TilingEngine::sync_theme_colors() {
 
 void TilingEngine::sync_terminal_theme() const {
   const ThemeDef& theme = themes()[effective_theme()];
-  ::mepwm::core::sync_terminal_theme(theme.fg, theme.bg, theme.accent,
+  std::array<std::string, 16> ansi;
+  std::copy(theme.ansi.begin(), theme.ansi.end(), ansi.begin());
+  ::mepwm::core::sync_terminal_theme(theme.fg, theme.bg, theme.accent, ansi,
                                       [this](const std::string& command) { platform_->spawn(command); });
 }
 

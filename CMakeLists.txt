@@ -78,6 +78,7 @@ set(MEPWM_SOURCES
   src/core/tree.cpp
   src/core/engine.cpp
   src/core/terminal_theme.cpp
+  src/core/theme_palette.cpp
   src/wayland/wayland_backend.cpp
 )
 

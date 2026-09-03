@@ -49,7 +49,7 @@ std::string shell_single_quote(const std::string& value) {
 }
 
 void write_kitty_theme_file(const std::string& path, const std::string& fg, const std::string& bg,
-                             const std::string& accent) {
+                             const std::string& accent, const std::array<std::string, 16>& ansi) {
   std::ofstream file(path);
   if (!file) return;
   file << "background " << bg << '\n'
@@ -63,6 +63,9 @@ void write_kitty_theme_file(const std::string& path, const std::string& fg, cons
        << "active_tab_foreground " << bg << '\n'
        << "inactive_tab_background " << mix_hex(bg, fg, 0.15) << '\n'
        << "tab_bar_background " << bg << '\n';
+  for (std::size_t index = 0; index < ansi.size(); ++index) {
+    file << "color" << index << ' ' << ansi[index] << '\n';
+  }
 }
 
 // kitty only picks up mepwm-theme.conf for cold-started windows if
@@ -128,7 +131,7 @@ std::string xresources_theme_path() {
 // instance name so per-window overrides in the user's own resources still
 // take precedence.
 void write_xresources_theme_file(const std::string& path, const std::string& fg, const std::string& bg,
-                                  const std::string& accent) {
+                                  const std::string& accent, const std::array<std::string, 16>& ansi) {
   std::ofstream file(path);
   if (!file) return;
   file << "xterm*background: " << bg << '\n'
@@ -139,6 +142,10 @@ void write_xresources_theme_file(const std::string& path, const std::string& fg,
        << "URxvt*foreground: " << fg << '\n'
        << "URxvt*cursorColor: " << accent << '\n'
        << "URxvt*highlightColor: " << accent << '\n';
+  for (std::size_t index = 0; index < ansi.size(); ++index) {
+    file << "xterm*color" << index << ": " << ansi[index] << '\n'
+         << "URxvt*color" << index << ": " << ansi[index] << '\n';
+  }
 }
 
 // xrdb (which xterm/urxvt both read their resources through) parses via cpp,
@@ -164,8 +171,19 @@ void ensure_xresources_includes_theme(const std::string& theme_path) {
 // accepts these OSC sequences to recolor itself live; the values are
 // already-validated "#rrggbb" literals from the built-in theme tables,
 // never user input, so no shell-injection risk from the substitution.
-std::string osc_color_sequence(const std::string& fg, const std::string& bg, const std::string& accent) {
-  return "\\033]10;" + fg + "\\007" + "\\033]11;" + bg + "\\007" + "\\033]12;" + accent + "\\007";
+// OSC 10/11/12 set fg/bg/cursor; a single chained OSC 4 request repaints all
+// 16 ANSI slots (index;color pairs) -- this is what neofetch's swatch and
+// any other tool reading the standard palette actually draw from.
+std::string osc_color_sequence(const std::string& fg, const std::string& bg, const std::string& accent,
+                                const std::array<std::string, 16>& ansi) {
+  std::string sequence = "\\033]10;" + fg + "\\007" + "\\033]11;" + bg + "\\007" + "\\033]12;" + accent + "\\007";
+  sequence += "\\033]4;";
+  for (std::size_t index = 0; index < ansi.size(); ++index) {
+    if (index != 0) sequence += ';';
+    sequence += std::to_string(index) + ';' + ansi[index];
+  }
+  sequence += "\\007";
+  return sequence;
 }
 
 // Finds every currently-running xterm/urxvt/alacritty/foot session's pty
@@ -175,27 +193,29 @@ std::string osc_color_sequence(const std::string& fg, const std::string& bg, con
 // kitty is excluded here since it's restyled separately via its own
 // remote-control call, which also primes new-window colors.
 std::string live_recolor_running_terminals_command(const std::string& fg, const std::string& bg,
-                                                     const std::string& accent) {
+                                                     const std::string& accent,
+                                                     const std::array<std::string, 16>& ansi) {
   // Substring (not exact) match: distro packaging can wrap the real binary
   // (e.g. NixOS's comm shows ".xterm-wrapped", not "xterm").
   return "for _epid in $(ps -eo pid=,comm= | awk '$2 ~ "
          "/xterm|urxvt|rxvt-unicode|alacritty|foot/{print $1}'); do "
          "ps -eo ppid=,tty= | awk -v p=\"$_epid\" '$1==p && $2!=\"?\"{print $2}'; "
          "done | sort -u | while IFS= read -r _pty; do "
-         "printf '" + osc_color_sequence(fg, bg, accent) + "' > \"/dev/$_pty\" 2>/dev/null; "
+         "printf '" + osc_color_sequence(fg, bg, accent, ansi) + "' > \"/dev/$_pty\" 2>/dev/null; "
          "done";
 }
 
 }  // namespace
 
 void sync_terminal_theme(const std::string& fg, const std::string& bg, const std::string& accent,
+                          const std::array<std::string, 16>& ansi,
                           const std::function<void(const std::string&)>& spawn) {
   std::error_code error;
 
   if (const std::string config_dir = kitty_config_dir(); !config_dir.empty()) {
     std::filesystem::create_directories(config_dir, error);
     const std::string theme_path = config_dir + "/mepwm-theme.conf";
-    write_kitty_theme_file(theme_path, fg, bg, accent);
+    write_kitty_theme_file(theme_path, fg, bg, accent, ansi);
     ensure_kitty_conf_includes_theme(config_dir);
     // `--configured` updates the palette new OS windows inherit within a
     // running kitty instance, so each call below covers both an
@@ -217,7 +237,7 @@ void sync_terminal_theme(const std::string& fg, const std::string& bg, const std
 
   if (const std::string xresources_path = xresources_theme_path(); !xresources_path.empty()) {
     std::filesystem::create_directories(std::filesystem::path(xresources_path).parent_path(), error);
-    write_xresources_theme_file(xresources_path, fg, bg, accent);
+    write_xresources_theme_file(xresources_path, fg, bg, accent, ansi);
     ensure_xresources_includes_theme(xresources_path);
     // Merging our file directly (rather than just appending the #include)
     // takes effect immediately even if the user's shell never re-sources
@@ -225,7 +245,7 @@ void sync_terminal_theme(const std::string& fg, const std::string& bg, const std
     spawn("command -v xrdb >/dev/null 2>&1 && [ -n \"$DISPLAY\" ] && xrdb -merge " +
           shell_single_quote(xresources_path) + " >/dev/null 2>&1 || true");
   }
-  spawn(live_recolor_running_terminals_command(fg, bg, accent) + " >/dev/null 2>&1 || true");
+  spawn(live_recolor_running_terminals_command(fg, bg, accent, ansi) + " >/dev/null 2>&1 || true");
 }
 
 }  // namespace mepwm::core

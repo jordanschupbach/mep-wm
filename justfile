@@ -1,6 +1,6 @@
 # Linux source list; on macOS the X11/Wayland files are not in the compile
 # database, so lint there with: just lint "src/window_manager.cpp src/core/*.cpp src/main.cpp src/mep_wm_cli.cpp"
-mepwm_sources := "src/x11/x11_backend.cpp src/window_manager.cpp src/wayland/wayland_backend.cpp src/wayland/wayland_backend.c src/core/geometry.cpp src/core/layout.cpp src/core/engine.cpp src/main.cpp src/mep_wm_cli.cpp"
+mepwm_sources := "src/x11/x11_backend.cpp src/window_manager.cpp src/wayland/wayland_backend.cpp src/wayland/wayland_backend.c src/core/geometry.cpp src/core/layout.cpp src/core/engine.cpp src/core/terminal_theme.cpp src/core/theme_palette.cpp src/main.cpp src/mep_wm_cli.cpp"
 
 build:
   cmake -S . -B build

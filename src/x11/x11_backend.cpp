@@ -1,5 +1,6 @@
 #include "backend.hpp"
 #include "core/terminal_theme.hpp"
+#include "core/theme_palette.hpp"
 
 #include <X11/XKBlib.h>
 #include <X11/Xatom.h>
@@ -61,12 +62,14 @@ constexpr double kMinSplitWeight = 0.05;
 constexpr int kTraySpacing = 4;
 constexpr int kLauncherWidth = 640;
 constexpr int kLauncherMaxRows = 8;
-// Image preview pane that sits to the right of the launcher list when it's
-// in wallpaper mode -- a fixed width (rather than e.g. matching whatever's
-// left on the monitor) so the preview reads as a stable panel instead of
-// stretching unpredictably between monitors.
+// Preview pane that sits to the right of the launcher list -- an image in
+// wallpaper mode, a palette swatch grid in theme mode -- fixed widths
+// (rather than e.g. matching whatever's left on the monitor) so the preview
+// reads as a stable panel instead of stretching unpredictably between
+// monitors.
 constexpr int kWallpaperPreviewWidth = 420;
-constexpr int kWallpaperPreviewGap = 12;
+constexpr int kThemePreviewWidth = 300;
+constexpr int kPickerPreviewGap = 12;
 constexpr int kLeftDockCount = 8;
 // Side panels (notifications, todos, agents, help, info) share this layout so
 // they all read as one family of widget rather than four different designs.
@@ -339,6 +342,17 @@ struct LauncherApp {
   std::string exec;
 };
 
+// One cyclable theme entry: fg/bg/accent drive the bar/border chrome, ansi
+// is the 16-slot terminal palette (see core::ThemePalette) that gets pushed
+// to kitty/xterm/urxvt/alacritty/foot -- including neofetch's swatch, which
+// reads straight from those slots rather than fg/bg/accent.
+struct ThemeColors {
+  std::string fg;
+  std::string bg;
+  std::string accent;
+  std::array<std::string, 16> ansi;
+};
+
 int on_x_error(Display*, XErrorEvent* error) {
   if (error->error_code == BadAccess) another_window_manager_flag() = true;
   return 0;
@@ -389,6 +403,7 @@ class X11Backend final : public Backend {
     if (bar_pixmap_) XFreePixmap(display_, bar_pixmap_);
     if (launcher_pixmap_) XFreePixmap(display_, launcher_pixmap_);
     if (wallpaper_preview_pixmap_) XFreePixmap(display_, wallpaper_preview_pixmap_);
+    if (theme_preview_pixmap_) XFreePixmap(display_, theme_preview_pixmap_);
     for (const DockWindows& dock : docks_) {
       if (dock.left_buffer) XFreePixmap(display_, dock.left_buffer);
       if (dock.bottom_buffer) XFreePixmap(display_, dock.bottom_buffer);
@@ -1079,12 +1094,15 @@ class X11Backend final : public Backend {
   // Adapted from mwm's mwm.theme({topbar={normal=,selected=},...}) to
   // mep-wm's simpler palette-cycling bar (fg/bg/selected, no separate
   // light/dark tables): mwm.theme({name=, fg=, bg=, selected=}) adds a new
-  // cyclable theme, or replaces the built-in of the same name.
+  // cyclable theme, or replaces the built-in of the same name. The Lua API
+  // only ever supplies fg/bg/selected, so its 16-slot ANSI palette (the one
+  // terminals repaint from) is synthesized from those three -- see
+  // core::synthesize_ansi_palette().
   static int lua_theme(lua_State* state) {
     X11Backend* backend = lua_backend(state);
     luaL_checktype(state, 1, LUA_TTABLE);
-    std::array<std::string, 3> palette = backend->theme_palettes_.empty()
-        ? std::array<std::string, 3>{"#f8f8f2", "#202124", "#5294e2"} : backend->theme_palettes_[0];
+    ThemeColors palette = backend->theme_palettes_.empty()
+        ? ThemeColors{"#f8f8f2", "#202124", "#5294e2", {}} : backend->theme_palettes_[0];
     std::string name = "theme" + std::to_string(backend->theme_palettes_.size() + 1);
     auto string_field = [&](const char* field, std::string* out) {
       lua_getfield(state, 1, field);
@@ -1092,9 +1110,10 @@ class X11Backend final : public Backend {
       lua_pop(state, 1);
     };
     string_field("name", &name);
-    string_field("fg", palette.data());
-    string_field("bg", &palette[1]);
-    string_field("selected", &palette[2]);
+    string_field("fg", &palette.fg);
+    string_field("bg", &palette.bg);
+    string_field("selected", &palette.accent);
+    palette.ansi = core::synthesize_ansi_palette(palette.fg, palette.bg, palette.accent);
     const auto it = std::find(backend->theme_names_.begin(), backend->theme_names_.end(), name);
     if (it != backend->theme_names_.end()) {
       const std::size_t index = static_cast<std::size_t>(it - backend->theme_names_.begin());
@@ -3093,25 +3112,26 @@ class X11Backend final : public Backend {
   void apply_current_theme() {
     if (theme_palettes_.empty()) return;
     theme_index_ = std::clamp(theme_index_, 0, static_cast<int>(theme_palettes_.size()) - 1);
-    const std::array<std::string, 3>& palette = theme_palettes_[static_cast<std::size_t>(theme_index_)];
+    const ThemeColors& palette = theme_palettes_[static_cast<std::size_t>(theme_index_)];
     XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &bar_foreground_);
     XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &bar_background_);
     XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &bar_selected_);
     XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &bar_card_);
-    XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), palette[0].c_str(), &bar_foreground_);
-    XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), palette[1].c_str(), &bar_background_);
-    XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), palette[2].c_str(), &bar_selected_);
+    XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), palette.fg.c_str(), &bar_foreground_);
+    XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), palette.bg.c_str(), &bar_background_);
+    XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), palette.accent.c_str(), &bar_selected_);
     XftColorAllocName(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_),
-                      mix_hex(palette[1], palette[0], 0.10).c_str(), &bar_card_);
+                      mix_hex(palette.bg, palette.fg, 0.10).c_str(), &bar_card_);
     // Focused-window border tracks the theme's accent (matching the bar's
     // selected/highlight color); the unfocused border is a subtle bg/fg
     // blend so it stays visible without competing with window content.
-    border_focused_pixel_ = alloc_color(palette[2]);
-    border_normal_pixel_ = alloc_color(mix_hex(palette[1], palette[0], 0.35));
+    border_focused_pixel_ = alloc_color(palette.accent);
+    border_normal_pixel_ = alloc_color(mix_hex(palette.bg, palette.fg, 0.35));
     refresh_all_borders();
     // Keeps kitty/xterm/urxvt/alacritty/foot (running and future windows)
-    // in sync with the picker, matching the border/bar behavior above.
-    core::sync_terminal_theme(palette[0], palette[1], palette[2],
+    // in sync with the picker, matching the border/bar behavior above --
+    // including the 16-slot ANSI palette that neofetch's swatch reads from.
+    core::sync_terminal_theme(palette.fg, palette.bg, palette.accent, palette.ansi,
                                [](const std::string& command) { spawn_command(command); });
     // The tray window itself (not just its icons) paints the gap between
     // icons, so it needs to follow the theme too -- otherwise it stays the
@@ -3131,35 +3151,26 @@ class X11Backend final : public Backend {
     apply_current_theme();
   }
 
-  // The built-in collection: half dark, half light, so the picker always
+  // The built-in collection, shared with the macOS/core picker via
+  // core::theme_palettes(): half dark, half light, so the picker always
   // offers a real choice on either side of the light/dark wallpaper split
-  // (see theme_is_light()/refresh_wallpaper()). Each entry is {fg, bg,
-  // accent} -- accent drives both the selected/highlight color and the
-  // focused-window border (see apply_current_theme()).
-  static std::vector<std::array<std::string, 3>> default_theme_palettes() {
-    return {
-        {{"#f8f8f2", "#202124", "#5294e2"}},  // dark
-        {{"#d8dee9", "#2e3440", "#88c0d0"}},  // nord
-        {{"#f8f8f2", "#282a36", "#bd93f9"}},  // dracula
-        {{"#ebdbb2", "#282828", "#fe8019"}},  // gruvbox-dark
-        {{"#c0caf5", "#1a1b26", "#7aa2f7"}},  // tokyo-night
-        {{"#cdd6f4", "#1e1e2e", "#cba6f7"}},  // catppuccin-mocha
-        {{"#abb2bf", "#282c34", "#61afef"}},  // one-dark
-        {{"#d3c6aa", "#2d353b", "#a7c080"}},  // everforest-dark
-        {{"#202124", "#f4f4f4", "#3971ed"}},  // light
-        {{"#586e75", "#fdf6e3", "#268bd2"}},  // solarized-light
-        {{"#3c3836", "#fbf1c7", "#d65d0e"}},  // gruvbox-light
-        {{"#4c4f69", "#eff1f5", "#8839ef"}},  // catppuccin-latte
-        {{"#575279", "#faf4ed", "#907aa9"}},  // rose-pine-dawn
-        {{"#5c6a72", "#f3ead3", "#8da101"}},  // everforest-light
-        {{"#2e3440", "#eceff4", "#5e81ac"}},  // nord-light
-    };
+  // (see theme_is_light()/refresh_wallpaper()). accent drives both the
+  // selected/highlight color and the focused-window border (see
+  // apply_current_theme()); ansi is the 16-slot terminal palette.
+  static std::vector<ThemeColors> default_theme_palettes() {
+    std::vector<ThemeColors> palettes;
+    for (const core::ThemePalette& palette : core::theme_palettes()) {
+      ThemeColors colors{palette.fg, palette.bg, palette.accent, {}};
+      std::copy(palette.ansi.begin(), palette.ansi.end(), colors.ansi.begin());
+      palettes.push_back(std::move(colors));
+    }
+    return palettes;
   }
 
   static std::vector<std::string> default_theme_names() {
-    return {"dark", "nord", "dracula", "gruvbox-dark", "tokyo-night", "catppuccin-mocha", "one-dark",
-            "everforest-dark", "light", "solarized-light", "gruvbox-light", "catppuccin-latte",
-            "rose-pine-dawn", "everforest-light", "nord-light"};
+    std::vector<std::string> names;
+    for (const core::ThemePalette& palette : core::theme_palettes()) names.emplace_back(palette.name);
+    return names;
   }
 
   void reset_theme_palettes() {
@@ -3212,7 +3223,7 @@ class X11Backend final : public Backend {
     if (theme_palettes_.empty()) return false;
     const std::size_t index = static_cast<std::size_t>(
         std::clamp(theme_index_, 0, static_cast<int>(theme_palettes_.size()) - 1));
-    return color_is_light(theme_palettes_[index][1]);
+    return color_is_light(theme_palettes_[index].bg);
   }
 
   // The default wallpaper dirs ("assets/light_comic_wallpapers" etc.) are
@@ -3333,7 +3344,7 @@ class X11Backend final : public Backend {
     const int inner_h = std::max(1, full_h - 2 * kBarHeight);
     const std::size_t index = theme_palettes_.empty() ? 0 : static_cast<std::size_t>(
         std::clamp(theme_index_, 0, static_cast<int>(theme_palettes_.size()) - 1));
-    const std::string letterbox = theme_palettes_.empty() ? "#202124" : theme_palettes_[index][1];
+    const std::string letterbox = theme_palettes_.empty() ? "#202124" : theme_palettes_[index].bg;
     const std::string temp_path = "/tmp/mepwm-wallpaper-" + std::to_string(getpid()) + ".png";
     const std::string command = "convert " + shell_quote(path) +
         " -resize " + std::to_string(inner_w) + "x" + std::to_string(inner_h) + "^" +
@@ -4391,7 +4402,7 @@ class X11Backend final : public Backend {
       } else if (launcher_mode_ == LauncherMode::Themes) {
         const std::size_t theme = theme_matches_[launcher_scroll_ + row];
         label = (static_cast<int>(theme) == theme_index_ ? "* " : "  ") + theme_names_[theme];
-        swatch_pixel = alloc_color(theme_palettes_[theme][2]);
+        swatch_pixel = alloc_color(theme_palettes_[theme].accent);
       } else if (launcher_mode_ == LauncherMode::Wallpapers) {
         const std::string& path = wallpaper_paths_[wallpaper_matches_[launcher_scroll_ + row]];
         label = (path == current_wallpaper_path_ ? "* " : "  ") + wallpaper_label(path);
@@ -4408,6 +4419,7 @@ class X11Backend final : public Backend {
     XCopyArea(display_, launcher_pixmap_, launcher_window_, bar_gc_, 0, 0, width, height, 0, 0);
     XFlush(display_);
     draw_wallpaper_preview(x, width, y, height);
+    draw_theme_preview(x, width, y, height);
   }
 
   void close_launcher() {
@@ -4424,6 +4436,7 @@ class X11Backend final : public Backend {
     XUngrabKeyboard(display_, CurrentTime);
     XUnmapWindow(display_, launcher_window_);
     if (wallpaper_preview_window_ != None) XUnmapWindow(display_, wallpaper_preview_window_);
+    if (theme_preview_window_ != None) XUnmapWindow(display_, theme_preview_window_);
   }
 
   // Renders (or hides, outside wallpaper mode) the fzf/Telescope-style
@@ -4437,7 +4450,7 @@ class X11Backend final : public Backend {
       return;
     }
     const Monitor& target_monitor = monitor(current_monitor_);
-    const int preview_x = launcher_x + launcher_width + kWallpaperPreviewGap;
+    const int preview_x = launcher_x + launcher_width + kPickerPreviewGap;
     const int available = target_monitor.x + target_monitor.width - 10 - preview_x;
     if (available < 160) {
       if (wallpaper_preview_window_ != None) XUnmapWindow(display_, wallpaper_preview_window_);
@@ -4473,6 +4486,82 @@ class X11Backend final : public Backend {
     }
     XCopyArea(display_, wallpaper_preview_pixmap_, wallpaper_preview_window_, bar_gc_, 0, 0, width, height, 0, 0);
     XMapRaised(display_, wallpaper_preview_window_);
+    XFlush(display_);
+  }
+
+  // Renders (or hides, outside theme mode) a palette preview beside the
+  // launcher list: the highlighted theme's full 16-slot ANSI palette --
+  // what terminals actually repaint from, including neofetch's color-swatch
+  // printout -- laid out the same way neofetch draws it (two rows of eight
+  // blocks: normal colors, then bright), plus its fg/bg/accent chrome
+  // colors below. Geometry mirrors draw_wallpaper_preview() so the two
+  // preview kinds feel like one family of picker panel.
+  void draw_theme_preview(int launcher_x, int launcher_width, int y, int height) {
+    if (launcher_mode_ != LauncherMode::Themes) {
+      if (theme_preview_window_ != None) XUnmapWindow(display_, theme_preview_window_);
+      return;
+    }
+    const Monitor& target_monitor = monitor(current_monitor_);
+    const int preview_x = launcher_x + launcher_width + kPickerPreviewGap;
+    const int available = target_monitor.x + target_monitor.width - 10 - preview_x;
+    if (available < 160) {
+      if (theme_preview_window_ != None) XUnmapWindow(display_, theme_preview_window_);
+      return;
+    }
+    const int width = std::min(kThemePreviewWidth, available);
+    if (theme_preview_window_ == None) {
+      XSetWindowAttributes attributes{};
+      attributes.override_redirect = True;
+      attributes.background_pixel = bar_background_.pixel;
+      attributes.border_pixel = bar_selected_.pixel;
+      attributes.event_mask = ExposureMask;
+      theme_preview_window_ = XCreateWindow(display_, root_, 0, 0, width, height, 1, DefaultDepth(display_, screen_),
+                                            CopyFromParent, DefaultVisual(display_, screen_),
+                                            CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWEventMask, &attributes);
+      XStoreName(display_, theme_preview_window_, "mepwm-theme-preview");
+      XDefineCursor(display_, theme_preview_window_, cursor_);
+    }
+    XMoveResizeWindow(display_, theme_preview_window_, preview_x, y, width, height);
+    if (theme_preview_pixmap_) XFreePixmap(display_, theme_preview_pixmap_);
+    theme_preview_pixmap_ = XCreatePixmap(display_, theme_preview_window_, width, height, DefaultDepth(display_, screen_));
+    XSetForeground(display_, bar_gc_, bar_background_.pixel);
+    XFillRectangle(display_, theme_preview_pixmap_, bar_gc_, 0, 0, width, height);
+    if (theme_matches_.empty()) {
+      const char* message = "No matching themes";
+      draw_dock_text(theme_preview_pixmap_, std::max(10, (width - text_width(message)) / 2),
+                     (height + bar_font_->ascent - bar_font_->descent) / 2, message, bar_foreground_);
+    } else {
+      const ThemeColors& palette = theme_palettes_[theme_matches_[launcher_selection_]];
+      const int margin = 14;
+      const int gap = 6;
+      const int columns = 8;
+      const int cell = std::min((width - 2 * margin - (columns - 1) * gap) / columns, 30);
+      int cursor_y = margin;
+      for (int row = 0; row < 2; ++row) {
+        for (int col = 0; col < columns; ++col) {
+          const std::size_t slot = static_cast<std::size_t>(row) * static_cast<std::size_t>(columns) +
+                                   static_cast<std::size_t>(col);
+          XSetForeground(display_, bar_gc_, alloc_color(palette.ansi[slot]));
+          XFillRectangle(display_, theme_preview_pixmap_, bar_gc_, margin + col * (cell + gap), cursor_y, cell, cell);
+        }
+        cursor_y += cell + gap;
+      }
+      cursor_y += margin - gap;
+      const int swatch_size = 18;
+      auto draw_swatch_row = [&](const char* label, const std::string& hex) {
+        XSetForeground(display_, bar_gc_, alloc_color(hex));
+        XFillRectangle(display_, theme_preview_pixmap_, bar_gc_, margin, cursor_y, swatch_size, swatch_size);
+        draw_dock_text(theme_preview_pixmap_, margin + swatch_size + 10,
+                       cursor_y + (swatch_size + bar_font_->ascent - bar_font_->descent) / 2,
+                       std::string(label) + "  " + hex, bar_foreground_);
+        cursor_y += swatch_size + gap;
+      };
+      draw_swatch_row("fg", palette.fg);
+      draw_swatch_row("bg", palette.bg);
+      draw_swatch_row("accent", palette.accent);
+    }
+    XCopyArea(display_, theme_preview_pixmap_, theme_preview_window_, bar_gc_, 0, 0, width, height, 0, 0);
+    XMapRaised(display_, theme_preview_window_);
     XFlush(display_);
   }
 
@@ -6661,7 +6750,7 @@ class X11Backend final : public Backend {
   // pressing Enter. Reset to -1 on confirm (see launch_selected_app()) and
   // on close (see close_launcher()).
   int theme_preview_saved_index_ = -1;
-  std::vector<std::array<std::string, 3>> theme_palettes_ = default_theme_palettes();
+  std::vector<ThemeColors> theme_palettes_ = default_theme_palettes();
   std::vector<std::string> theme_names_ = default_theme_names();
   std::optional<bool> wallpaper_is_light_;
   std::mt19937 wallpaper_rng_{std::random_device{}()};
@@ -6688,6 +6777,8 @@ class X11Backend final : public Backend {
   std::vector<std::size_t> wallpaper_matches_;
   Window wallpaper_preview_window_ = None;
   Pixmap wallpaper_preview_pixmap_ = None;
+  Window theme_preview_window_ = None;
+  Pixmap theme_preview_pixmap_ = None;
   std::size_t launcher_selection_ = 0;
   std::size_t launcher_scroll_ = 0;
   XftFont* bar_font_ = nullptr;
