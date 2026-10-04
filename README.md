@@ -314,9 +314,18 @@ independent set of nine workspaces (and its own top bar) -- switching a
 workspace on one monitor never affects another. `Super+,` and `Super+.` focus
 the previous or next monitor; add Shift to send the focused window there,
 landing it on that monitor's currently visible workspace. `Super+o` is the
-shorthand for exactly two monitors: it focuses the other one, and
-`Super+Shift+o` sends the focused window there. Dropping a moved or resized
+shorthand for exactly two monitors: it sends the focused window to the other
+one, and `Super+Shift+o` moves focus there. `Super+h/j/k/l` also cross monitors:
+with nothing further in that direction, focus moves to the neighbouring
+monitor, and `Super+Ctrl+h/j/k/l` (manual layout) carries the focused window
+across the same way. Dropping a moved or resized
 floating window on another monitor also transfers it.
+
+External monitors are configured automatically through RandR: plugging one in
+turns it on at its preferred resolution, extending the desktop to the right
+of the existing monitors, and unplugging it turns it off again (its windows
+move to the first monitor). Only the plug/unplug itself triggers this, so an
+output you switched off by hand with `xrandr` stays off.
 
 ## Themes
 

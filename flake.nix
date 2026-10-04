@@ -26,6 +26,7 @@
           libffi
           libx11
           libXinerama
+          libXrandr
           libXft
           fontconfig
           imlib2

@@ -9,6 +9,7 @@
 #include <X11/Xlib.h>
 #include <X11/Xft/Xft.h>
 #include <X11/extensions/Xinerama.h>
+#include <X11/extensions/Xrandr.h>
 #include <X11/cursorfont.h>
 #include <X11/keysym.h>
 #include <Imlib2.h>
@@ -31,6 +32,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -474,6 +476,7 @@ class X11Backend final : public Backend {
     border_focused_pixel_ = alloc_color(config_.border_color_focused);
     todo_active_pixel_ = alloc_color("#2ecc71");
     todo_inactive_pixel_ = alloc_color("#e74c3c");
+    initialize_randr();
     update_monitors();
     startup.checkpoint("configure display and monitors");
 
@@ -525,6 +528,13 @@ class X11Backend final : public Backend {
         XEvent event;
         XNextEvent(display_, &event);
         dispatch(event);
+      }
+      // RandR reports one layout change as a burst of events; re-lay out
+      // once after the whole burst rather than per event.
+      if (display_geometry_dirty_) {
+        display_geometry_dirty_ = false;
+        refresh_display_geometry();
+        arrange();
       }
     }
     return 0;
@@ -713,6 +723,195 @@ class X11Backend final : public Backend {
     // leaving them stranded in a WorkspaceSet that's about to be destroyed.
     resize_workspace_sets(monitors_.size());
     current_monitor_ = std::min(current_monitor_, monitors_.size() - 1);
+  }
+
+  // Hotplug support: remembers which outputs are connected so a later
+  // RROutputChangeNotify can be recognised as a plug or an unplug. Outputs
+  // already connected at startup are left exactly as configured.
+  void initialize_randr() {
+    int error_base = 0;
+    int major = 0;
+    int minor = 0;
+    // 1.3 for XRRGetScreenResourcesCurrent.
+    if (!XRRQueryExtension(display_, &randr_event_base_, &error_base) ||
+        !XRRQueryVersion(display_, &major, &minor) || major < 1 || (major == 1 && minor < 3)) {
+      randr_event_base_ = -1;
+      return;
+    }
+    XRRSelectInput(display_, root_, RRScreenChangeNotifyMask | RRCrtcChangeNotifyMask | RROutputChangeNotifyMask);
+    XRRScreenResources* resources = XRRGetScreenResourcesCurrent(display_, root_);
+    if (!resources) return;
+    for (int index = 0; index < resources->noutput; ++index) {
+      XRROutputInfo* info = XRRGetOutputInfo(display_, resources, resources->outputs[index]);
+      if (!info) continue;
+      output_connected_[resources->outputs[index]] = info->connection == RR_Connected;
+      XRRFreeOutputInfo(info);
+    }
+    XRRFreeScreenResources(resources);
+  }
+
+  // Returns true when event was a RandR event (and so is fully handled).
+  bool handle_randr_event(const XEvent& event) {
+    if (randr_event_base_ < 0) return false;
+    if (event.type == randr_event_base_ + RRScreenChangeNotify) {
+      // Keeps Xlib's cached DisplayWidth/DisplayHeight in step with the root.
+      XRRUpdateConfiguration(const_cast<XEvent*>(&event));
+      display_geometry_dirty_ = true;
+      return true;
+    }
+    if (event.type != randr_event_base_ + RRNotify) return false;
+    display_geometry_dirty_ = true;
+    const auto& notify = reinterpret_cast<const XRRNotifyEvent&>(event);
+    if (notify.subtype == RRNotify_OutputChange) {
+      handle_output_change(reinterpret_cast<const XRROutputChangeNotifyEvent&>(event).output);
+    }
+    return true;
+  }
+
+  // Acts only on a connection *transition*: an output the user switched off
+  // by hand (`xrandr --output X --off`) also arrives here as connected with
+  // no CRTC, and must stay off.
+  void handle_output_change(RROutput output) {
+    XRRScreenResources* resources = XRRGetScreenResourcesCurrent(display_, root_);
+    if (!resources) return;
+    XRROutputInfo* info = XRRGetOutputInfo(display_, resources, output);
+    if (!info) {
+      XRRFreeScreenResources(resources);
+      return;
+    }
+    const bool connected = info->connection == RR_Connected;
+    const bool enabled = info->crtc != None;
+    XRRFreeOutputInfo(info);
+    XRRFreeScreenResources(resources);
+
+    const auto known = output_connected_.find(output);
+    const bool was_connected = known != output_connected_.end() && known->second;
+    output_connected_[output] = connected;
+    if (connected == was_connected) return;
+    if (connected && !enabled) enable_output(output);
+    else if (!connected && enabled) disable_output(output);
+  }
+
+  // Resizes the X screen (the bounding box every CRTC must fit inside),
+  // keeping the current DPI. False when the server cannot go that large.
+  bool set_screen_size(int width, int height) {
+    int min_width = 0;
+    int min_height = 0;
+    int max_width = 0;
+    int max_height = 0;
+    if (!XRRGetScreenSizeRange(display_, root_, &min_width, &min_height, &max_width, &max_height)) return false;
+    if (width > max_width || height > max_height) return false;
+    width = std::max(width, min_width);
+    height = std::max(height, min_height);
+    const int current_width = DisplayWidth(display_, screen_);
+    const int current_height = DisplayHeight(display_, screen_);
+    const int current_width_mm = DisplayWidthMM(display_, screen_);
+    const int current_height_mm = DisplayHeightMM(display_, screen_);
+    const bool known_dpi = current_width > 0 && current_height > 0 && current_width_mm > 0 && current_height_mm > 0;
+    const int width_mm = known_dpi ? width * current_width_mm / current_width : width * 254 / 960;
+    const int height_mm = known_dpi ? height * current_height_mm / current_height : height * 254 / 960;
+    XRRSetScreenSize(display_, root_, width, height, width_mm, height_mm);
+    return true;
+  }
+
+  // Turns output on at its preferred mode, extending the desktop to the
+  // right of everything already active.
+  void enable_output(RROutput output) {
+    XRRScreenResources* resources = XRRGetScreenResourcesCurrent(display_, root_);
+    if (!resources) return;
+    XRROutputInfo* info = XRRGetOutputInfo(display_, resources, output);
+    if (!info || info->crtc != None) {
+      if (info) XRRFreeOutputInfo(info);
+      XRRFreeScreenResources(resources);
+      return;
+    }
+    // RandR lists an output's preferred modes first.
+    const XRRModeInfo* mode = nullptr;
+    for (int index = 0; info->nmode > 0 && index < resources->nmode; ++index) {
+      if (resources->modes[index].id == info->modes[0]) mode = &resources->modes[index];
+    }
+    int right = 0;
+    int bottom = 0;
+    RRCrtc free_crtc = None;
+    for (int index = 0; index < resources->ncrtc; ++index) {
+      const RRCrtc id = resources->crtcs[index];
+      XRRCrtcInfo* crtc = XRRGetCrtcInfo(display_, resources, id);
+      if (!crtc) continue;
+      if (crtc->mode != None) {
+        right = std::max(right, crtc->x + static_cast<int>(crtc->width));
+        bottom = std::max(bottom, crtc->y + static_cast<int>(crtc->height));
+      } else if (free_crtc == None &&
+                 std::find(info->crtcs, info->crtcs + info->ncrtc, id) != info->crtcs + info->ncrtc) {
+        free_crtc = id;
+      }
+      XRRFreeCrtcInfo(crtc);
+    }
+    if (!mode || free_crtc == None) {
+      std::cerr << "mepwm: cannot enable output " << info->name << ": no usable mode or free CRTC\n";
+    } else {
+      XGrabServer(display_);
+      // The screen must grow before a CRTC may be placed in the new area.
+      if (set_screen_size(right + static_cast<int>(mode->width), std::max(bottom, static_cast<int>(mode->height)))) {
+        XRRSetCrtcConfig(display_, resources, free_crtc, CurrentTime, right, 0, mode->id, RR_Rotate_0, &output, 1);
+      } else {
+        std::cerr << "mepwm: cannot enable output " << info->name
+                  << ": desktop would exceed the maximum X screen size\n";
+      }
+      XUngrabServer(display_);
+    }
+    XRRFreeOutputInfo(info);
+    XRRFreeScreenResources(resources);
+  }
+
+  // Turns off an unplugged output's CRTC, closes any gap it leaves at the
+  // left/top of the remaining layout, and shrinks the screen to fit.
+  void disable_output(RROutput output) {
+    XRRScreenResources* resources = XRRGetScreenResourcesCurrent(display_, root_);
+    if (!resources) return;
+    XRROutputInfo* info = XRRGetOutputInfo(display_, resources, output);
+    const RRCrtc doomed = info ? info->crtc : None;
+    if (info) XRRFreeOutputInfo(info);
+    if (doomed == None) {
+      XRRFreeScreenResources(resources);
+      return;
+    }
+    std::vector<std::pair<RRCrtc, XRRCrtcInfo*>> remaining;
+    int left = std::numeric_limits<int>::max();
+    int top = std::numeric_limits<int>::max();
+    for (int index = 0; index < resources->ncrtc; ++index) {
+      const RRCrtc id = resources->crtcs[index];
+      XRRCrtcInfo* crtc = id == doomed ? nullptr : XRRGetCrtcInfo(display_, resources, id);
+      if (!crtc) continue;
+      if (crtc->mode == None) {
+        XRRFreeCrtcInfo(crtc);
+        continue;
+      }
+      left = std::min(left, crtc->x);
+      top = std::min(top, crtc->y);
+      remaining.emplace_back(id, crtc);
+    }
+    XGrabServer(display_);
+    XRRSetCrtcConfig(display_, resources, doomed, CurrentTime, 0, 0, None, RR_Rotate_0, nullptr, 0);
+    int right = 0;
+    int bottom = 0;
+    for (const auto& [id, crtc] : remaining) {
+      if (left > 0 || top > 0) {
+        XRRSetCrtcConfig(display_, resources, id, CurrentTime, crtc->x - left, crtc->y - top, crtc->mode,
+                         crtc->rotation, crtc->outputs, crtc->noutput);
+      }
+      right = std::max(right, crtc->x - left + static_cast<int>(crtc->width));
+      bottom = std::max(bottom, crtc->y - top + static_cast<int>(crtc->height));
+      XRRFreeCrtcInfo(crtc);
+    }
+    if (!remaining.empty()) set_screen_size(right, bottom);
+    XUngrabServer(display_);
+    XRRFreeScreenResources(resources);
+    if (!remaining.empty()) return;
+    // That was the only active output: bring up whatever else is connected
+    // (e.g. a laptop panel that had been switched off) rather than go dark.
+    for (const auto& [other, connected] : output_connected_) {
+      if (connected) enable_output(other);
+    }
   }
 
   // Xephyr can change the nested root size when its host window is resized.
@@ -2527,8 +2726,8 @@ class X11Backend final : public Backend {
         {"Super+Shift+t", "Toggle todo list sidebar"},
         {"Super+i", "Recent projects picker"},
         {"Super+u", "Active projects picker"},
-        {"Super+o", "Focus the other monitor"},
-        {"Super+Shift+o", "Send window to the other monitor"},
+        {"Super+o", "Send window to the other monitor"},
+        {"Super+Shift+o", "Focus the other monitor"},
         {"Super+h/j/k/l", "Focus direction (selects empty panes too in manual layout)"},
         {"Super+Ctrl+h/j/k/l", "Manual mode: move client into adjacent split"},
         {"Super+Ctrl+j/k", "Other modes: focus next/previous in stack order"},
@@ -5571,15 +5770,29 @@ class X11Backend final : public Backend {
   // only real, mapped windows exist as candidates. Manual mode uses
   // select_pane_direction below instead, which can also land on an empty
   // pane that has no window yet.
-  void focus_direction(KeySym key) {
-    const Window selected = workspace().focused;
-    if (selected == None) return;
-
+  //
+  // With nothing further in that direction on this monitor, focus crosses to
+  // the neighbouring monitor (see cross_monitor_direction), which re-runs the
+  // search there with `origin` set: the point being navigated from, replacing
+  // the focused window as the reference. Returns whether focus moved.
+  bool focus_direction(KeySym key, const std::pair<int, int>* origin = nullptr) {
+    const Window selected = origin ? None : workspace().focused;
+    int selected_x = 0;
+    int selected_y = 0;
     XWindowAttributes selected_attributes;
-    if (!XGetWindowAttributes(display_, selected, &selected_attributes) ||
-        selected_attributes.map_state != IsViewable) return;
-    const int selected_x = selected_attributes.x + selected_attributes.width / 2;
-    const int selected_y = selected_attributes.y + selected_attributes.height / 2;
+    if (origin) {
+      selected_x = origin->first;
+      selected_y = origin->second;
+    } else if (selected != None && XGetWindowAttributes(display_, selected, &selected_attributes) &&
+               selected_attributes.map_state == IsViewable) {
+      selected_x = selected_attributes.x + selected_attributes.width / 2;
+      selected_y = selected_attributes.y + selected_attributes.height / 2;
+    } else {
+      // Nothing focused here (an empty workspace): navigate from the
+      // monitor itself so it can still be left with the keyboard.
+      const Monitor& here = monitor(current_monitor_);
+      return cross_monitor_direction(key, here.x + here.width / 2, here.y + here.height / 2);
+    }
 
     std::vector<Window> windows;
     collect_windows(workspace().root.get(), windows);
@@ -5609,7 +5822,7 @@ class X11Backend final : public Backend {
         primary = candidate_x - selected_x;
         secondary = std::abs(selected_y - candidate_y);
       } else {
-        return;
+        return false;
       }
       if (primary <= 0) continue;
 
@@ -5622,7 +5835,73 @@ class X11Backend final : public Backend {
         best_score = score;
       }
     }
-    if (best != None) focus(best);
+    if (best != None) {
+      focus(best);
+      return true;
+    }
+    return !origin && cross_monitor_direction(key, selected_x, selected_y);
+  }
+
+  // How well a point offset by (dx, dy) matches direction key (h/j/k/l):
+  // lower is better, negative means it does not lie that way at all. Same
+  // alignment-then-distance ranking as focus_direction above.
+  static long direction_score(KeySym key, int dx, int dy) {
+    int primary = 0;
+    int secondary = 0;
+    if (key == XK_h) { primary = -dx; secondary = std::abs(dy); }
+    else if (key == XK_j) { primary = dy; secondary = std::abs(dx); }
+    else if (key == XK_k) { primary = -dy; secondary = std::abs(dx); }
+    else if (key == XK_l) { primary = dx; secondary = std::abs(dy); }
+    if (primary <= 0) return -1;
+    return static_cast<long>(secondary) * 10000L + primary;
+  }
+
+  // The monitor lying in direction key from the current one, if any.
+  std::optional<std::size_t> monitor_in_direction(KeySym key) const {
+    const Monitor& here = monitor(current_monitor_);
+    std::optional<std::size_t> best;
+    long best_score = 0;
+    for (std::size_t index = 0; index < monitors_.size(); ++index) {
+      if (index == current_monitor_) continue;
+      const Monitor& candidate = monitors_[index];
+      const long score = direction_score(key, (candidate.x + candidate.width / 2) - (here.x + here.width / 2),
+                                         (candidate.y + candidate.height / 2) - (here.y + here.height / 2));
+      if (score < 0) continue;
+      if (!best || score < best_score) {
+        best = index;
+        best_score = score;
+      }
+    }
+    return best;
+  }
+
+  // Moves focus onto the monitor lying in the given direction, landing on
+  // the pane/window there that best lines up with (from_x, from_y) -- so
+  // Super+l off the right edge enters the next monitor at the same height.
+  bool cross_monitor_direction(KeySym key, int from_x, int from_y) {
+    const std::optional<std::size_t> destination = monitor_in_direction(key);
+    if (!destination) return false;
+
+    current_monitor_ = *destination;
+    const std::pair<int, int> origin{from_x, from_y};
+    const bool landed = workspace().mode == LayoutMode::Manual ? select_pane_direction(key, &origin)
+                                                               : focus_direction(key, &origin);
+    if (!landed) {
+      if (workspace().focused != None) {
+        focus(workspace().focused);
+      } else {
+        // Empty workspace: drop focus from the window left behind so typing
+        // does not keep going to the other monitor.
+        if (previously_focused_ != None) {
+          update_border(previously_focused_, false);
+          previously_focused_ = None;
+        }
+        XSetInputFocus(display_, root_, RevertToPointerRoot, CurrentTime);
+        set_active_window(None);
+      }
+    }
+    draw_bar();
+    return true;
   }
 
   // Selects a pane outright: focuses its active tab if it has one, or -- for
@@ -5657,9 +5936,10 @@ class X11Backend final : public Backend {
   // rects) rather than only real windows, so an empty pane can be selected
   // and later opened into without having to open something in it the
   // instant it's split off.
-  void select_pane_direction(KeySym key) {
+  // Crosses monitors, and takes `origin`, exactly as focus_direction does.
+  bool select_pane_direction(KeySym key, const std::pair<int, int>* origin = nullptr) {
     Workspace& target = workspace();
-    Node* current_leaf = target.selected_leaf;
+    Node* current_leaf = origin ? nullptr : target.selected_leaf;
 
     // selected_leaf is the source of truth for "where we are" -- it can
     // diverge from target.focused right after a split, since split() moves
@@ -5668,6 +5948,11 @@ class X11Backend final : public Backend {
     // here would silently navigate from the stale, pre-split position.
     int selected_x = 0, selected_y = 0;
     bool have_reference = false;
+    if (origin) {
+      selected_x = origin->first;
+      selected_y = origin->second;
+      have_reference = true;
+    }
     if (current_leaf) {
       if (const Rect* rect = leaf_rect(current_leaf)) {
         selected_x = rect->x + rect->w / 2;
@@ -5684,7 +5969,7 @@ class X11Backend final : public Backend {
         have_reference = true;
       }
     }
-    if (!have_reference) { focus_direction(key); return; }
+    if (!have_reference) return focus_direction(key);
 
     struct Candidate {
       int x, y;
@@ -5703,7 +5988,7 @@ class X11Backend final : public Backend {
       candidates.push_back({rect->x + rect->w / 2, rect->y + rect->h / 2, leaf, window});
     }
     for (Window window : target.floating) {
-      if (window == target.focused || window_state_[window].monitor != current_monitor_) continue;
+      if ((!origin && window == target.focused) || window_state_[window].monitor != current_monitor_) continue;
       XWindowAttributes attributes;
       if (!XGetWindowAttributes(display_, window, &attributes) || attributes.map_state != IsViewable) continue;
       candidates.push_back({attributes.x + attributes.width / 2, attributes.y + attributes.height / 2,
@@ -5729,7 +6014,7 @@ class X11Backend final : public Backend {
         primary = candidate.x - selected_x;
         secondary = std::abs(selected_y - candidate.y);
       } else {
-        return;
+        return false;
       }
       if (primary <= 0) continue;
       // Prioritize alignment with the requested axis, then distance along it
@@ -5742,18 +6027,60 @@ class X11Backend final : public Backend {
         best_window = candidate.window;
       }
     }
-    if (!found) return;
+    if (!found) return !origin && cross_monitor_direction(key, selected_x, selected_y);
     if (best_leaf) {
       select_pane(best_leaf);
     } else if (best_window != None) {
       focus(best_window);
     }
+    return true;
+  }
+
+  // The monitor-crossing half of move_client_direction: moves source_leaf's
+  // active client onto the visible workspace of the monitor lying in
+  // direction key, into the pane there that best lines up with
+  // (from_x, from_y), and takes focus along with it.
+  void move_client_across_monitor(KeySym key, Node* source_leaf, int from_x, int from_y) {
+    const std::optional<std::size_t> destination = monitor_in_direction(key);
+    if (!destination) return;
+    Workspace& from = workspace();
+    Workspace& to = workspace_at(*destination);
+    const Window window = source_leaf->tabs[source_leaf->active_tab];
+
+    if (to.mode == LayoutMode::Manual) {
+      std::vector<Node*> leaves;
+      collect_leaves(to.root.get(), leaves);
+      Node* best_leaf = nullptr;
+      long best_score = 0;
+      for (Node* leaf : leaves) {
+        const Rect* rect = leaf_rect(leaf);
+        if (!rect) continue;
+        const long score = direction_score(key, rect->x + rect->w / 2 - from_x, rect->y + rect->h / 2 - from_y);
+        if (score < 0) continue;
+        if (!best_leaf || score < best_score) {
+          best_leaf = leaf;
+          best_score = score;
+        }
+      }
+      // insert_tiled opens into the selected pane.
+      if (best_leaf) to.selected_leaf = best_leaf;
+    }
+
+    // As in move_client_direction, an emptied source pane is left in place.
+    remove_tiled(from, window, /*prune_empty=*/false);
+    from.selected_leaf = source_leaf;
+    from.focused = source_leaf->tabs.empty() ? None : source_leaf->tabs[source_leaf->active_tab];
+    window_state_[window].monitor = *destination;
+    insert_tiled(to, window);
+    focus(window);
+    arrange();
   }
 
   // Relocates the focused client out of its pane and into whichever
   // existing pane sits adjacent in the given direction, using the same
-  // spatial search as select_pane_direction. Manual mode only, and a no-op
-  // if there's no pane in that direction (it never creates a new split).
+  // spatial search as select_pane_direction. Manual mode only; it never
+  // creates a new split. With no pane in that direction on this monitor, the
+  // client crosses to the monitor lying that way instead.
   void move_client_direction(KeySym key) {
     Workspace& target = workspace();
     if (target.mode != LayoutMode::Manual) return;
@@ -5804,7 +6131,10 @@ class X11Backend final : public Backend {
         best_leaf = leaf;
       }
     }
-    if (!found || !best_leaf) return;
+    if (!found || !best_leaf) {
+      move_client_across_monitor(key, source_leaf, selected_x, selected_y);
+      return;
+    }
 
     // remove_tiled drops the window from stack_order too; it's still tiled
     // once it lands in best_leaf below, so put it back at the end. Don't
@@ -6751,6 +7081,7 @@ class X11Backend final : public Backend {
   }
 
   void dispatch(const XEvent& event) {
+    if (handle_randr_event(event)) return;
     switch (event.type) {
       case MapRequest:
         if (is_tray_icon(event.xmaprequest.window)) {
@@ -6964,7 +7295,7 @@ class X11Backend final : public Backend {
                                            (current_monitor_ + monitors_.size() - 1) % monitors_.size());
       if (key == XK_period) send_to_monitor(workspace().focused,
                                             (current_monitor_ + 1) % monitors_.size());
-      if (key == XK_o) send_to_monitor(workspace().focused, (current_monitor_ + 1) % monitors_.size());
+      if (key == XK_o) focus_monitor(1);
       if (key == XK_h || key == XK_j || key == XK_k || key == XK_l) resize_pane(key);
       if (key == XK_Tab) next_tab(-1);
       if (key == XK_r) restart();
@@ -6991,7 +7322,7 @@ class X11Backend final : public Backend {
     if (key == XK_Return) spawn_terminal();
     if (key == XK_i) toggle_project_picker(false);
     if (key == XK_u) toggle_project_picker(true);
-    if (key == XK_o) focus_monitor(1);
+    if (key == XK_o) send_to_monitor(workspace().focused, (current_monitor_ + 1) % monitors_.size());
     if (key == XK_p) toggle_launcher();
     if (key == XK_w) open_window_switcher();
     if (key == XK_f) toggle_hints();
@@ -7257,6 +7588,10 @@ class X11Backend final : public Backend {
   std::vector<int> current_workspace_;
   std::vector<Monitor> monitors_;
   std::size_t current_monitor_ = 0;
+  // First RandR event code, or -1 when the extension is unavailable.
+  int randr_event_base_ = -1;
+  std::unordered_map<RROutput, bool> output_connected_;
+  bool display_geometry_dirty_ = false;
   std::unordered_set<Window> expected_unmaps_;
   std::unordered_map<Window, WindowState> window_state_;
   Window previously_focused_ = None;

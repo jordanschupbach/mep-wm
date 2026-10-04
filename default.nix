@@ -13,6 +13,7 @@ pkgs.stdenv.mkDerivation {
   buildInputs = [
     pkgs.libx11
     pkgs.libXinerama
+    pkgs.libXrandr
     pkgs.libXft
     pkgs.imlib2
     pkgs.lua
