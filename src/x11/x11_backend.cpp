@@ -43,6 +43,7 @@
 #include <sys/socket.h>
 #include <sys/statvfs.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -455,6 +456,10 @@ class X11Backend final : public Backend {
     imlib_context_set_display(display_);
     imlib_context_set_visual(DefaultVisual(display_, screen_));
     imlib_context_set_colormap(DefaultColormap(display_, screen_));
+    // An in-place restart from a build that ignored SIGCHLD (or a session
+    // script that did) would otherwise leak that disposition to everything we
+    // spawn; see fork_detached().
+    signal(SIGCHLD, SIG_DFL);
     another_window_manager_flag() = false;
     XSetErrorHandler(on_x_error);
     XSelectInput(display_, root_, SubstructureRedirectMask | SubstructureNotifyMask |
@@ -2979,12 +2984,31 @@ class X11Backend final : public Backend {
     else toggle_side_panel(SidePanel::Info, anchor_x);
   }
 
-  static void spawn_argv(std::vector<std::string> arguments) {
-    if (arguments.empty()) return;
+  // Double-forks so the spawned program is reparented to init and never
+  // needs reaping. Returns 0 in the (session-leading) grandchild, the reaped
+  // intermediate's pid in the caller, or -1 if the fork failed. This replaces
+  // signal(SIGCHLD, SIG_IGN): an ignored SIGCHLD is inherited across exec and
+  // makes waitpid() fail with ECHILD in every program we launch, which breaks
+  // ones that wait on their own children (Steam's container init, for one).
+  static pid_t fork_detached() {
     const pid_t child = fork();
-    if (child < 0) return;
+    if (child < 0) return -1;
     if (child == 0) {
       setsid();
+      const pid_t grandchild = fork();
+      if (grandchild != 0) _exit(grandchild < 0 ? 1 : 0);
+      return 0;
+    }
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    return child;
+  }
+
+  static void spawn_argv(std::vector<std::string> arguments) {
+    if (arguments.empty()) return;
+    const pid_t child = fork_detached();
+    if (child < 0) return;
+    if (child == 0) {
       std::vector<char*> argv;
       argv.reserve(arguments.size() + 1);
       for (std::string& argument : arguments) argv.push_back(argument.data());
@@ -2992,7 +3016,6 @@ class X11Backend final : public Backend {
       execvp(argv[0], argv.data());
       _exit(127);
     }
-    signal(SIGCHLD, SIG_IGN);
   }
 
   void open_wifi_panel(int anchor_x = -1) {
@@ -3103,9 +3126,8 @@ class X11Backend final : public Backend {
       } else if (info_action_ == InfoAction::Git) {
         const char* project = std::getenv("MEPWM_PROJECT_DIR");
         if (project && *project) {
-          const pid_t child = fork();
+          const pid_t child = fork_detached();
           if (child == 0) {
-            setsid();
             // Best-effort: if the project directory disappeared, still open
             // the terminal (just in whatever the fork inherited as cwd)
             // rather than not opening one at all.
@@ -3447,17 +3469,15 @@ class X11Backend final : public Backend {
   }
 
   static void run_feh_bg_fill(const std::string& path) {
-    const pid_t child = fork();
+    const pid_t child = fork_detached();
     if (child < 0) {
       std::cerr << "mepwm: could not set wallpaper: " << std::strerror(errno) << '\n';
       return;
     }
     if (child == 0) {
-      setsid();
       execlp("feh", "feh", "--bg-fill", path.c_str(), static_cast<char*>(nullptr));
       _exit(127);
     }
-    signal(SIGCHLD, SIG_IGN);
   }
 
   // Crops+letterboxes `path` to the rectangle the border bars leave
@@ -6529,17 +6549,15 @@ class X11Backend final : public Backend {
   }
 
   static void spawn_command(const std::string& command) {
-    const pid_t child = fork();
+    const pid_t child = fork_detached();
     if (child < 0) {
       std::cerr << "mepwm: could not start command: " << std::strerror(errno) << '\n';
       return;
     }
     if (child == 0) {
-      setsid();
       execl("/bin/sh", "sh", "-c", command.c_str(), static_cast<char*>(nullptr));
       _exit(127);
     }
-    signal(SIGCHLD, SIG_IGN);
   }
 
   // Opens in the active project's directory so Super+Return (and the dock's
@@ -6554,13 +6572,12 @@ class X11Backend final : public Backend {
   // just a binary), so the agent command is run in its own terminal rather
   // than trying to splice it into an arbitrary user-configured launcher.
   static void spawn_terminal_running(const std::string& directory, const std::string& command) {
-    const pid_t child = fork();
+    const pid_t child = fork_detached();
     if (child < 0) {
       std::cerr << "mepwm: could not start agent: " << std::strerror(errno) << '\n';
       return;
     }
     if (child == 0) {
-      setsid();
       if (chdir(directory.c_str()) != 0) _exit(127);
       setenv("MEPWM_AGENT_COMMAND", command.c_str(), 1);
       const char* wrapped =
@@ -6569,7 +6586,6 @@ class X11Backend final : public Backend {
       execl("/bin/sh", "sh", "-c", wrapped, static_cast<char*>(nullptr));
       _exit(127);
     }
-    signal(SIGCHLD, SIG_IGN);
   }
 
   // Opens `path` in $EDITOR (falling back to vi) inside a new terminal, the
@@ -6590,18 +6606,16 @@ class X11Backend final : public Backend {
   }
 
   void spawn_terminal_in(const std::string& directory) const {
-    const pid_t child = fork();
+    const pid_t child = fork_detached();
     if (child < 0) {
       std::cerr << "mepwm: could not start terminal: " << std::strerror(errno) << '\n';
       return;
     }
     if (child == 0) {
-      setsid();
       if (chdir(directory.c_str()) != 0) _exit(127);
       execl("/bin/sh", "sh", "-c", config_.terminal.c_str(), static_cast<char*>(nullptr));
       _exit(127);
     }
-    signal(SIGCHLD, SIG_IGN);
   }
 
   // Makes a tiled window floating mid-drag, at the given live geometry, and
