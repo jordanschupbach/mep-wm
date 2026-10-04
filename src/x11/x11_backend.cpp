@@ -1,5 +1,6 @@
 #include "backend.hpp"
 #include "core/mep_theme.hpp"
+#include "core/org_todo.hpp"
 #include "core/terminal_theme.hpp"
 #include "core/theme_palette.hpp"
 
@@ -70,6 +71,10 @@ constexpr int kLauncherMaxRows = 8;
 // monitors.
 constexpr int kWallpaperPreviewWidth = 420;
 constexpr int kThemePreviewWidth = 300;
+// The todo picker's preview is text (headline, notes, logbook summary and
+// clock lines), so it takes the widest pane and may grow taller than the
+// list when an entry has a long history.
+constexpr int kTodoPreviewWidth = 480;
 constexpr int kPickerPreviewGap = 12;
 constexpr int kLeftDockCount = 8;
 // Side panels (notifications, todos, agents, help, info) share this layout so
@@ -178,7 +183,7 @@ enum class Orientation { Vertical, Horizontal };
 enum class LayoutMode { Manual, MasterStack, Monocle };
 enum class SliderKind { Backlight, Volume, Microphone };
 enum class SidePanel { Closed, Notifications, Todos, Agents, Help, Info };
-enum class LauncherMode { Applications, Projects, ActiveProjects, Windows, Themes, Wallpapers };
+enum class LauncherMode { Applications, Projects, ActiveProjects, Windows, Themes, Wallpapers, Todos };
 // Note: cannot use "None" as a member name here — X11/X.h (pulled in via
 // Xlib.h) #defines None to 0L, which breaks enum class member declarations.
 enum class InfoAction { NoneAction, Wifi, Bluetooth, Media, Git, Keyboard };
@@ -308,11 +313,14 @@ struct Notification {
 // `active` mirrors org-mode clocking: true when an open (unterminated) CLOCK
 // line sits in this headline's :LOGBOOK: drawer. `clock_start` is that open
 // CLOCK line's timestamp (0 when inactive), used to render a running timer.
+// `body` is the raw text between the headline and the next one (drawer,
+// clock lines, notes) -- what the todo picker's preview pane summarizes.
 struct TodoItem {
   std::string text;
   std::size_t line = 0;
   bool active = false;
   std::time_t clock_start = 0;
+  std::vector<std::string> body;
 };
 
 struct AgentStatus {
@@ -417,6 +425,7 @@ class X11Backend final : public Backend {
     if (launcher_pixmap_) XFreePixmap(display_, launcher_pixmap_);
     if (wallpaper_preview_pixmap_) XFreePixmap(display_, wallpaper_preview_pixmap_);
     if (theme_preview_pixmap_) XFreePixmap(display_, theme_preview_pixmap_);
+    if (todo_preview_pixmap_) XFreePixmap(display_, todo_preview_pixmap_);
     for (const DockWindows& dock : docks_) {
       if (dock.left_buffer) XFreePixmap(display_, dock.left_buffer);
       if (dock.bottom_buffer) XFreePixmap(display_, dock.bottom_buffer);
@@ -1562,7 +1571,11 @@ class X11Backend final : public Backend {
     for (const TrayIcon& icon : tray_icons_) {
       if (!icon.mapped) { XUnmapWindow(display_, icon.window); continue; }
       XMoveResizeWindow(display_, icon.window, x, (kBarHeight - icon.height) / 2, icon.width, icon.height);
-      XMapRaised(display_, icon.window);
+      // Plain map, not XMapRaised: icons never overlap, and raising each one
+      // in turn restacks them whenever there are two or more, which sends a
+      // ConfigureNotify per icon back to us -- and that handler calls
+      // update_tray() again, an event storm that never settles.
+      XMapWindow(display_, icon.window);
       x += icon.width + kTraySpacing;
     }
     XMoveResizeWindow(display_, tray_, tray_widget_x_, 0, width, kBarHeight);
@@ -2384,7 +2397,11 @@ class X11Backend final : public Backend {
       if (!parse_org_headline(lines[line_number], "TODO", &keyword_start, &text_start)) continue;
       const auto clock_line = find_open_clock_line(lines, line_number);
       const std::time_t clock_start = clock_line ? parse_clock_start(lines[*clock_line]).value_or(0) : 0;
-      todos_.push_back({lines[line_number].substr(text_start), line_number, clock_line.has_value(), clock_start});
+      std::vector<std::string> body;
+      for (std::size_t scan = line_number + 1; scan < lines.size() && !is_org_headline(lines[scan]); ++scan)
+        body.push_back(lines[scan]);
+      todos_.push_back({lines[line_number].substr(text_start), line_number, clock_line.has_value(), clock_start,
+                        std::move(body)});
     }
     if (todo_selected_ >= static_cast<int>(todos_.size())) todo_selected_ = todos_.empty() ? -1 : static_cast<int>(todos_.size()) - 1;
   }
@@ -2501,7 +2518,8 @@ class X11Backend final : public Backend {
         {"Super+p", "Application picker"},
         {"Super+w", "Window switcher"},
         {"Super+f", "Element hints (click anything by typing its label)"},
-        {"Super+t", "Toggle todo list sidebar"},
+        {"Super+t", "Todo picker (fuzzy search with a notes/logbook preview; Enter clocks the todo in)"},
+        {"Super+Shift+t", "Toggle todo list sidebar"},
         {"Super+i", "Recent projects picker"},
         {"Super+u", "Active projects picker"},
         {"Super+o", "Focus the other monitor"},
@@ -2532,7 +2550,7 @@ class X11Backend final : public Backend {
         {"Super+Shift+1..9", "Send focused window to workspace"},
         {"Super+r", "Reload config"},
         {"Super+Shift+r", "Restart mepwm"},
-        {"Super+Shift+t", "Theme picker"},
+        {"Super+Shift+u", "Theme picker"},
         {"Super+Shift+w", "Wallpaper picker (fuzzy search with a live image preview)"},
         {"Super+Shift+slash", "Toggle this help panel"},
         {"?", "In Notifications/Todos/Agents/Info: toggle that panel's contextual help (Esc closes it)"},
@@ -2905,7 +2923,10 @@ class X11Backend final : public Backend {
       if (length > 0) draw_side_panel();
       return;
     }
-    if (key == XK_Escape || (state == Mod4Mask && key == XK_t)) { close_side_panel(); return; }
+    if (key == XK_Escape || (state == (Mod4Mask | ShiftMask) && key == XK_t)) { close_side_panel(); return; }
+    // The sidebar holds the keyboard grab, so the picker's global binding
+    // would never reach handle_key while it is open: hand over directly.
+    if (state == Mod4Mask && key == XK_t) { close_side_panel(); toggle_todo_picker(); return; }
     if (key == XK_question) { side_panel_help_visible_ = !side_panel_help_visible_; draw_side_panel(); return; }
     if (side_panel_help_visible_) return;
     if (state == 0 && key == XK_a) { todo_input_active_ = true; todo_input_text_.clear(); draw_side_panel(); return; }
@@ -4436,6 +4457,24 @@ class X11Backend final : public Backend {
       launcher_scroll_ = 0;
       return;
     }
+    if (launcher_mode_ == LauncherMode::Todos) {
+      std::vector<std::pair<int, std::size_t>> matches;
+      for (std::size_t index = 0; index < todos_.size(); ++index) {
+        const int score = fuzzy_score(launcher_query_, todos_[index].text);
+        if (score >= 0) matches.emplace_back(score, index);
+      }
+      if (!launcher_query_.empty()) {
+        std::sort(matches.begin(), matches.end(), [&](const auto& left, const auto& right) {
+          return left.first != right.first ? left.first > right.first
+                                           : todos_[left.second].text < todos_[right.second].text;
+        });
+      }
+      todo_matches_.clear();
+      for (const auto& match : matches) todo_matches_.push_back(match.second);
+      launcher_selection_ = 0;
+      launcher_scroll_ = 0;
+      return;
+    }
     if (launcher_mode_ == LauncherMode::Themes) {
       std::vector<std::pair<int, std::size_t>> matches;
       for (std::size_t index = 0; index < theme_names_.size(); ++index) {
@@ -4527,6 +4566,7 @@ class X11Backend final : public Backend {
                       : launcher_mode_ == LauncherMode::Windows ? "Window: "
                       : launcher_mode_ == LauncherMode::Themes ? "Theme: "
                       : launcher_mode_ == LauncherMode::Wallpapers ? "Wallpaper: "
+                      : launcher_mode_ == LauncherMode::Todos ? "Todo: "
                       : launcher_mode_ == LauncherMode::Projects ? "Projects: " : "Active projects: ";
     draw_launcher_text(10, (kBarHeight + bar_font_->ascent - bar_font_->descent) / 2,
                        std::string(title) + launcher_query_, bar_foreground_);
@@ -4540,6 +4580,8 @@ class X11Backend final : public Backend {
                              ? "No matching themes"
                          : launcher_mode_ == LauncherMode::Wallpapers
                              ? (wallpaper_paths_.empty() ? "No wallpapers found" : "No matching wallpapers")
+                         : launcher_mode_ == LauncherMode::Todos
+                             ? (todos_.empty() ? "No pending TODO items" : "No matching todos")
                              : "No matching projects", bar_foreground_);
     }
     // Theme rows get an accent-color swatch at the right edge so ~15 themes
@@ -4565,6 +4607,15 @@ class X11Backend final : public Backend {
       } else if (launcher_mode_ == LauncherMode::Wallpapers) {
         const std::string& path = wallpaper_paths_[wallpaper_matches_[launcher_scroll_ + row]];
         label = (path == current_wallpaper_path_ ? "* " : "  ") + wallpaper_label(path);
+      } else if (launcher_mode_ == LauncherMode::Todos) {
+        // Same [ ]/[*] rows as the sidebar, plus the pill's red/green dot so
+        // the clocked-in todo stands out while scanning the list.
+        const TodoItem& todo = todos_[todo_matches_[launcher_scroll_ + row]];
+        // Todo text can run much longer than any other picker's rows: cut
+        // it with an ellipsis before it reaches the dot.
+        const std::vector<std::string> fitted = wrap_lines(todo_row_text(todo), width - 10 - 48, 1);
+        label = fitted.empty() ? std::string() : fitted.front();
+        swatch_pixel = todo.active ? todo_active_pixel_ : todo_inactive_pixel_;
       } else {
         label = project_label(projects_[project_matches_[launcher_scroll_ + row]].path);
       }
@@ -4579,6 +4630,7 @@ class X11Backend final : public Backend {
     XFlush(display_);
     draw_wallpaper_preview(x, width, y, height);
     draw_theme_preview(x, width, y, height);
+    draw_todo_preview(x, width, y, height);
   }
 
   void close_launcher() {
@@ -4596,6 +4648,7 @@ class X11Backend final : public Backend {
     XUnmapWindow(display_, launcher_window_);
     if (wallpaper_preview_window_ != None) XUnmapWindow(display_, wallpaper_preview_window_);
     if (theme_preview_window_ != None) XUnmapWindow(display_, theme_preview_window_);
+    if (todo_preview_window_ != None) XUnmapWindow(display_, todo_preview_window_);
   }
 
   // Renders (or hides, outside wallpaper mode) the fzf/Telescope-style
@@ -4724,6 +4777,109 @@ class X11Backend final : public Backend {
     XFlush(display_);
   }
 
+  // Renders (or hides, outside todo mode) a text preview beside the launcher
+  // list for the highlighted todo: its headline, clock status, any notes
+  // written under it, and its :LOGBOOK: boiled down to entry count / total
+  // time / last clock-out followed by the individual clock lines (see
+  // core/org_todo.hpp). Unlike the image and palette panes this one grows
+  // with its content -- down to the bottom bar at most -- since a
+  // long-lived todo can carry dozens of clock entries.
+  void draw_todo_preview(int launcher_x, int launcher_width, int y, int height) {
+    if (launcher_mode_ != LauncherMode::Todos) {
+      if (todo_preview_window_ != None) XUnmapWindow(display_, todo_preview_window_);
+      return;
+    }
+    const Monitor& target_monitor = monitor(current_monitor_);
+    const int preview_x = launcher_x + launcher_width + kPickerPreviewGap;
+    // Wide enough to reach the right dock, so stop short of it (the
+    // narrower image/palette panes never get that far).
+    const int right_edge = target_monitor.x + target_monitor.width - (bars_visible_ ? kDockWidth : 0) - 10;
+    const int available = right_edge - preview_x;
+    if (available < 160) {
+      if (todo_preview_window_ != None) XUnmapWindow(display_, todo_preview_window_);
+      return;
+    }
+    const int width = std::min(kTodoPreviewWidth, available);
+    const int margin = 14;
+    const int line_height = bar_font_->ascent + bar_font_->descent + 4;
+    const int text_max = width - 2 * margin;
+
+    // Lay the text out first so the pane can size itself to it. Kind: 0 =
+    // plain, 1 = accent (headline and section headings), 2 = the clock
+    // status line, which gets the pill's red/green dot in front.
+    struct PreviewLine {
+      std::string text;
+      int kind = 0;
+    };
+    std::vector<PreviewLine> lines;
+    if (todo_matches_.empty()) {
+      lines.push_back({todos_.empty() ? "No pending TODO items" : "No matching todos", 0});
+    } else {
+      const TodoItem& todo = todos_[todo_matches_[launcher_selection_]];
+      const core::TodoPreview preview = core::build_todo_preview(todo.text, todo.body, std::time(nullptr));
+      for (const std::string& line : wrap_lines(preview.title, text_max, 3)) lines.push_back({line, 1});
+      for (const std::string& line : wrap_lines(preview.status, text_max - 18, 1)) lines.push_back({line, 2});
+      if (!preview.notes.empty()) {
+        lines.push_back({"", 0});
+        lines.push_back({"Notes", 1});
+        for (const std::string& note : preview.notes) {
+          if (note.empty()) { lines.push_back({"", 0}); continue; }
+          for (const std::string& line : wrap_lines(note, text_max, 2)) lines.push_back({line, 0});
+        }
+      }
+      lines.push_back({"", 0});
+      lines.push_back({"Logbook", 1});
+      for (const std::string& line : wrap_lines(preview.summary.substr(std::string("Logbook: ").size()), text_max, 2))
+        lines.push_back({line, 0});
+      for (const std::string& clock : preview.clocks)
+        for (const std::string& line : wrap_lines(clock, text_max, 2)) lines.push_back({line, 0});
+    }
+    // Never past the bottom bar: trim to what fits and mark the cut.
+    const int max_height = std::max(height, target_monitor.y + target_monitor.height - kBarHeight - 10 - y);
+    const std::size_t capacity = static_cast<std::size_t>(std::max(1, (max_height - 2 * margin) / line_height));
+    if (lines.size() > capacity) {
+      lines.resize(capacity);
+      lines.back() = {"…", 0};
+    }
+    const int pane_height = std::max(height, static_cast<int>(lines.size()) * line_height + 2 * margin);
+
+    if (todo_preview_window_ == None) {
+      XSetWindowAttributes attributes{};
+      attributes.override_redirect = True;
+      attributes.background_pixel = bar_background_.pixel;
+      attributes.border_pixel = bar_selected_.pixel;
+      attributes.event_mask = ExposureMask;
+      todo_preview_window_ = XCreateWindow(display_, root_, 0, 0, width, pane_height, 1, DefaultDepth(display_, screen_),
+                                           CopyFromParent, DefaultVisual(display_, screen_),
+                                           CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWEventMask, &attributes);
+      XStoreName(display_, todo_preview_window_, "mepwm-todo-preview");
+      XDefineCursor(display_, todo_preview_window_, cursor_);
+    }
+    XMoveResizeWindow(display_, todo_preview_window_, preview_x, y, width, pane_height);
+    if (todo_preview_pixmap_) XFreePixmap(display_, todo_preview_pixmap_);
+    todo_preview_pixmap_ = XCreatePixmap(display_, todo_preview_window_, width, pane_height, DefaultDepth(display_, screen_));
+    XSetForeground(display_, bar_gc_, bar_background_.pixel);
+    XFillRectangle(display_, todo_preview_pixmap_, bar_gc_, 0, 0, width, pane_height);
+    int cursor_y = margin;
+    for (const PreviewLine& line : lines) {
+      const int baseline = cursor_y + (line_height + bar_font_->ascent - bar_font_->descent) / 2;
+      int text_x = margin;
+      if (line.kind == 2) {
+        const bool active = !todo_matches_.empty() && todos_[todo_matches_[launcher_selection_]].active;
+        const int dot = 10;
+        XSetForeground(display_, bar_gc_, active ? todo_active_pixel_ : todo_inactive_pixel_);
+        XFillArc(display_, todo_preview_pixmap_, bar_gc_, margin, cursor_y + (line_height - dot) / 2, dot, dot, 0, 360 * 64);
+        text_x += dot + 8;
+      }
+      if (!line.text.empty())
+        draw_dock_text(todo_preview_pixmap_, text_x, baseline, line.text, line.kind == 1 ? bar_selected_ : bar_foreground_);
+      cursor_y += line_height;
+    }
+    XCopyArea(display_, todo_preview_pixmap_, todo_preview_window_, bar_gc_, 0, 0, width, pane_height, 0, 0);
+    XMapRaised(display_, todo_preview_window_);
+    XFlush(display_);
+  }
+
   // Applies the theme under the highlighted row so the picker previews
   // live as the selection changes; committed on Enter, reverted on cancel
   // (see launch_selected_app() and close_launcher()).
@@ -4738,6 +4894,7 @@ class X11Backend final : public Backend {
     if (mode == LauncherMode::Applications) scan_launcher_apps();
     if (mode == LauncherMode::Windows) scan_windows();
     if (mode == LauncherMode::Wallpapers) scan_wallpapers();
+    if (mode == LauncherMode::Todos) load_todos();
     if (mode == LauncherMode::Themes) theme_preview_saved_index_ = theme_index_;
     launcher_query_.clear();
     filter_launcher_apps();
@@ -4868,11 +5025,21 @@ class X11Backend final : public Backend {
     open_launcher(LauncherMode::Wallpapers);
   }
 
+  // Fuzzy picker over the active project's pending todos (Super+t). Enter
+  // clocks the highlighted todo in -- the sidebar (Super+Shift+t) keeps the
+  // add/done/edit actions; this is the fast "start working on X" path.
+  void toggle_todo_picker() {
+    if (launcher_visible_ && launcher_mode_ == LauncherMode::Todos) { close_launcher(); return; }
+    if (launcher_visible_) close_launcher();
+    open_launcher(LauncherMode::Todos);
+  }
+
   std::size_t launcher_match_count() const {
     return launcher_mode_ == LauncherMode::Applications ? launcher_matches_.size()
          : launcher_mode_ == LauncherMode::Windows ? window_matches_.size()
          : launcher_mode_ == LauncherMode::Themes ? theme_matches_.size()
          : launcher_mode_ == LauncherMode::Wallpapers ? wallpaper_matches_.size()
+         : launcher_mode_ == LauncherMode::Todos ? todo_matches_.size()
                                                     : project_matches_.size();
   }
 
@@ -4915,6 +5082,26 @@ class X11Backend final : public Backend {
       wallpaper_is_light_ = theme_is_light();
       close_launcher();
       apply_wallpaper();
+      return;
+    }
+    if (launcher_mode_ == LauncherMode::Todos) {
+      if (todo_matches_.empty()) return;
+      const TodoItem chosen = todos_[todo_matches_[launcher_selection_]];
+      close_launcher();
+      // org-clock-in semantics: at most one running clock, so any other
+      // active todo is clocked out first; picking the already-running todo
+      // leaves its clock untouched rather than restarting it.
+      if (!chosen.active) {
+        const auto running = std::find_if(todos_.begin(), todos_.end(), [](const TodoItem& todo) { return todo.active; });
+        if (running != todos_.end()) stop_todo_clock(*running);
+        start_todo_clock(chosen);
+      }
+      load_todos();
+      if (side_panel_ == SidePanel::Todos) {
+        ensure_todo_selection_visible();
+        draw_side_panel();
+      }
+      draw_docks();
       return;
     }
     if (launcher_mode_ != LauncherMode::Applications) {
@@ -5003,8 +5190,8 @@ class X11Backend final : public Backend {
                                  XK_a, XK_z, XK_m, XK_r, XK_minus, XK_comma, XK_period, XK_1, XK_2, XK_3,
                                  XK_4, XK_5, XK_6, XK_7, XK_8, XK_9, XK_w, XK_b, XK_d, XK_f, XK_t};
     const KeySym shift_keys[] = {XK_q, XK_space, XK_c, XK_minus, XK_comma, XK_period, XK_h, XK_j, XK_k, XK_l,
-                                 XK_r, XK_d, XK_t, XK_w, XK_slash, XK_Tab, XK_o, XK_1, XK_2, XK_3, XK_4, XK_5,
-                                 XK_6, XK_7, XK_8, XK_9};
+                                 XK_r, XK_d, XK_t, XK_u, XK_w, XK_slash, XK_Tab, XK_o, XK_1, XK_2, XK_3, XK_4,
+                                 XK_5, XK_6, XK_7, XK_8, XK_9};
     const KeySym ctrl_keys[] = {XK_h, XK_j, XK_k, XK_l};
     for (const unsigned int ignored : ignored_modifiers) {
       for (const KeySym key : plain_keys) {
@@ -6694,16 +6881,22 @@ class X11Backend final : public Backend {
         break;
       case ConfigureNotify:
         if (is_tray_icon(event.xconfigure.window)) {
+          // Only re-lay out when the icon's size actually changed: our own
+          // update_tray() moves icons too, and reacting to those echoes
+          // would feed the layout back into itself.
+          bool changed = false;
           for (TrayIcon& icon : tray_icons_) {
             if (icon.window != event.xconfigure.window) continue;
-            icon.width = std::clamp(event.xconfigure.height > 0
-                                        ? event.xconfigure.width * kBarHeight / event.xconfigure.height
-                                        : kBarHeight,
-                                    1, kBarHeight * 2);
+            const int width = std::clamp(event.xconfigure.height > 0
+                                             ? event.xconfigure.width * kBarHeight / event.xconfigure.height
+                                             : kBarHeight,
+                                         1, kBarHeight * 2);
+            changed = width != icon.width || icon.height != kBarHeight;
+            icon.width = width;
             icon.height = kBarHeight;
             break;
           }
-          update_tray();
+          if (changed) update_tray();
           break;
         }
         if (event.xconfigure.window == root_) {
@@ -6762,7 +6955,8 @@ class X11Backend final : public Backend {
       if (key == XK_Tab) next_tab(-1);
       if (key == XK_r) restart();
       if (key == XK_d) adjust_nmaster(1);
-      if (key == XK_t) toggle_theme_picker();
+      if (key == XK_t) toggle_side_panel(SidePanel::Todos);
+      if (key == XK_u) toggle_theme_picker();
       if (key == XK_w) toggle_wallpaper_picker();
       if (key == XK_slash) toggle_side_panel(SidePanel::Help);
       if (key >= XK_1 && key <= XK_9) send_to_workspace(workspace().focused, static_cast<int>(key - XK_1));
@@ -6787,7 +6981,7 @@ class X11Backend final : public Backend {
     if (key == XK_p) toggle_launcher();
     if (key == XK_w) open_window_switcher();
     if (key == XK_f) toggle_hints();
-    if (key == XK_t) toggle_side_panel(SidePanel::Todos);
+    if (key == XK_t) toggle_todo_picker();
     if (key == XK_b) toggle_bar();
     if (key == XK_d) { if (workspace().mode == LayoutMode::Manual) merge_pane(); else adjust_nmaster(-1); }
     if (key == XK_h || key == XK_j || key == XK_k || key == XK_l) {
@@ -6987,10 +7181,13 @@ class X11Backend final : public Backend {
   std::vector<std::size_t> theme_matches_;
   std::vector<std::string> wallpaper_paths_;
   std::vector<std::size_t> wallpaper_matches_;
+  std::vector<std::size_t> todo_matches_;
   Window wallpaper_preview_window_ = None;
   Pixmap wallpaper_preview_pixmap_ = None;
   Window theme_preview_window_ = None;
   Pixmap theme_preview_pixmap_ = None;
+  Window todo_preview_window_ = None;
+  Pixmap todo_preview_pixmap_ = None;
   std::size_t launcher_selection_ = 0;
   std::size_t launcher_scroll_ = 0;
   XftFont* bar_font_ = nullptr;

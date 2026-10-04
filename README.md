@@ -130,10 +130,12 @@ installed (mepwm picks the first installed "* Nerd Font" family
 automatically; override with `MEPWM_ICON_FONT="JetBrainsMono Nerd Font"` or
 disable icons with `MEPWM_ICON_FONT=none`). Without one, widgets fall back
 to text labels.
-`Mod+t` toggles a todo sidebar (reads `MEPWM_TODO_FILE`, else
-`TODO.org` in the launch directory, else `~/TODO.org`), `Mod+Shift+t` opens
-the theme picker (live preview while the highlight moves; Enter commits,
-Escape reverts), and `Mod+Shift+/` toggles a keybinding help sidebar. The wifi widget shows just "on" unless
+`Mod+t` opens the todo picker (a fuzzy list of the pending todos in
+`MEPWM_TODO_FILE`, else `TODO.org` in the launch directory, else
+`~/TODO.org`; Enter clocks the highlighted one in), `Mod+Shift+t` toggles
+the todo sidebar over the same file, `Mod+Shift+u` opens the theme picker
+(live preview while the highlight moves; Enter commits, Escape reverts),
+and `Mod+Shift+/` toggles a keybinding help sidebar. The wifi widget shows just "on" unless
 mepwm has the Location permission (macOS gates SSIDs behind it). The `gap`
 setting pads the tiled windows, and each managed window gets a border ring
 in the gap (`border_color_focused` highlights the focused window). Set
@@ -289,6 +291,18 @@ sits at the bottom of each of these panels. This replaces those panels'
 instructions being shown inline all the time; the full window-manager
 keybinding list is still its own panel via `Super+Shift+/`.
 
+The Todos panel (`Super+Shift+t`) reads the active project's `TODO.org`:
+`a` adds a headline, `d` marks one DONE, `s` clocks it in or out (org-mode
+`CLOCK:` lines in a `:LOGBOOK:` drawer, so the file stays usable in Emacs),
+and `e` opens the file in `$EDITOR`. `Super+t` opens the todo picker
+instead -- the same fuzzy popup as the application and project pickers,
+with a preview pane beside the list that shows the highlighted todo's notes
+and its logbook (entry count, total time, last clock-out, then each clock
+line). Enter clocks that todo in, clocking out whichever one was running
+first, so picking what to work on next is a few letters and a keystroke;
+the red/green pill at the bottom-left shows the running todo and its
+elapsed time.
+
 The built-in widget glyphs use `UbuntuMono Nerd Font Mono`, matching MWM;
 install the Ubuntu Mono Nerd Font for those icons to render.
 
@@ -311,7 +325,7 @@ MEPWM ships 15 built-in themes, 8 dark and 7 light: `dark`, `nord`,
 `everforest-dark`, `light`, `solarized-light`, `gruvbox-light`,
 `catppuccin-latte`, `rose-pine-dawn`, `everforest-light`, and `nord-light`.
 Left/scroll-click the bottom-bar theme widget to cycle through them, or
-middle-click it (or press `Super+Shift+t`) to open the theme picker -- a
+middle-click it (or press `Super+Shift+u`) to open the theme picker -- a
 fuzzy-searchable popup, the same kind used for the application and project
 pickers, listing every theme with an accent-color swatch and letting you
 type to filter or press Enter/click to select one directly. A theme is a

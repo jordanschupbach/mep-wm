@@ -42,7 +42,7 @@ class TilingEngine final : public Backend {
   };
   enum class PomodoroPhase { Idle, Work, Break };
   // Which list picker is waiting for a PickerSelected event.
-  enum class PendingPicker { None, Projects, ActiveProjects, Themes, Wallpapers };
+  enum class PendingPicker { None, Projects, ActiveProjects, Themes, Wallpapers, Todos };
 
   static constexpr std::size_t kWorkspaceCount = 9;
 
@@ -71,12 +71,15 @@ class TilingEngine final : public Backend {
 
   // One pending "* TODO" headline from the project's TODO.org (X11 parity):
   // `line` is the 0-based line it was parsed from so it can be rewritten in
-  // place, `active` mirrors an open org CLOCK line in its body.
+  // place, `active` mirrors an open org CLOCK line in its body, and `body`
+  // is that body verbatim (drawer, clock lines, notes) for the picker's
+  // preview.
   struct TodoItem {
     std::string text;
     std::size_t line = 0;
     bool active = false;
     std::time_t clock_start = 0;
+    std::vector<std::string> body;
   };
 
   void handle_event(const Event& event);
@@ -159,8 +162,11 @@ class TilingEngine final : public Backend {
   // the bottom-right corner (the AeroSpace technique).
   void park_window(WindowId window);
 
-  // Todo sidebar (project-centric TODO.org, X11 parity).
+  // Todo sidebar and picker (project-centric TODO.org, X11 parity). The
+  // picker lists pending todos with a notes/logbook preview; choosing one
+  // clocks it in.
   std::string todo_path() const;
+  void open_todo_picker();
   void load_todos();
   void mark_todo_done(const TodoItem& item);
   void add_todo(const std::string& text);

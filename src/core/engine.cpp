@@ -2,6 +2,7 @@
 
 #include "core/icons.hpp"
 #include "core/mep_theme.hpp"
+#include "core/org_todo.hpp"
 #include "core/terminal_theme.hpp"
 #include "core/theme_palette.hpp"
 
@@ -62,10 +63,11 @@ const std::vector<Binding>& default_bindings() {
         {{kModPrimary, Key::R}, Action::Retile},
         {{kModPrimary, Key::Return}, Action::SpawnTerminal},
         {{kModPrimary | kModShift, Key::Slash}, Action::ToggleHelpPanel},
-        {{kModPrimary, Key::T}, Action::ToggleTodoPanel},
+        {{kModPrimary, Key::T}, Action::OpenTodoPicker},               // matches X11's Super+t
+        {{kModPrimary | kModShift, Key::T}, Action::ToggleTodoPanel},  // matches X11's Super+Shift+t
         {{kModPrimary, Key::F}, Action::ToggleHints},  // matches X11's Super+f
         {{kModPrimary, Key::B}, Action::ToggleBars},   // matches X11's Super+b
-        {{kModPrimary | kModShift, Key::T}, Action::OpenThemePicker},
+        {{kModPrimary | kModShift, Key::U}, Action::OpenThemePicker},  // matches X11's Super+Shift+u
         {{kModPrimary | kModShift, Key::W}, Action::OpenWallpaperPicker},  // matches X11's Super+Shift+w
         {{kModPrimary | kModShift, Key::Q}, Action::Quit},
     };
@@ -659,6 +661,9 @@ void TilingEngine::handle_event(const Event& event) {
         case Action::OpenWallpaperPicker:
           open_wallpaper_picker();
           break;
+        case Action::OpenTodoPicker:
+          open_todo_picker();
+          break;
         case Action::ToggleHelpPanel:
           toggle_side_panel(PanelKind::Help);
           break;
@@ -941,7 +946,7 @@ void TilingEngine::open_project_picker(bool active_only) {
     if (active_only && !project_has_windows(index)) continue;
     std::string label = projects_[index].path;
     if (index == active_project_) label += "  (current)";
-    items.push_back({std::to_string(index), std::move(label)});
+    items.push_back({std::to_string(index), std::move(label), {}});
   }
   pending_picker_ = active_only ? PendingPicker::ActiveProjects : PendingPicker::Projects;
   platform_->show_list_picker(active_only ? "Active projects" : "Projects", items);
@@ -953,7 +958,7 @@ void TilingEngine::open_theme_picker() {
   for (std::size_t index = 0; index < list.size(); ++index) {
     std::string label = list[index].name;
     if (index == theme_index_) label += "  (current)";
-    items.push_back({std::to_string(index), std::move(label)});
+    items.push_back({std::to_string(index), std::move(label), {}});
   }
   pending_picker_ = PendingPicker::Themes;
   // Start highlighted on the committed theme so opening the picker doesn't
@@ -1062,7 +1067,7 @@ void TilingEngine::open_wallpaper_picker() {
   for (const std::string& path : paths) {
     std::string label = std::filesystem::path(path).filename().string();
     if (path == wallpaper_path_) label += "  (current)";
-    items.push_back({path, std::move(label)});
+    items.push_back({path, std::move(label), {}});
   }
   pending_picker_ = PendingPicker::Wallpapers;
   platform_->show_list_picker("Wallpaper", items, wallpaper_path_);
@@ -1102,6 +1107,25 @@ void TilingEngine::handle_picker_selected(const Event& event) {
   }
   if (pending == PendingPicker::Wallpapers) {
     if (!event.cell.empty()) apply_wallpaper(event.cell);
+    return;
+  }
+  if (pending == PendingPicker::Todos) {
+    if (event.cell.empty()) return;
+    const auto index = static_cast<std::size_t>(std::strtoull(event.cell.c_str(), nullptr, 10));
+    if (index >= todos_.size()) return;
+    // org-clock-in semantics: one running clock at a time, so any other
+    // active todo is clocked out first; picking the running todo leaves
+    // its clock alone rather than restarting it.
+    const TodoItem chosen = todos_[index];
+    if (!chosen.active) {
+      const auto running = std::find_if(todos_.begin(), todos_.end(),
+                                        [](const TodoItem& todo) { return todo.active; });
+      if (running != todos_.end()) stop_todo_clock(*running);
+      start_todo_clock(chosen);
+    }
+    load_todos();
+    if (side_panel_ == PanelKind::Todo) refresh_side_panel();
+    refresh_chrome();  // the active-TODO pill
     return;
   }
   // A typed, valid directory takes precedence over fuzzy matches (X11
@@ -1612,6 +1636,27 @@ void TilingEngine::handle_panel_key(const Event& event) {
 
 std::string TilingEngine::todo_path() const { return todo_file_path(active_project_path()); }
 
+// Fuzzy picker over the pending todos (X11 Super+t parity): rows read like
+// the sidebar's ("[*]" + running time for the clocked-in one), each carrying
+// a notes/logbook preview; Enter clocks the choice in (handle_picker_selected).
+void TilingEngine::open_todo_picker() {
+  if (pending_picker_ == PendingPicker::Themes) preview_theme(-1);
+  load_todos();
+  const std::time_t now = std::time(nullptr);
+  std::vector<PickerItem> items;
+  for (std::size_t index = 0; index < todos_.size(); ++index) {
+    const TodoItem& todo = todos_[index];
+    PickerItem item;
+    item.id = std::to_string(index);
+    item.label = todo.active ? "[*] " + todo.text + "  (" + format_elapsed(now - todo.clock_start) + ")"
+                             : "[ ] " + todo.text;
+    item.preview = flatten_todo_preview(build_todo_preview(todo.text, todo.body, now));
+    items.push_back(std::move(item));
+  }
+  pending_picker_ = PendingPicker::Todos;
+  platform_->show_list_picker("Todo", items);
+}
+
 // Parses org-mode headlines ("* TODO Buy milk"); only the plain TODO keyword
 // is a pending item, so DONE never shows up. A headline is "active" when its
 // body has an open CLOCK line, mirroring org-clock-in/out.
@@ -1625,7 +1670,12 @@ void TilingEngine::load_todos() {
     const auto clock_line = find_open_clock_line(lines, number);
     const std::time_t clock_start =
         clock_line ? parse_clock_start(lines[*clock_line]).value_or(0) : 0;
-    todos_.push_back({lines[number].substr(text_start), number, clock_line.has_value(), clock_start});
+    std::vector<std::string> body;
+    for (std::size_t scan = number + 1; scan < lines.size() && !is_org_headline(lines[scan]); ++scan) {
+      body.push_back(lines[scan]);
+    }
+    todos_.push_back({lines[number].substr(text_start), number, clock_line.has_value(), clock_start,
+                      std::move(body)});
   }
   if (todo_selected_ >= static_cast<int>(todos_.size())) {
     todo_selected_ = todos_.empty() ? -1 : static_cast<int>(todos_.size()) - 1;
@@ -1816,10 +1866,11 @@ void TilingEngine::refresh_side_panel() {
           {mod + " + enter            open terminal", false},
           {mod + " + 1..9             switch workspace", false},
           {mod + " + shift + 1..9     send window to workspace", false},
-          {mod + " + t                toggle todo sidebar", false},
+          {mod + " + t                todo picker (Enter clocks in)", false},
+          {mod + " + shift + t        toggle todo sidebar", false},
           {mod + " + f                click hints", false},
           {mod + " + b                toggle bars", false},
-          {mod + " + shift + t        theme picker", false},
+          {mod + " + shift + u        theme picker", false},
           {mod + " + shift + w        wallpaper picker", false},
           {mod + " + shift + /        toggle this help", false},
           {mod + " + shift + q        quit mepwm", false},

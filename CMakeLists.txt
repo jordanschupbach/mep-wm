@@ -80,6 +80,7 @@ set(MEPWM_SOURCES
   src/core/mep_theme.cpp
   src/core/terminal_theme.cpp
   src/core/theme_palette.cpp
+  src/core/org_todo.cpp
   src/wayland/wayland_backend.cpp
 )
 

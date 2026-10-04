@@ -367,7 +367,7 @@ void scan_app_directory(const std::filesystem::path& directory, int depth,
   for (const auto& entry : std::filesystem::directory_iterator(directory, error)) {
     const std::filesystem::path& path = entry.path();
     if (path.extension() == ".app") {
-      apps.push_back({path.string(), path.stem().string()});
+      apps.push_back({path.string(), path.stem().string(), {}});
     } else if (depth > 0 && entry.is_directory(error)) {
       // One level of subfolders covers /Applications/Utilities and the
       // folders installers create, without walking inside bundles.
@@ -551,6 +551,7 @@ UInt32 carbon_key_code(core::Key key) {
     case core::Key::R: return kVK_ANSI_R;
     case core::Key::S: return kVK_ANSI_S;
     case core::Key::T: return kVK_ANSI_T;
+    case core::Key::U: return kVK_ANSI_U;
     case core::Key::V: return kVK_ANSI_V;
     case core::Key::W: return kVK_ANSI_W;
     case core::Key::Return: return kVK_Return;

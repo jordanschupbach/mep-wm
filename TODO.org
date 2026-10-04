@@ -4,8 +4,11 @@
 :LOGBOOK:
 CLOCK: [2026-08-08 Sat 14:28]
 :END:
+* TODO Improve todo sidebar to be a picker, w preview
+* TODO Sync taskwarrior tasks with org mode tasks on read and change?
 * TODO Improve wifi widget
 * TODO Add pin binding (mod+shift+p) to maximize current window
+* TODO Add pin workspace to screen mode (w/ picker?)
 * TODO Add floating binding (mod+shift+f) to toggle floating for current window
 * TODO Add resizing behaviour for floating windows (mod+shift+h,j,k,l keys)
 * TODO Add moving behaviour for floating windows (mod+alt+h,j,k,l keys)
