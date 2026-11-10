@@ -306,6 +306,13 @@ class Platform {
   // it input focus (used to keep a pane's active tab on top).
   virtual void raise_window(WindowId window) = 0;
 
+  // Takes a window of an inactive workspace off screen by hiding it.
+  // Platforms that can't (the default) return false, and the engine parks
+  // the window in the screen corner instead (the AeroSpace technique). A
+  // hidden window must keep appearing in list_windows(), and the next
+  // set_window_frame() or focus_window() on it shows it again.
+  virtual bool hide_window(WindowId /*window*/) { return false; }
+
   // Returns false when the hotkey could not be bound (already taken, ...).
   // `argument` is echoed back in the ActionTriggered event (e.g. the
   // workspace number).

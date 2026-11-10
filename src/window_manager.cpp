@@ -42,8 +42,12 @@ int WindowManager::run(BackendKind backend_kind) {
 #endif
       break;
     case BackendKind::Windows:
-      throw std::runtime_error(
-          "the windows backend is not implemented yet (see docs/PORTING.md, phase 4)");
+#ifdef MEPWM_WITH_WINDOWS
+      backend = make_windows_backend();
+#else
+      throw std::runtime_error("the windows backend is only available on Windows");
+#endif
+      break;
   }
   return backend->run(implementation_->config);
 }

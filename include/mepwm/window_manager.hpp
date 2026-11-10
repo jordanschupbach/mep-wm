@@ -17,7 +17,11 @@ struct Config {
   // already running; a bare `open -a Terminal` would only activate it.
   std::string terminal = "open -a kitty ~ || open -a iTerm ~ || open -a Terminal ~";
 #elif defined(_WIN32)
-  std::string terminal = "start cmd";
+  // Run by `cmd.exe /c`. Windows Terminal when installed (-d . opens it in
+  // the working directory, which spawn_terminal_in sets per project),
+  // otherwise a plain console.
+  std::string terminal =
+      "where wt >nul 2>nul && (start \"\" wt -d .) || (start \"\" cmd)";
 #else
   std::string terminal = "command -v kitty >/dev/null 2>&1 && exec kitty || exec xterm";
 #endif
@@ -30,6 +34,11 @@ struct Config {
   // Super.
 #if defined(__APPLE__)
   std::string modifier = "fn+cmd";
+#elif defined(_WIN32)
+  // Alt, not Win: Windows reserves Win+L (lock) below any hook, so the
+  // Super layout would lose focus-right, and most other Win+letter chords
+  // are shell shortcuts. "super"/"win" still works for everything else.
+  std::string modifier = "alt";
 #else
   std::string modifier = "super";
 #endif

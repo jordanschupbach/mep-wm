@@ -1,26 +1,61 @@
 # Linux source list; on macOS the X11/Wayland files are not in the compile
 # database, so lint there with: just lint "src/window_manager.cpp src/core/*.cpp src/main.cpp src/mep_wm_cli.cpp"
+# Windows runs recipes under PowerShell (no sh needed); the [windows]
+# variants below mirror the unix ones.
+set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
+
 mepwm_sources := "src/x11/x11_backend.cpp src/window_manager.cpp src/wayland/wayland_backend.cpp src/wayland/wayland_backend.c src/core/geometry.cpp src/core/layout.cpp src/core/engine.cpp src/core/mep_theme.cpp src/core/terminal_theme.cpp src/core/theme_palette.cpp src/core/org_todo.cpp src/main.cpp src/mep_wm_cli.cpp"
 
+[unix]
 build:
   cmake -S . -B build
   cmake --build build
 
+# Windows: MSVC (Visual Studio or its Build Tools, "Desktop development
+# with C++") via CMake's default Visual Studio generator. A separate build
+# dir keeps it from colliding with a Linux/macOS `build` cache.
+[windows]
+build:
+  cmake -S . -B build-windows
+  cmake --build build-windows --config Release
+
+[unix]
 run: build
   ./build/mepwm
+
+[windows]
+run: build
+  & .\build-windows\Release\mepwm.exe
 
 # Install mepwm, mep-wm-cli, and the wallpaper assets. Defaults to ~/.local
 # (no sudo needed); pass another prefix with e.g. `just install /usr/local`
 # (run under sudo for system prefixes). On macOS this also puts MEP-wm.app
 # in ~/Applications so Spotlight finds it.
+[unix]
 install prefix=(env_var('HOME') + "/.local"): build
   cmake --install build --prefix "{{prefix}}"
   @if [ "$(uname)" = "Darwin" ]; then just install-app; fi
 
+# Windows: installs mepwm.exe (terminal) and MEP-wm.exe (no console) into
+# %USERPROFILE%\.local\bin plus the assets, adds that bin dir to the user
+# PATH, and adds a "MEP-wm" Start-menu entry. No admin rights needed.
+# A running mepwm is quit first (Windows locks running .exe files) and
+# restarted afterwards.
+[windows]
+install prefix=(env_var('USERPROFILE') + '\.local'): build
+  ./scripts/windows-install.ps1 pre-install "{{prefix}}"
+  cmake --install build-windows --config Release --prefix "{{prefix}}"
+  ./scripts/windows-install.ps1 install "{{prefix}}"
+
+[unix]
 uninstall prefix=(env_var('HOME') + "/.local"):
   rm -f "{{prefix}}/bin/mepwm" "{{prefix}}/bin/mep-wm-cli"
   rm -rf "{{prefix}}/share/mepwm"
   @if [ "$(uname)" = "Darwin" ]; then just uninstall-app; fi
+
+[windows]
+uninstall prefix=(env_var('USERPROFILE') + '\.local'):
+  ./scripts/windows-install.ps1 uninstall "{{prefix}}"
 
 # macOS: copy the MEP-wm.app bundle where Spotlight indexes it
 # (~/Applications; pass /Applications for all users, may need sudo). When
@@ -42,27 +77,61 @@ uninstall-app dest=(env_var('HOME') + "/Applications"):
 # installed binary -- starts now and at every login, restarts on crashes
 # (Mod+Shift+q stays exited). Logs to ~/Library/Logs/mepwm.log. The first
 # run prompts for the Accessibility permission.
+[unix]
 service-install prefix=(env_var('HOME') + "/.local"): (install prefix)
   ./scripts/macos-service.sh install "{{prefix}}/bin/mepwm"
 
 # macOS: stop the service and remove its LaunchAgent (keeps the binaries).
+[unix]
 service-uninstall:
   ./scripts/macos-service.sh uninstall
 
+[unix]
 service-start:
   ./scripts/macos-service.sh start
 
+[unix]
 service-stop:
   ./scripts/macos-service.sh stop
 
+[unix]
 service-restart:
   ./scripts/macos-service.sh restart
 
+[unix]
 service-status:
   ./scripts/macos-service.sh status
 
+[unix]
 service-log:
   tail -f ~/Library/Logs/mepwm.log
+
+# Windows: start MEP-wm at every sign-in (a Startup-folder shortcut) and
+# start it now. service-uninstall removes the shortcut (keeps the binaries).
+[windows]
+service-install prefix=(env_var('USERPROFILE') + '\.local'): (install prefix)
+  ./scripts/windows-install.ps1 service-install "{{prefix}}"
+
+[windows]
+service-uninstall prefix=(env_var('USERPROFILE') + '\.local'):
+  ./scripts/windows-install.ps1 service-uninstall "{{prefix}}"
+
+[windows]
+service-start prefix=(env_var('USERPROFILE') + '\.local'):
+  ./scripts/windows-install.ps1 start "{{prefix}}"
+
+[windows]
+service-stop prefix=(env_var('USERPROFILE') + '\.local'):
+  ./scripts/windows-install.ps1 stop "{{prefix}}"
+
+[windows]
+service-restart prefix=(env_var('USERPROFILE') + '\.local'):
+  ./scripts/windows-install.ps1 stop "{{prefix}}"
+  ./scripts/windows-install.ps1 start "{{prefix}}"
+
+[windows]
+service-status prefix=(env_var('USERPROFILE') + '\.local'):
+  ./scripts/windows-install.ps1 status "{{prefix}}"
 
 # Static analysis over mep-wm's own sources (checks/suppressions in
 # .clang-tidy; cppcheck reads compile_commands.json from `build`, which

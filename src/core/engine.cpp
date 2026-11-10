@@ -23,6 +23,16 @@ namespace mepwm::core {
 
 namespace {
 
+// Thread-safe localtime: POSIX localtime_r, MSVC localtime_s (which takes
+// its arguments in the opposite order and returns an errno).
+bool local_time(std::time_t time, std::tm* out) {
+#if defined(_WIN32)
+  return localtime_s(out, &time) == 0;
+#else
+  return localtime_r(&time, out) != nullptr;
+#endif
+}
+
 struct Binding {
   Hotkey hotkey;
   Action action;
@@ -269,7 +279,13 @@ bool normalize_project_path(const std::string& raw_path, std::string* normalized
   return true;
 }
 
+// Quotes one argument for the platform's spawn() shell: POSIX sh on
+// Linux/macOS, cmd.exe on Windows (where single quotes mean nothing and
+// paths cannot contain a double quote anyway).
 std::string shell_quote(const std::string& value) {
+#if defined(_WIN32)
+  return "\"" + value + "\"";
+#else
   std::string quoted = "'";
   for (const char character : value) {
     if (character == '\'') {
@@ -280,6 +296,7 @@ std::string shell_quote(const std::string& value) {
   }
   quoted += "'";
   return quoted;
+#endif
 }
 
 // TODO.org resolution for the todo sidebar, project-centric like X11:
@@ -345,7 +362,7 @@ bool is_org_headline(const std::string& line) {
 std::string org_timestamp(std::time_t time) {
   char buffer[32];
   std::tm local{};
-  if (localtime_r(&time, &local) == nullptr) return {};
+  if (!local_time(time, &local)) return {};
   std::strftime(buffer, sizeof buffer, "[%Y-%m-%d %a %H:%M]", &local);
   return buffer;
 }
@@ -398,7 +415,7 @@ std::optional<std::time_t> parse_clock_start(const std::string& clock_line) {
 std::string format_elapsed(std::time_t seconds) {
   seconds = std::max<std::time_t>(seconds, 0);
   if (seconds < 60) return std::to_string(seconds) + "s";
-  const long total_minutes = seconds / 60;
+  const long total_minutes = static_cast<long>(seconds / 60);
   if (total_minutes < 60) return std::to_string(total_minutes) + "m";
   char buffer[32];
   std::snprintf(buffer, sizeof buffer, "%ldh%02ldm", total_minutes / 60, total_minutes % 60);
@@ -431,6 +448,20 @@ constexpr LauncherApp kLauncherApps[] = {
     {icons::kEmacs, "emacs", "open -a Emacs"},
     {icons::kNeovim, "nvim", "open -a Neovide || open -a MacVim"},
 };
+#elif defined(_WIN32)
+// Commands run under `cmd.exe /c`: `start ""` resolves App Paths
+// registrations (firefox, inkscape, ...) the way the Run dialog does and
+// returns immediately.
+constexpr LauncherApp kLauncherApps[] = {
+    {icons::kFirefox, "ff", "start \"\" firefox"},
+    {icons::kTerminal, "term", ""},
+    {icons::kInkscape, "ink", "start \"\" inkscape"},
+    {icons::kGimp, "gimp", "start \"\" gimp"},
+    {icons::kLibreOffice, "odf", "start \"\" soffice"},
+    {icons::kVsCode, "code", "start \"\" code"},
+    {icons::kEmacs, "emacs", "start \"\" runemacs"},
+    {icons::kNeovim, "nvim", "start \"\" nvim-qt || start \"\" neovide"},
+};
 #else
 constexpr LauncherApp kLauncherApps[] = {
     {icons::kFirefox, "ff", "firefox"},
@@ -455,7 +486,7 @@ std::string clock_text() {
   char buffer[32];
   const std::time_t now = std::time(nullptr);
   std::tm local{};
-  if (localtime_r(&now, &local) == nullptr) return {};
+  if (!local_time(now, &local)) return {};
   if (std::strftime(buffer, sizeof buffer, "%a %H:%M", &local) == 0) return {};
   return buffer;
 }
@@ -745,7 +776,7 @@ void TilingEngine::notify(const std::string& text) {
   char stamp[8] = {0};
   const std::time_t now = std::time(nullptr);
   std::tm local{};
-  if (localtime_r(&now, &local) != nullptr) std::strftime(stamp, sizeof stamp, "%H:%M", &local);
+  if (local_time(now, &local)) std::strftime(stamp, sizeof stamp, "%H:%M", &local);
   notifications_.insert(notifications_.begin(), std::string(stamp) + "  " + text);
   if (notifications_.size() > 50) notifications_.resize(50);
 }
@@ -809,6 +840,9 @@ void TilingEngine::reconcile_windows() {
 void TilingEngine::park_window(WindowId window) {
   auto entry = windows_.find(window);
   if (entry == windows_.end()) return;
+  // Platforms that can hide windows outright (Windows) do; the corner
+  // trick below would leak parked windows onto a neighboring monitor.
+  if (platform_->hide_window(window)) return;
   const Rect full = platform_->work_area();
   Rect frame = entry->second.frame;
   // Bottom-right corner, almost entirely off the work area; macOS keeps a
@@ -979,6 +1013,11 @@ void TilingEngine::sync_theme_colors() {
 }
 
 void TilingEngine::sync_terminal_theme() const {
+#if defined(_WIN32)
+  // The terminal sync targets kitty's config and unix-socket remote
+  // control, neither of which exists on Windows.
+  return;
+#endif
   const ThemeDef& theme = themes()[effective_theme()];
   std::array<std::string, 16> ansi;
   std::copy(theme.ansi.begin(), theme.ansi.end(), ansi.begin());
@@ -1169,7 +1208,11 @@ void TilingEngine::spawn_terminal_in(const std::string& directory) {
     rewritten += token == "~" ? quoted : token;
   }
   if (rewritten.empty()) rewritten = config_.terminal;
+#if defined(_WIN32)
+  platform_->spawn("cd /d " + quoted + " && (" + rewritten + ")");
+#else
   platform_->spawn("cd " + quoted + " && (" + rewritten + ")");
+#endif
 }
 
 Rect TilingEngine::tiling_area() {
@@ -1744,7 +1787,7 @@ void TilingEngine::stop_todo_clock(const TodoItem& item) {
       lines[*clock_line].substr(open_bracket + 1, close_bracket - open_bracket - 1);
   const std::time_t start = parse_org_timestamp(start_text);
   const std::time_t end = std::time(nullptr);
-  const long minutes = std::max<long>(0, (end - start) / 60);
+  const long minutes = static_cast<long>(std::max<std::time_t>(0, (end - start) / 60));
   char duration[32];
   std::snprintf(duration, sizeof duration, "%ld:%02ld", minutes / 60, minutes % 60);
   lines[*clock_line] =
@@ -1784,7 +1827,13 @@ void TilingEngine::edit_todo_file() {
   const std::string quoted = shell_quote(path);
   // `open -t` hands the file to the system's default plain-text editor;
   // touch first so a missing TODO.org opens as a new empty file.
+#if defined(_WIN32)
+  // Create the file if missing (appending nothing), then open it in Notepad,
+  // which unlike the .org file association always exists.
+  platform_->spawn("type nul >> " + quoted + " & start \"\" notepad " + quoted);
+#else
   platform_->spawn("touch " + quoted + " && open -t " + quoted);
+#endif
 }
 
 void TilingEngine::toggle_pomodoro() {

@@ -24,5 +24,6 @@ class Backend {
 std::unique_ptr<Backend> make_x11_backend();
 std::unique_ptr<Backend> make_wayland_backend();
 std::unique_ptr<Backend> make_macos_backend();
+std::unique_ptr<Backend> make_windows_backend();
 
 }  // namespace mepwm

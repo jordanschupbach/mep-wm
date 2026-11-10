@@ -20,7 +20,7 @@ main.cpp
             └─ OverlayBackend    (src/core/engine.*)    shared overlay engine ...
                  └─ core::Platform (src/core/platform.hpp)   the bridge interface
                       ├─ MacosPlatform   (src/macos/)   AX API + Carbon hotkeys
-                      └─ WindowsPlatform (src/windows/) Win32 (future)
+                      └─ WindowsPlatform (src/windows/) Win32 + keyboard hook
 ```
 
 - **`src/core/`** — platform-agnostic building blocks:
@@ -36,7 +36,7 @@ main.cpp
   core layer and still contains its own copies of layout/model logic; see
   "X11 migration" below.
 - **`src/macos/`** — macOS `Platform` implementation (Objective-C++).
-- **`src/windows/`** — Windows `Platform` implementation (not started).
+- **`src/windows/`** — Windows `Platform` implementation (Win32, C++).
 
 ### Rules of thumb
 
@@ -52,7 +52,7 @@ main.cpp
 |----------|----------------|--------|
 | Linux    | x11 (+ wayland) | `MEPWM_ENABLE_X11`, `MEPWM_ENABLE_WAYLAND` |
 | macOS    | macos overlay   | `MEPWM_ENABLE_MACOS` |
-| Windows  | (planned)       | `MEPWM_ENABLE_WINDOWS` |
+| Windows  | windows overlay | `MEPWM_ENABLE_WINDOWS` (MSVC; `just build` uses `build-windows/`) |
 
 `nix develop` provides the toolchain on Linux and macOS; `nix build` produces
 an installable package on both. A native installer (Homebrew cask / .pkg on
@@ -121,10 +121,23 @@ Do this on Linux where the result can be compiled and run under Xephyr
       keep native-WM extras: borders, bar, docks, tray, EWMH)
 
 ### Phase 4 — Windows overlay backend
-- [ ] `WindowsPlatform` using Win32: `EnumWindows`/`SetWinEventHook` for
-      discovery, `SetWindowPos`/DWM for placement, `RegisterHotKey` for keys
-- [ ] Same `TilingEngine`; only mechanism code is new
-- [ ] Build via MSVC or clang-cl; CI cross-check
+- [x] `WindowsPlatform` using Win32: `EnumWindows` + `SetWinEventHook`
+      (re-poll triggers) for discovery, `SetWindowPos` with DWM invisible-
+      border compensation for placement, a `WH_KEYBOARD_LL` hook on its own
+      thread for hotkeys (Alt by default; `RegisterHotKey` can't take Win
+      chords and can't capture picker typing)
+- [x] Same `TilingEngine`; core changes were portability only (`localtime_s`,
+      cmd.exe quoting, Windows launcher commands) plus the optional
+      `Platform::hide_window` used for workspaces
+- [x] Chrome, borders, tab bars, side panels, pickers, click hints as
+      non-activating topmost GDI popups; widgets via Win32 (power, Core
+      Audio, WLAN, Bluetooth, keyboard layouts, theme registry, Spotify title)
+- [x] MSVC build (`/W4 /WX`), `just install` / `just service-install`
+      (`scripts/windows-install.ps1`), console `mepwm.exe` + GUI `MEP-wm.exe`
+- [ ] Run-verify on a machine without Smart App Control (the dev box blocks
+      unsigned local builds); then code signing for distribution
+- [ ] Multi-monitor, media title via WinRT `GlobalSystemMediaTransportControls`,
+      Wi-Fi network / Bluetooth device actions, CI cross-check
 
 ### Phase 5 — installers & distribution
 - [ ] `nix build` package output polished (both platforms) — done for basics
@@ -169,6 +182,10 @@ equivalent or skip.
 
 ## Status log
 
+- **2026-11-10** — Phase 4 implemented: `src/windows/windows_platform.cpp`,
+  MSVC build and `just install` on Windows. Compiles warning-free and
+  installs; not yet run-verified because Smart App Control on the
+  development machine blocks unsigned local builds.
 - **2026-08-08** — Phase 1 implemented: core bridge (`src/core/`), macOS
   overlay backend (`src/macos/`), per-platform CMake + install rules, darwin
   nix flake with package output. X11/Wayland sources moved to `src/x11/`,

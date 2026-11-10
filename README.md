@@ -5,7 +5,8 @@ MEP-wm (Mise En Place window manager) is a window manager that has everything in
 On Linux, mepwm is the window manager (X11 native, experimental Wayland).
 On macOS it runs as an **overlay manager** (AeroSpace/Amethyst style): the
 native window server keeps owning windows and mepwm arranges them through the
-Accessibility API. A Windows overlay backend is planned. Shared policy
+Accessibility API. On Windows it is the same kind of overlay over Win32.
+Shared policy
 (layouts, focus rules, keybindings) lives in `src/core/` behind a
 `core::Platform` bridge; see `docs/PORTING.md` for the architecture and the
 parity roadmap.
@@ -24,9 +25,9 @@ Linux and macOS.
 
 `mepwm` is split into a reusable `mepwm` library and a small executable in
 `src/main.cpp`. It has an X11 tiling backend, an experimental wlroots-based
-Wayland compositor backend, and a macOS overlay backend. Select one with
-`--backend x11|wayland|macos` (the default is the native backend for the
-platform you built on).
+Wayland compositor backend, and macOS and Windows overlay backends. Select one
+with `--backend x11|wayland|macos|windows` (the default is the native backend
+for the platform you built on).
 
 ## Using mep-wm as a flake input
 
@@ -177,6 +178,68 @@ Globe/fn key alone, and note the Command modifier shadows `Cmd+H` (Hide),
 app, while `alt` gives the AeroSpace-style Option layout. If you remapped
 the Globe key in System Settings > Keyboard (e.g. to switch input sources),
 held-down fn still works as the modifier.
+
+## Windows overlay
+
+On Windows mepwm works like on macOS: Windows (DWM) keeps owning windows and
+mepwm tiles, focuses, and decorates them from the outside, with the same
+engine, layouts, workspaces, projects, pickers, sidebars, and widgets.
+
+### Installing (Windows)
+
+You need [just](https://github.com/casey/just), CMake, and MSVC (Visual
+Studio or the Build Tools with "Desktop development with C++"). From
+PowerShell or any terminal:
+
+```powershell
+just install    # builds, installs into %USERPROFILE%\.local, adds its bin to PATH
+mepwm           # in a new terminal; or start "MEP-wm" from the Start menu
+```
+
+`just install` puts two programs in `%USERPROFILE%\.local\bin`: `mepwm.exe`
+runs in the terminal (logs there; Ctrl+C stops it) and `MEP-wm.exe` runs
+without a console (the Start-menu entry). `just service-install` starts
+MEP-wm at every sign-in (a Startup-folder shortcut); `just service-stop`,
+`just service-start`, `just service-status`, and `just uninstall` do what
+they say. `mepwm --quit` asks a running instance to exit.
+
+**Smart App Control.** If Windows 11's Smart App Control is on, it refuses
+to run unsigned programs it has no reputation for -- which includes any
+locally built mepwm ("An Application Control policy has blocked this
+file"). `just install` warns about this. Either sign the binaries with a
+publicly trusted code-signing certificate, or turn Smart App Control off
+(Windows Security > App & browser control > Smart App Control settings).
+
+### Controls (Windows)
+
+The modifier defaults to **Alt** (`--modifier win|ctrl|alt` or
+`MEPWM_MODIFIER` changes it; set `MEPWM_MODIFIER=win` as a *user*
+environment variable to make the Start-menu and sign-in launches use it).
+Windows reserves `Win+L` (lock) below any hook, so the `win` modifier loses
+focus-right unless the lock shortcut is turned off (DWORD
+`DisableLockWorkstation=1` under
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System`); the
+other `Win+letter` shell shortcuts (search, clipboard history, ...) are
+simply overridden while mepwm runs. Bindings are the macOS ones with Mod = Alt:
+`Alt+h/j/k/l` focus, `Alt+Shift+h/j/k/l` resize, `Alt+Ctrl+h/j/k/l` move,
+`Alt+v`/`Alt+s` split, `Alt+n` next tab, `Alt+p` app picker (Start-menu
+shortcuts), `Alt+i`/`Alt+o` project pickers, `Alt+1..9` workspaces,
+`Alt+Enter` terminal (Windows Terminal if installed, else cmd), `Alt+t` /
+`Alt+Shift+t` todos, `Alt+f` click hints, `Alt+b` hide bars,
+`Alt+Shift+/` help, `Alt+Shift+q` quit. `Alt+Tab` is left to Windows.
+
+Windows on inactive workspaces are hidden (not parked in a corner, which
+would spill onto a neighboring monitor). mepwm shows them again when it
+exits, and if it was killed, the next start restores them.
+
+Known limits: only the primary monitor is tiled; windows of programs running
+as administrator are left alone (and hotkeys don't fire while one has focus)
+unless mepwm also runs as administrator; dialogs and non-resizable windows
+are left floating; switching Windows virtual desktops (Win+Ctrl+arrows)
+resets the layout of the desktop you left; with `--modifier ctrl` the
+Mod+Ctrl move bindings are unavailable. The bars hide while a fullscreen app
+is in front. Install
+a Nerd Font to get icons in the bars (`MEPWM_ICON_FONT` picks one).
 
 For safe X11 development inside an existing X11 desktop, run:
 

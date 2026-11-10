@@ -5,7 +5,8 @@ project(mepwm VERSION 0.1.0 LANGUAGES C CXX)
 # Backend availability per host platform (see docs/PORTING.md): on Linux
 # mepwm is the window manager (X11, experimental Wayland); on macOS it is an
 # overlay manager driving the native window server through the Accessibility
-# API. A Windows overlay backend is planned (MEPWM_ENABLE_WINDOWS, phase 4).
+# API; on Windows it is the same kind of overlay over Win32 (src/windows).
+set(MEPWM_DEFAULT_WINDOWS OFF)
 if(APPLE)
   set(MEPWM_DEFAULT_X11 OFF)
   set(MEPWM_DEFAULT_WAYLAND OFF)
@@ -14,6 +15,7 @@ elseif(WIN32)
   set(MEPWM_DEFAULT_X11 OFF)
   set(MEPWM_DEFAULT_WAYLAND OFF)
   set(MEPWM_DEFAULT_MACOS OFF)
+  set(MEPWM_DEFAULT_WINDOWS ON)
 else()
   set(MEPWM_DEFAULT_X11 ON)
   set(MEPWM_DEFAULT_WAYLAND ON)
@@ -23,6 +25,7 @@ endif()
 option(MEPWM_ENABLE_X11 "Build the X11 backend" ${MEPWM_DEFAULT_X11})
 option(MEPWM_ENABLE_WAYLAND "Build the wlroots Wayland backend" ${MEPWM_DEFAULT_WAYLAND})
 option(MEPWM_ENABLE_MACOS "Build the macOS overlay backend" ${MEPWM_DEFAULT_MACOS})
+option(MEPWM_ENABLE_WINDOWS "Build the Windows overlay backend" ${MEPWM_DEFAULT_WINDOWS})
 
 # clang-tidy and IDE tooling (clangd) both read this to know the actual
 # include paths/defines each file was compiled with -- without it clang-tidy
@@ -62,11 +65,19 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_C_COMPILER_ID STREQUAL "GNU")
   list(APPEND MEPWM_WARNING_FLAGS_COMMON -Wmisleading-indentation -Wduplicated-cond -Wduplicated-branches -Wlogical-op)
 endif()
 # CXX,OBJCXX: the Objective-C++ macOS backend takes the same C++ discipline.
-set(MEPWM_WARNING_FLAGS
-  -Werror
-  ${MEPWM_WARNING_FLAGS_COMMON}
-  $<$<COMPILE_LANGUAGE:CXX,OBJCXX>:${MEPWM_WARNING_FLAGS_CXX_ONLY}>
-)
+if(MSVC)
+  # MSVC's analogue of the curated GCC/Clang set above: /W4 as errors.
+  # /utf-8 because the sources carry UTF-8 literals (Nerd Font icons, the
+  # help text). C4996 is MSVC steering getenv/sscanf/strncpy toward its _s
+  # variants, which are not portable; the code already bounds-checks.
+  set(MEPWM_WARNING_FLAGS /W4 /WX /utf-8 /wd4996)
+else()
+  set(MEPWM_WARNING_FLAGS
+    -Werror
+    ${MEPWM_WARNING_FLAGS_COMMON}
+    $<$<COMPILE_LANGUAGE:CXX,OBJCXX>:${MEPWM_WARNING_FLAGS_CXX_ONLY}>
+  )
+endif()
 
 # Platform-agnostic sources: the public WindowManager facade, the core
 # policy layer (layout math, Platform bridge, TilingEngine), and the Wayland
@@ -139,7 +150,24 @@ if(MEPWM_ENABLE_MACOS)
   )
 endif()
 
+if(MEPWM_ENABLE_WINDOWS)
+  if(NOT WIN32)
+    message(FATAL_ERROR "MEPWM_ENABLE_WINDOWS requires building on Windows")
+  endif()
+  target_sources(mepwm PRIVATE src/windows/windows_platform.cpp)
+  # NOMINMAX/WIN32_LEAN_AND_MEAN keep <windows.h> from clobbering std::min
+  # and dragging in winsock 1; UNICODE selects the W APIs throughout.
+  target_compile_definitions(mepwm PRIVATE MEPWM_WITH_WINDOWS=1 NOMINMAX WIN32_LEAN_AND_MEAN
+                                           UNICODE _UNICODE)
+  target_link_libraries(mepwm PRIVATE user32 gdi32 shell32 ole32 dwmapi wlanapi bthprops
+                                      advapi32 shlwapi)
+endif()
+
 add_executable(mepwm-bin src/main.cpp)
+if(MEPWM_ENABLE_WINDOWS)
+  # UTF-8 active code page (see the manifest); MSVC embeds .manifest sources.
+  target_sources(mepwm-bin PRIVATE src/windows/mepwm.manifest)
+endif()
 set_target_properties(mepwm-bin PROPERTIES OUTPUT_NAME mepwm)
 target_compile_options(mepwm-bin PRIVATE ${MEPWM_WARNING_FLAGS})
 target_link_libraries(mepwm-bin PRIVATE mepwm::mepwm)
@@ -161,10 +189,29 @@ if(MEPWM_ENABLE_MACOS)
   target_link_libraries(mepwm-app PRIVATE mepwm::mepwm)
 endif()
 
-# mep-wm-cli only writes Lua source over the IPC socket; it does not embed
-# Lua itself, so it stays dependency-free and builds on every POSIX platform.
-add_executable(mep-wm-cli src/mep_wm_cli.cpp)
-target_compile_options(mep-wm-cli PRIVATE ${MEPWM_WARNING_FLAGS})
+if(MEPWM_ENABLE_WINDOWS)
+  # Start-menu/startup entry: the same program built for the GUI subsystem,
+  # so launching it outside a terminal doesn't open a console window (the
+  # Windows analogue of MEP-wm.app). mepwm.exe stays a console program for
+  # terminal use, with its log output and Ctrl+C.
+  add_executable(mepwm-gui WIN32 src/main.cpp src/windows/mepwm.manifest)
+  set_target_properties(mepwm-gui PROPERTIES OUTPUT_NAME "MEP-wm")
+  target_link_options(mepwm-gui PRIVATE /ENTRY:mainCRTStartup)
+  target_compile_options(mepwm-gui PRIVATE ${MEPWM_WARNING_FLAGS})
+  target_compile_definitions(mepwm-gui PRIVATE MEPWM_GUI_SUBSYSTEM=1)
+  target_link_libraries(mepwm-gui PRIVATE mepwm::mepwm)
+  install(TARGETS mepwm-gui RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
 
-install(TARGETS mepwm-bin mep-wm-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+# mep-wm-cli only writes Lua source over the X11 backend's unix-socket IPC;
+# it does not embed Lua itself, so it stays dependency-free and builds on
+# every POSIX platform. The overlay backends have no IPC yet, so Windows
+# skips it.
+if(NOT WIN32)
+  add_executable(mep-wm-cli src/mep_wm_cli.cpp)
+  target_compile_options(mep-wm-cli PRIVATE ${MEPWM_WARNING_FLAGS})
+  install(TARGETS mep-wm-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+
+install(TARGETS mepwm-bin RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(DIRECTORY assets/ DESTINATION ${CMAKE_INSTALL_DATADIR}/mepwm/assets)

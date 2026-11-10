@@ -1,5 +1,17 @@
 #include "core/mep_theme.hpp"
 
+#if defined(_WIN32)
+
+namespace mepwm::core {
+
+// mep's agent-control sockets are unix-domain sockets under the XDG data
+// dir; there is no Windows build of that protocol, so syncing is a no-op.
+void sync_mep_theme(const std::string&) {}
+
+}  // namespace mepwm::core
+
+#else
+
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -101,3 +113,5 @@ void sync_mep_theme(const std::string& mep_colorscheme_name) {
 }
 
 }  // namespace mepwm::core
+
+#endif  // _WIN32
